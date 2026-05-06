@@ -1,32 +1,41 @@
-# Prerequisites
-*.d
+# Visual Studio
+.vs/
+[Bb]in/
+[Oo]bj/
+[Aa]rm/
+[Aa]rm64/
+[Xx]64/
+[Xx]86/
+Generated\ Files/
+Edge/
+Debug/
+Release/
+*.user
+*.userosscache
+*.sln.doccache
+*.suo
+*.user
+*.userosscache
+*.sln.doccache
+*.suo
+*.ncb
+*.sdf
+*.opensdf
+*.db
+*.opendb
+*.VC.db
+*.VC.opendb
 
-# Compiled Object files
-*.slo
-*.lo
-*.o
-*.obj
+# Intel TBB / Packages
+packages/
+ipch/
+*.ipch
 
-# Precompiled Headers
-*.gch
-*.pch
+# Miscellaneous
+*.log
+*.tmp
+*.bak
 
-# Compiled Dynamic libraries
-*.so
-*.dylib
-*.dll
-
-# Fortran module files
-*.mod
-*.smod
-
-# Compiled Static libraries
-*.lai
-*.la
-*.a
-*.lib
-
-# Executables
-*.exe
-*.out
-*.app
+# Documents (Optional - if you want to keep them, remove these lines)
+# *.docx
+# *.pdf
