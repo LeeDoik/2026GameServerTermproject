@@ -10,38 +10,59 @@
 #include "protocol_2026.h"
 
 #pragma comment(lib, "ws2_32.lib")
+#pragma comment(lib, "mswsock.lib")
 
 using namespace std;
 
 // --- 구조체 및 상수 정의 ---
-enum class IO_TYPE { RECV, SEND, ACCEPT };
+enum IO_TYPE { IO_RECV, IO_SEND, IO_ACCEPT };
 
 struct OVERLAPPED_EX {
-    OVERLAPPED overlapped;
+    WSAOVERLAPPED overlapped;
     IO_TYPE type;
     WSABUF wsa_buf;
-    unsigned char buffer[MAX_CHAT_MSG_LEN + 256]; // 여유 있는 버퍼 크기
+    SOCKET client_socket;
+    unsigned char buffer[MAX_CHAT_MSG_LEN + 256];
+
+    OVERLAPPED_EX() {
+        memset(&overlapped, 0, sizeof(overlapped));
+        type = IO_RECV;
+        wsa_buf.buf = reinterpret_cast<char*>(buffer);
+        wsa_buf.len = sizeof(buffer);
+        client_socket = INVALID_SOCKET;
+    }
+    OVERLAPPED_EX(IO_TYPE t) : OVERLAPPED_EX() { type = t; }
 };
 
 struct SESSION {
     int id;
     SOCKET socket;
     OVERLAPPED_EX recv_overlapped;
-    shared_ptr<string> name; // atomic<shared_ptr> 호환성 문제로 shared_ptr로 변경 후 필요시 mutex/atomic_load 사용
+    shared_ptr<string> name; 
     short x, y;
     bool is_active;
 
-    SESSION() : id(-1), socket(INVALID_SOCKET), is_active(false) {
+    SESSION() : id(-1), socket(INVALID_SOCKET), is_active(false), recv_overlapped(IO_RECV) {
         name = make_shared<string>("Guest");
         x = y = 0;
-        memset(&recv_overlapped.overlapped, 0, sizeof(recv_overlapped.overlapped));
-        recv_overlapped.type = IO_TYPE::RECV;
-        recv_overlapped.wsa_buf.buf = reinterpret_cast<char*>(recv_overlapped.buffer);
-        recv_overlapped.wsa_buf.len = sizeof(recv_overlapped.buffer);
     }
 
     ~SESSION() {
         if (socket != INVALID_SOCKET) closesocket(socket);
+    }
+
+    void do_recv() {
+        DWORD flags = 0;
+        DWORD recv_bytes = 0;
+        memset(&recv_overlapped.overlapped, 0, sizeof(recv_overlapped.overlapped));
+        WSARecv(socket, &recv_overlapped.wsa_buf, 1, &recv_bytes, &flags, &recv_overlapped.overlapped, NULL);
+    }
+
+    void do_send(int num_bytes, void* mess) {
+        OVERLAPPED_EX* ov = new OVERLAPPED_EX(IO_SEND);
+        ov->wsa_buf.len = num_bytes;
+        memcpy(ov->buffer, mess, num_bytes);
+        WSASend(socket, &ov->wsa_buf, 1, NULL, 0, &ov->overlapped, NULL);
     }
 };
 
@@ -49,10 +70,11 @@ struct SESSION {
 tbb::concurrent_map<int, shared_ptr<SESSION>> g_clients;
 atomic<int> g_next_id{ 0 };
 HANDLE g_h_iocp;
+SOCKET g_listen_socket;
+LPFN_ACCEPTEX g_fp_accept_ex = nullptr;
 
 // --- 함수 선언 ---
 void worker_thread();
-void do_recv(shared_ptr<SESSION>& session);
 void process_packet(int client_id, unsigned char* ptr);
 
 int main() {
@@ -64,20 +86,32 @@ int main() {
 
     g_h_iocp = CreateIoCompletionPort(INVALID_HANDLE_VALUE, NULL, 0, 0);
 
-    SOCKET listen_socket = WSASocket(AF_INET, SOCK_STREAM, 0, NULL, 0, WSA_FLAG_OVERLAPPED);
+    g_listen_socket = WSASocket(AF_INET, SOCK_STREAM, 0, NULL, 0, WSA_FLAG_OVERLAPPED);
     SOCKADDR_IN server_addr;
     memset(&server_addr, 0, sizeof(server_addr));
     server_addr.sin_family = AF_INET;
     server_addr.sin_port = htons(PORT);
     server_addr.sin_addr.s_addr = htonl(INADDR_ANY);
 
-    if (::bind(listen_socket, (SOCKADDR*)&server_addr, sizeof(server_addr)) == SOCKET_ERROR) {
+    if (::bind(g_listen_socket, (SOCKADDR*)&server_addr, sizeof(server_addr)) == SOCKET_ERROR) {
         cout << "[Error] Bind Failed." << endl;
         return 1;
     }
-    listen(listen_socket, SOMAXCONN);
+    listen(g_listen_socket, SOMAXCONN);
 
-    cout << "[Server] MMO Server Started. Listening on port " << PORT << "..." << endl;
+    GUID guid_accept_ex = WSAID_ACCEPTEX;
+    DWORD bytes = 0;
+    WSAIoctl(g_listen_socket, SIO_GET_EXTENSION_FUNCTION_POINTER, &guid_accept_ex, sizeof(guid_accept_ex), &g_fp_accept_ex, sizeof(g_fp_accept_ex), &bytes, NULL, NULL);
+
+    CreateIoCompletionPort(reinterpret_cast<HANDLE>(g_listen_socket), g_h_iocp, static_cast<ULONG_PTR>(-1), 0);
+
+    cout << "[Server] MMO Server Started. Port: " << PORT << endl;
+
+    // npc.cpp 방식의 초기 AcceptEx 호출
+    OVERLAPPED_EX accept_over(IO_ACCEPT);
+    accept_over.client_socket = WSASocket(AF_INET, SOCK_STREAM, 0, NULL, 0, WSA_FLAG_OVERLAPPED);
+    g_fp_accept_ex(g_listen_socket, accept_over.client_socket, accept_over.buffer, 0,
+        sizeof(SOCKADDR_IN) + 16, sizeof(SOCKADDR_IN) + 16, NULL, &accept_over.overlapped);
 
     vector<thread> worker_threads;
     int num_threads = thread::hardware_concurrency();
@@ -85,56 +119,63 @@ int main() {
         worker_threads.emplace_back(worker_thread);
     }
 
-    while (true) {
-        SOCKADDR_IN client_addr;
-        int addr_len = sizeof(client_addr);
-        SOCKET client_socket = accept(listen_socket, (SOCKADDR*)&client_addr, &addr_len);
-
-        if (client_socket == INVALID_SOCKET) continue;
-
-        int new_id = g_next_id++;
-        auto session = make_shared<SESSION>();
-        session->id = new_id;
-        session->socket = client_socket;
-        session->is_active = true;
-
-        g_clients[new_id] = session;
-
-        CreateIoCompletionPort(reinterpret_cast<HANDLE>(client_socket), g_h_iocp, new_id, 0);
-
-        cout << "[Connect] Client Connected. ID: " << new_id << " (Total: " << g_clients.size() << ")" << endl;
-
-        do_recv(session);
-    }
-
     for (auto& t : worker_threads) t.join();
-    closesocket(listen_socket);
+    
+    closesocket(g_listen_socket);
     WSACleanup();
     return 0;
-}
-
-void do_recv(shared_ptr<SESSION>& session) {
-    DWORD flags = 0;
-    DWORD recv_bytes = 0;
-    memset(&session->recv_overlapped.overlapped, 0, sizeof(session->recv_overlapped.overlapped));
-    WSARecv(session->socket, &session->recv_overlapped.wsa_buf, 1, &recv_bytes, &flags, &session->recv_overlapped.overlapped, NULL);
 }
 
 void worker_thread() {
     while (true) {
         DWORD bytes_transferred;
         ULONG_PTR completion_key;
-        OVERLAPPED* overlapped = nullptr;
+        WSAOVERLAPPED* overlapped = nullptr;
 
-        BOOL result = GetQueuedCompletionStatus(g_h_iocp, &bytes_transferred, &completion_key, &overlapped, INFINITE);
+        BOOL result = GetQueuedCompletionStatus(g_h_iocp, &bytes_transferred, &completion_key, (LPOVERLAPPED*)&overlapped, INFINITE);
 
         if (overlapped == nullptr) break;
 
-        int client_id = static_cast<int>(completion_key);
         OVERLAPPED_EX* ov_ex = reinterpret_cast<OVERLAPPED_EX*>(overlapped);
 
+        if (ov_ex->type == IO_ACCEPT) {
+            if (g_clients.size() >= MAX_PLAYERS) {
+                cout << "[Reject] Server Full." << endl;
+                closesocket(ov_ex->client_socket);
+            }
+            else {
+                SOCKET c_socket = ov_ex->client_socket;
+                int new_id = g_next_id++;
+                auto session = make_shared<SESSION>();
+                session->id = new_id;
+                session->socket = c_socket;
+                session->is_active = true;
+
+                g_clients[new_id] = session;
+                CreateIoCompletionPort(reinterpret_cast<HANDLE>(c_socket), g_h_iocp, new_id, 0);
+
+                cout << "[Connect] Client Connected. ID: " << new_id << " (Total: " << g_clients.size() << ")" << endl;
+
+                S2C_LoginResult res;
+                res.size = sizeof(res);
+                res.type = S2C_LOGIN_RESULT;
+                res.success = true;
+                strcpy_s(res.message, "Connected to MMO Server!");
+                session->do_send(res.size, &res);
+
+                session->do_recv();
+            }
+            // npc.cpp 방식: Accept 완료 후 즉시 다음 AcceptEx 예약
+            ov_ex->client_socket = WSASocket(AF_INET, SOCK_STREAM, 0, NULL, 0, WSA_FLAG_OVERLAPPED);
+            memset(&ov_ex->overlapped, 0, sizeof(ov_ex->overlapped));
+            g_fp_accept_ex(g_listen_socket, ov_ex->client_socket, ov_ex->buffer, 0,
+                sizeof(SOCKADDR_IN) + 16, sizeof(SOCKADDR_IN) + 16, NULL, &ov_ex->overlapped);
+            continue;
+        }
+
+        int client_id = static_cast<int>(completion_key);
+
         if (!result || bytes_transferred == 0) {
-            // 접속 종료 처리
             auto it = g_clients.find(client_id);
             if (it != g_clients.end()) {
                 cout << "[Disconnect] Client Disconnected. ID: " << client_id << endl;
@@ -143,18 +184,20 @@ void worker_thread() {
             continue;
         }
 
-        if (ov_ex->type == IO_TYPE::RECV) {
+        if (ov_ex->type == IO_RECV) {
             process_packet(client_id, ov_ex->buffer);
             auto it = g_clients.find(client_id);
             if (it != g_clients.end()) {
-                do_recv(it->second);
+                it->second->do_recv();
             }
+        }
+        else if (ov_ex->type == IO_SEND) {
+            delete ov_ex;
         }
     }
 }
 
 void process_packet(int client_id, unsigned char* ptr) {
-    unsigned char size = ptr[0];
     PACKET_TYPE type = static_cast<PACKET_TYPE>(ptr[1]);
 
     auto it = g_clients.find(client_id);
@@ -164,18 +207,9 @@ void process_packet(int client_id, unsigned char* ptr) {
     switch (type) {
     case C2S_LOGIN: {
         C2S_Login* pkt = reinterpret_cast<C2S_Login*>(ptr);
-        // C++20 atomic shared_ptr 대용 (atomic_store 호환성)
         atomic_store(&session->name, make_shared<string>(pkt->username));
         
         cout << "[Login] Client " << client_id << " logged in as: " << *atomic_load(&session->name) << endl;
-
-        S2C_LoginResult res;
-        res.size = sizeof(res);
-        res.type = S2C_LOGIN_RESULT;
-        res.success = true;
-        strcpy_s(res.message, "Welcome to MMO Server 2026!");
-        
-        send(session->socket, reinterpret_cast<char*>(&res), res.size, 0);
         break;
     }
     case C2S_LOGOUT: {
