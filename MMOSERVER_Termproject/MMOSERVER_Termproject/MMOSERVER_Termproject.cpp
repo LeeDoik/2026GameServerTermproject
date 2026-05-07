@@ -8,12 +8,37 @@
 #include <winsock2.h>
 #include <mswsock.h>
 #include <tbb/concurrent_map.h>
+#include <mutex>
+#include <unordered_set>
 #include "protocol_2026.h"
 
 #pragma comment(lib, "ws2_32.lib")
 #pragma comment(lib, "mswsock.lib")
 
 using namespace std;
+
+// --- 구조체 및 상수 정의 ---
+enum IO_TYPE { IO_RECV, IO_SEND, IO_ACCEPT };
+
+// 링 버퍼 클래스 전방 선언
+class RingBuffer;
+
+struct OVERLAPPED_EX {
+    WSAOVERLAPPED overlapped;
+    IO_TYPE type;
+    WSABUF wsa_buf;
+    SOCKET client_socket;
+    unsigned char buffer[MAX_CHAT_MSG_LEN + 256];
+
+    OVERLAPPED_EX() {
+        memset(&overlapped, 0, sizeof(overlapped));
+        type = IO_RECV;
+        wsa_buf.buf = reinterpret_cast<char*>(buffer);
+        wsa_buf.len = sizeof(buffer);
+        client_socket = INVALID_SOCKET;
+    }
+    OVERLAPPED_EX(IO_TYPE t) : OVERLAPPED_EX() { type = t; }
+};
 
 // --- 링 버퍼 (Ring Buffer) 구현 ---
 // 기존의 prev_recv 방식(포인터 이동)을 피하고, 원형 큐 형태로 데이터를 안전하게 적재 및 추출합니다.
@@ -31,10 +56,10 @@ public:
     }
 
     int GetStoredSize() const { return current_size; }
-    int GetFreeSpace() const { return capacity - current_size; }
+    int GetFreeCapacity() const { return capacity - current_size; }
 
     bool Write(const unsigned char* data, int size) {
-        if (size > GetFreeSpace()) return false; // 오버플로우 방지
+        if (size > GetFreeCapacity()) return false; // 오버플로우 방지
         
         int first_chunk = min(size, capacity - tail);
         memcpy(&buffer[tail], data, first_chunk);
@@ -69,26 +94,6 @@ public:
     }
 };
 
-// --- 구조체 및 상수 정의 ---
-enum IO_TYPE { IO_RECV, IO_SEND, IO_ACCEPT };
-
-struct OVERLAPPED_EX {
-    WSAOVERLAPPED overlapped;
-    IO_TYPE type;
-    WSABUF wsa_buf;
-    SOCKET client_socket;
-    unsigned char buffer[MAX_CHAT_MSG_LEN + 256];
-
-    OVERLAPPED_EX() {
-        memset(&overlapped, 0, sizeof(overlapped));
-        type = IO_RECV;
-        wsa_buf.buf = reinterpret_cast<char*>(buffer);
-        wsa_buf.len = sizeof(buffer);
-        client_socket = INVALID_SOCKET;
-    }
-    OVERLAPPED_EX(IO_TYPE t) : OVERLAPPED_EX() { type = t; }
-};
-
 struct SESSION {
     int id;
     SOCKET socket;
@@ -100,7 +105,8 @@ struct SESSION {
 
     SESSION() : id(-1), socket(INVALID_SOCKET), is_active(false), recv_overlapped(IO_RECV) {
         name = make_shared<string>("Guest");
-        x = y = 0;
+        x = -1;
+        y = -1;
     }
 
     ~SESSION() {
@@ -130,6 +136,110 @@ atomic<int> g_next_id{ 0 };
 HANDLE g_h_iocp;
 SOCKET g_listen_socket;
 LPFN_ACCEPTEX g_fp_accept_ex = nullptr;
+
+// --- 시야 관리 (Sector) ---
+constexpr int WINDOW_VIEW_SIZE = 20; // 클라이언트에 표시되는 시야 (창) 크기 20x20
+constexpr int GAME_VIEW_RANGE = 15;  // 게임 속 실제 객체가 보이는 시야 15x15
+
+constexpr int SECTOR_SIZE = 20; // 시야 범위 고려 (20x20 단위로 공간 분할, 2000 / 20 = 100 딱 떨어짐)
+constexpr int NUM_SECTORS_X = WORLD_WIDTH / SECTOR_SIZE;
+constexpr int NUM_SECTORS_Y = WORLD_HEIGHT / SECTOR_SIZE;
+
+struct Sector {
+    mutex m_lock;
+    unordered_set<int> players;
+    unordered_set<int> npcs;
+};
+
+Sector g_sectors[NUM_SECTORS_Y][NUM_SECTORS_X];
+
+// Sector 업데이트 유틸리티 함수
+void UpdateObjectSector(int id, short old_x, short old_y, short new_x, short new_y, bool is_player) {
+    int old_sx = max(0, min(NUM_SECTORS_X - 1, old_x / SECTOR_SIZE));
+    int old_sy = max(0, min(NUM_SECTORS_Y - 1, old_y / SECTOR_SIZE));
+    int new_sx = max(0, min(NUM_SECTORS_X - 1, new_x / SECTOR_SIZE));
+    int new_sy = max(0, min(NUM_SECTORS_Y - 1, new_y / SECTOR_SIZE));
+
+    if (old_sx != new_sx || old_sy != new_sy) {
+        if (old_x != -1 && old_y != -1) { // -1, -1은 초기 생성 시
+            lock_guard<mutex> lock(g_sectors[old_sy][old_sx].m_lock);
+            if (is_player) g_sectors[old_sy][old_sx].players.erase(id);
+            else g_sectors[old_sy][old_sx].npcs.erase(id);
+        }
+        {
+            lock_guard<mutex> lock(g_sectors[new_sy][new_sx].m_lock);
+            if (is_player) g_sectors[new_sy][new_sx].players.insert(id);
+            else g_sectors[new_sy][new_sx].npcs.insert(id);
+        }
+    }
+}
+
+void RemoveObjectFromSector(int id, short x, short y, bool is_player) {
+    if (x == -1 || y == -1) return;
+    int sx = max(0, min(NUM_SECTORS_X - 1, x / SECTOR_SIZE));
+    int sy = max(0, min(NUM_SECTORS_Y - 1, y / SECTOR_SIZE));
+    lock_guard<mutex> lock(g_sectors[sy][sx].m_lock);
+    if (is_player) g_sectors[sy][sx].players.erase(id);
+    else g_sectors[sy][sx].npcs.erase(id);
+}
+
+// --- 시야 체크 및 패킷 전송 유틸리티 ---
+
+// 두 좌표 사이의 거리가 시야 범위(GAME_VIEW_RANGE) 내인지 확인
+bool IsInView(short x1, short y1, short x2, short y2) {
+    return (abs(x1 - x2) <= GAME_VIEW_RANGE && abs(y1 - y2) <= GAME_VIEW_RANGE);
+}
+
+// 특정 섹터 내의 모든 플레이어에게 패킷 전송
+void SendToSector(int sx, int sy, int packet_size, void* packet) {
+    if (sx < 0 || sx >= NUM_SECTORS_X || sy < 0 || sy >= NUM_SECTORS_Y) return;
+
+    lock_guard<mutex> lock(g_sectors[sy][sx].m_lock);
+    for (int pid : g_sectors[sy][sx].players) {
+        auto it = g_clients.find(pid);
+        if (it != g_clients.end()) {
+            it->second->do_send(packet_size, packet);
+        }
+    }
+}
+
+// 주변 9개 섹터의 플레이어들에게 패킷 전송
+void BroadcastToNeighbors(short x, short y, int packet_size, void* packet) {
+    int sx = max(0, min(NUM_SECTORS_X - 1, x / SECTOR_SIZE));
+    int sy = max(0, min(NUM_SECTORS_Y - 1, y / SECTOR_SIZE));
+
+    for (int dy = -1; dy <= 1; ++dy) {
+        for (int dx = -1; dx <= 1; ++dx) {
+            SendToSector(sx + dx, sy + dy, packet_size, packet);
+        }
+    }
+}
+
+// 특정 오브젝트 정보를 플레이어에게 전송 (Add)
+void SendAddObject(shared_ptr<SESSION> to_session, shared_ptr<SESSION> obj_session) {
+    S2C_AddObject pkt;
+    pkt.size = sizeof(pkt);
+    pkt.type = S2C_ADD_OBJECT;
+    pkt.object_id = obj_session->id;
+    pkt.x = obj_session->x;
+    pkt.y = obj_session->y;
+    pkt.visual_id = 0;
+    strcpy_s(pkt.obj_name, (*atomic_load(&obj_session->name)).c_str());
+    // 나머지 상태값 초기화
+    pkt.hp = 100; pkt.max_hp = 100; pkt.level = 1; pkt.exp = 0;
+    
+    to_session->do_send(pkt.size, &pkt);
+}
+
+// 특정 오브젝트 제거 정보를 플레이어에게 전송 (Remove)
+void SendRemoveObject(shared_ptr<SESSION> to_session, int obj_id) {
+    S2C_RemoveObject pkt;
+    pkt.size = sizeof(pkt);
+    pkt.type = S2C_REMOVE_OBJECT;
+    pkt.object_id = obj_id;
+    
+    to_session->do_send(pkt.size, &pkt);
+}
 
 // --- 함수 선언 ---
 void worker_thread();
@@ -236,6 +346,7 @@ void worker_thread() {
             auto it = g_clients.find(client_id);
             if (it != g_clients.end()) {
                 cout << "[Disconnect] Client Disconnected. ID: " << client_id << endl;
+                RemoveObjectFromSector(client_id, it->second->x, it->second->y, true);
                 g_clients.unsafe_erase(it);
             }
             continue;
@@ -295,11 +406,116 @@ void process_packet(int client_id, unsigned char* ptr) {
         C2S_Login* pkt = reinterpret_cast<C2S_Login*>(ptr);
         atomic_store(&session->name, make_shared<string>(pkt->username));
         
-        cout << "[Login] Client " << client_id << " logged in as: " << *atomic_load(&session->name) << endl;
+        // Spawn 위치 지정 및 Sector 등록
+        session->x = rand() % WORLD_WIDTH;
+        session->y = rand() % WORLD_HEIGHT;
+        UpdateObjectSector(client_id, -1, -1, session->x, session->y, true);
+
+        // 1. 본인에게 아바타 정보 전송
+        S2C_AvatarInfo info;
+        info.size = sizeof(info);
+        info.type = S2C_AVATAR_INFO;
+        info.playerId = client_id;
+        info.x = session->x;
+        info.y = session->y;
+        info.hp = 100; info.max_hp = 100; info.exp = 0; info.level = 1; info.visualId = 0;
+        session->do_send(info.size, &info);
+
+        // 2. 주변 플레이어들에게 나를 알리고, 나에게 주변 플레이어들을 알림
+        int sx = session->x / SECTOR_SIZE;
+        int sy = session->y / SECTOR_SIZE;
+        for (int dy = -1; dy <= 1; ++dy) {
+            for (int dx = -1; dx <= 1; ++dx) {
+                int nx = sx + dx, ny = sy + dy;
+                if (nx < 0 || nx >= NUM_SECTORS_X || ny < 0 || ny >= NUM_SECTORS_Y) continue;
+                
+                lock_guard<mutex> lock(g_sectors[ny][nx].m_lock);
+                for (int other_id : g_sectors[ny][nx].players) {
+                    if (other_id == client_id) continue;
+                    auto other_it = g_clients.find(other_id);
+                    if (other_it != g_clients.end()) {
+                        auto other_session = other_it->second;
+                        if (IsInView(session->x, session->y, other_session->x, other_session->y)) {
+                            SendAddObject(other_session, session); // 타인에게 나를 추가
+                            SendAddObject(session, other_session); // 나에게 타인을 추가
+                        }
+                    }
+                }
+            }
+        }
+
+        cout << "[Login] Client " << client_id << " logged in as: " << *atomic_load(&session->name) << " at (" << session->x << ", " << session->y << ")" << endl;
+        break;
+    }
+    case C2S_MOVE: {
+        C2S_Move* pkt = reinterpret_cast<C2S_Move*>(ptr);
+        short old_x = session->x;
+        short old_y = session->y;
+        
+        // Sector 업데이트
+        UpdateObjectSector(client_id, old_x, old_y, pkt->x, pkt->y, true);
+        session->x = pkt->x;
+        session->y = pkt->y;
+
+        // 이동 패킷 브로드캐스팅
+        S2C_MoveObject move_pkt;
+        move_pkt.size = sizeof(move_pkt);
+        move_pkt.type = S2C_MOVE_OBJECT;
+        move_pkt.object_id = client_id;
+        move_pkt.x = session->x;
+        move_pkt.y = session->y;
+        move_pkt.move_time = pkt->move_time;
+
+        // 주변 섹터에 알림 (시야 경계 처리 포함)
+        int old_sx = old_x / SECTOR_SIZE;
+        int old_sy = old_y / SECTOR_SIZE;
+        int new_sx = session->x / SECTOR_SIZE;
+        int new_sy = session->y / SECTOR_SIZE;
+
+        // 단순히 주변에 이동 알림 (최적화 전: 주변 9개 섹터 브로드캐스트)
+        // 실제로는 새로 시야에 들어온 사람에게는 Add, 나간 사람에게는 Remove를 보내야 함
+        for (int dy = -1; dy <= 1; ++dy) {
+            for (int dx = -1; dx <= 1; ++dx) {
+                int nx = new_sx + dx, ny = new_sy + dy;
+                if (nx < 0 || nx >= NUM_SECTORS_X || ny < 0 || ny >= NUM_SECTORS_Y) continue;
+                
+                lock_guard<mutex> lock(g_sectors[ny][nx].m_lock);
+                for (int other_id : g_sectors[ny][nx].players) {
+                    auto other_it = g_clients.find(other_id);
+                    if (other_it == g_clients.end()) continue;
+                    auto other_session = other_it->second;
+
+                    bool was_in_view = IsInView(old_x, old_y, other_session->x, other_session->y);
+                    bool is_in_view = IsInView(session->x, session->y, other_session->x, other_session->y);
+
+                    if (is_in_view) {
+                        if (was_in_view) {
+                            other_session->do_send(move_pkt.size, &move_pkt);
+                        } else {
+                            // 새로 시야에 들어옴
+                            SendAddObject(other_session, session);
+                            SendAddObject(session, other_session);
+                        }
+                    } else if (was_in_view) {
+                        // 시야에서 벗어남
+                        SendRemoveObject(other_session, client_id);
+                        SendRemoveObject(session, other_id);
+                    }
+                }
+            }
+        }
         break;
     }
     case C2S_LOGOUT: {
         cout << "[Logout] Client " << client_id << " requested logout." << endl;
+        
+        // 주변 플레이어들에게 나를 제거하라고 알림
+        S2C_RemoveObject rem_pkt;
+        rem_pkt.size = sizeof(rem_pkt);
+        rem_pkt.type = S2C_REMOVE_OBJECT;
+        rem_pkt.object_id = client_id;
+        BroadcastToNeighbors(session->x, session->y, rem_pkt.size, &rem_pkt);
+
         closesocket(session->socket);
         break;
     }
