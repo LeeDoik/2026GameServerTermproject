@@ -4,6 +4,7 @@
 #include <thread>
 #include <atomic>
 #include <memory>
+#include <algorithm>
 #include <winsock2.h>
 #include <mswsock.h>
 #include <tbb/concurrent_map.h>
@@ -13,6 +14,60 @@
 #pragma comment(lib, "mswsock.lib")
 
 using namespace std;
+
+// --- 링 버퍼 (Ring Buffer) 구현 ---
+// 기존의 prev_recv 방식(포인터 이동)을 피하고, 원형 큐 형태로 데이터를 안전하게 적재 및 추출합니다.
+class RingBuffer {
+private:
+    vector<unsigned char> buffer;
+    int head;
+    int tail;
+    int capacity;
+    int current_size;
+
+public:
+    RingBuffer(int size = 8192) : capacity(size), head(0), tail(0), current_size(0) {
+        buffer.resize(size);
+    }
+
+    int GetStoredSize() const { return current_size; }
+    int GetFreeSpace() const { return capacity - current_size; }
+
+    bool Write(const unsigned char* data, int size) {
+        if (size > GetFreeSpace()) return false; // 오버플로우 방지
+        
+        int first_chunk = min(size, capacity - tail);
+        memcpy(&buffer[tail], data, first_chunk);
+        
+        if (size > first_chunk) {
+            memcpy(&buffer[0], data + first_chunk, size - first_chunk);
+        }
+        
+        tail = (tail + size) % capacity;
+        current_size += size;
+        return true;
+    }
+
+    bool Peek(unsigned char* dest, int size) const {
+        if (size > current_size) return false;
+        
+        int first_chunk = min(size, capacity - head);
+        memcpy(dest, &buffer[head], first_chunk);
+        
+        if (size > first_chunk) {
+            memcpy(dest + first_chunk, &buffer[0], size - first_chunk);
+        }
+        return true;
+    }
+
+    bool Read(unsigned char* dest, int size) {
+        if (!Peek(dest, size)) return false;
+        
+        head = (head + size) % capacity;
+        current_size -= size;
+        return true;
+    }
+};
 
 // --- 구조체 및 상수 정의 ---
 enum IO_TYPE { IO_RECV, IO_SEND, IO_ACCEPT };
@@ -38,6 +93,7 @@ struct SESSION {
     int id;
     SOCKET socket;
     OVERLAPPED_EX recv_overlapped;
+    RingBuffer packet_buffer; // 링 버퍼 객체 추가
     shared_ptr<string> name; 
     short x, y;
     bool is_active;
@@ -55,6 +111,8 @@ struct SESSION {
         DWORD flags = 0;
         DWORD recv_bytes = 0;
         memset(&recv_overlapped.overlapped, 0, sizeof(recv_overlapped.overlapped));
+        recv_overlapped.wsa_buf.buf = reinterpret_cast<char*>(recv_overlapped.buffer);
+        recv_overlapped.wsa_buf.len = sizeof(recv_overlapped.buffer);
         WSARecv(socket, &recv_overlapped.wsa_buf, 1, &recv_bytes, &flags, &recv_overlapped.overlapped, NULL);
     }
 
@@ -107,7 +165,6 @@ int main() {
 
     cout << "[Server] MMO Server Started. Port: " << PORT << endl;
 
-    // npc.cpp 방식의 초기 AcceptEx 호출
     OVERLAPPED_EX accept_over(IO_ACCEPT);
     accept_over.client_socket = WSASocket(AF_INET, SOCK_STREAM, 0, NULL, 0, WSA_FLAG_OVERLAPPED);
     g_fp_accept_ex(g_listen_socket, accept_over.client_socket, accept_over.buffer, 0,
@@ -165,7 +222,7 @@ void worker_thread() {
 
                 session->do_recv();
             }
-            // npc.cpp 방식: Accept 완료 후 즉시 다음 AcceptEx 예약
+            
             ov_ex->client_socket = WSASocket(AF_INET, SOCK_STREAM, 0, NULL, 0, WSA_FLAG_OVERLAPPED);
             memset(&ov_ex->overlapped, 0, sizeof(ov_ex->overlapped));
             g_fp_accept_ex(g_listen_socket, ov_ex->client_socket, ov_ex->buffer, 0,
@@ -185,10 +242,39 @@ void worker_thread() {
         }
 
         if (ov_ex->type == IO_RECV) {
-            process_packet(client_id, ov_ex->buffer);
             auto it = g_clients.find(client_id);
             if (it != g_clients.end()) {
-                it->second->do_recv();
+                auto session = it->second;
+                
+                // 1. 수신된 데이터를 링 버퍼에 기록
+                if (!session->packet_buffer.Write(ov_ex->buffer, bytes_transferred)) {
+                    cout << "[Error] RingBuffer overflow for Client " << client_id << endl;
+                    closesocket(session->socket);
+                    continue;
+                }
+
+                // 2. 완전한 패킷이 있는지 확인하고 조립 (TCP 스트림 파편화/뭉침 완전 해결)
+                while (true) {
+                    unsigned char packet_size = 0;
+                    // 패킷의 크기 정보(첫 번째 바이트)를 엿봄
+                    if (!session->packet_buffer.Peek(&packet_size, 1)) {
+                        break; // 처리할 데이터가 없음
+                    }
+
+                    // 버퍼에 저장된 데이터가 패킷의 크기 이상이면 온전한 패킷 완성
+                    if (session->packet_buffer.GetStoredSize() >= packet_size) {
+                        unsigned char packet_data[256]; // 임시 조립 버퍼 (프로토콜상 최대 255바이트)
+                        session->packet_buffer.Read(packet_data, packet_size);
+                        
+                        process_packet(client_id, packet_data);
+                    } else {
+                        // 아직 패킷이 덜 옴. 다음 Recv를 기다림
+                        break; 
+                    }
+                }
+
+                // 3. 다음 수신 예약
+                session->do_recv();
             }
         }
         else if (ov_ex->type == IO_SEND) {
