@@ -1,4 +1,5 @@
 #define NOMINMAX
+#define _SILENCE_CXX20_OLD_SHARED_PTR_ATOMIC_SUPPORT_DEPRECATION_WARNING
 #include <iostream>
 #include <vector>
 #include <thread>
@@ -7,18 +8,20 @@
 #include <algorithm>
 #include <winsock2.h>
 #include <mswsock.h>
-#include <tbb/concurrent_map.h>
 #include <mutex>
+#include <unordered_map>
 #include <unordered_set>
+#include <tbb/concurrent_hash_map.h>
 #include "protocol_2026.h"
+#include "Core/ObjectPool.h"
+#include "Core/Entity.h"
+#include "Core/OverlappedTypes.h"
+#include "Core/TimerManager.h"
 
 #pragma comment(lib, "ws2_32.lib")
 #pragma comment(lib, "mswsock.lib")
 
 using namespace std;
-
-// --- 구조체 및 상수 정의 ---
-enum IO_TYPE { IO_RECV, IO_SEND, IO_ACCEPT };
 
 // 링 버퍼 클래스 전방 선언
 class RingBuffer;
@@ -39,6 +42,15 @@ struct OVERLAPPED_EX {
     }
     OVERLAPPED_EX(IO_TYPE t) : OVERLAPPED_EX() { type = t; }
 };
+
+// IO_SEND 전용 OVERLAPPED_EX 풀. do_send마다 new/delete 비용 제거
+ObjectPool<OVERLAPPED_EX> g_send_pool;
+
+// Timer 만기 이벤트를 IOCP로 post할 때 사용하는 OVERLAPPED 풀
+ObjectPool<TimerOverlapped> g_timer_pool;
+
+// 전역 타이머 매니저. main에서 Start, worker_thread가 IO_TIMER로 처리
+TimerManager g_timer_manager;
 
 // --- 링 버퍼 (Ring Buffer) 구현 ---
 // 기존의 prev_recv 방식(포인터 이동)을 피하고, 원형 큐 형태로 데이터를 안전하게 적재 및 추출합니다.
@@ -94,22 +106,19 @@ public:
     }
 };
 
-struct SESSION {
-    int id;
+// Entity를 상속받아 id/x/y/view_list를 공유. Player는 네트워크 세션 관련 필드 추가
+struct Player : public Entity {
     SOCKET socket;
     OVERLAPPED_EX recv_overlapped;
-    RingBuffer packet_buffer; // 링 버퍼 객체 추가
-    shared_ptr<string> name; 
-    short x, y;
+    RingBuffer packet_buffer;
+    shared_ptr<string> name;
     bool is_active;
 
-    SESSION() : id(-1), socket(INVALID_SOCKET), is_active(false), recv_overlapped(IO_RECV) {
+    Player() : Entity(), socket(INVALID_SOCKET), recv_overlapped(IO_RECV), is_active(false) {
         name = make_shared<string>("Guest");
-        x = -1;
-        y = -1;
     }
 
-    ~SESSION() {
+    ~Player() override {
         if (socket != INVALID_SOCKET) closesocket(socket);
     }
 
@@ -123,7 +132,10 @@ struct SESSION {
     }
 
     void do_send(int num_bytes, void* mess) {
-        OVERLAPPED_EX* ov = new OVERLAPPED_EX(IO_SEND);
+        OVERLAPPED_EX* ov = g_send_pool.Acquire();
+        ov->type = IO_SEND;
+        memset(&ov->overlapped, 0, sizeof(ov->overlapped));
+        ov->wsa_buf.buf = reinterpret_cast<char*>(ov->buffer);
         ov->wsa_buf.len = num_bytes;
         memcpy(ov->buffer, mess, num_bytes);
         WSASend(socket, &ov->wsa_buf, 1, NULL, 0, &ov->overlapped, NULL);
@@ -131,7 +143,9 @@ struct SESSION {
 };
 
 // --- 글로벌 변수 ---
-tbb::concurrent_map<int, shared_ptr<SESSION>> g_clients;
+// TBB concurrent_hash_map: 버킷 단위 락. accessor 패턴으로 find/insert/erase 모두 동시 안전
+using ClientMap = tbb::concurrent_hash_map<int, std::shared_ptr<Player>>;
+ClientMap g_clients;
 atomic<int> g_next_id{ 0 };
 HANDLE g_h_iocp;
 SOCKET g_listen_socket;
@@ -191,15 +205,24 @@ bool IsInView(short x1, short y1, short x2, short y2) {
 }
 
 // 특정 섹터 내의 모든 플레이어에게 패킷 전송
+// 락 안에서는 세션 포인터만 수집하고, 락 밖에서 do_send 호출 (Send-Lockless 패턴)
 void SendToSector(int sx, int sy, int packet_size, void* packet) {
     if (sx < 0 || sx >= NUM_SECTORS_X || sy < 0 || sy >= NUM_SECTORS_Y) return;
 
-    lock_guard<mutex> lock(g_sectors[sy][sx].m_lock);
-    for (int pid : g_sectors[sy][sx].players) {
-        auto it = g_clients.find(pid);
-        if (it != g_clients.end()) {
-            it->second->do_send(packet_size, packet);
-        }
+    vector<int> ids;
+    {
+        lock_guard<mutex> lock(g_sectors[sy][sx].m_lock);
+        ids.reserve(g_sectors[sy][sx].players.size());
+        for (int pid : g_sectors[sy][sx].players) ids.push_back(pid);
+    }
+    vector<shared_ptr<Player>> targets;
+    targets.reserve(ids.size());
+    for (int pid : ids) {
+        ClientMap::const_accessor a;
+        if (g_clients.find(a, pid)) targets.push_back(a->second);
+    }
+    for (auto& s : targets) {
+        s->do_send(packet_size, packet);
     }
 }
 
@@ -216,7 +239,7 @@ void BroadcastToNeighbors(short x, short y, int packet_size, void* packet) {
 }
 
 // 특정 오브젝트 정보를 플레이어에게 전송 (Add)
-void SendAddObject(shared_ptr<SESSION> to_session, shared_ptr<SESSION> obj_session) {
+void SendAddObject(shared_ptr<Player> to_session, shared_ptr<Player> obj_session) {
     S2C_AddObject pkt;
     pkt.size = sizeof(pkt);
     pkt.type = S2C_ADD_OBJECT;
@@ -232,7 +255,7 @@ void SendAddObject(shared_ptr<SESSION> to_session, shared_ptr<SESSION> obj_sessi
 }
 
 // 특정 오브젝트 제거 정보를 플레이어에게 전송 (Remove)
-void SendRemoveObject(shared_ptr<SESSION> to_session, int obj_id) {
+void SendRemoveObject(shared_ptr<Player> to_session, int obj_id) {
     S2C_RemoveObject pkt;
     pkt.size = sizeof(pkt);
     pkt.type = S2C_REMOVE_OBJECT;
@@ -244,10 +267,16 @@ void SendRemoveObject(shared_ptr<SESSION> to_session, int obj_id) {
 // --- 함수 선언 ---
 void worker_thread();
 void process_packet(int client_id, unsigned char* ptr);
+int RunTimerTest();
 
-int main() {
+int main(int argc, char* argv[]) {
     ios_base::sync_with_stdio(false);
     cin.tie(NULL);
+
+    // 검증 모드: --test-timer 인자 있으면 IOCP/네트워크 초기화 없이 TimerManager만 테스트하고 종료
+    if (argc > 1 && string(argv[1]) == "--test-timer") {
+        return RunTimerTest();
+    }
 
     WSADATA wsaData;
     if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0) return 1;
@@ -279,6 +308,16 @@ int main() {
     accept_over.client_socket = WSASocket(AF_INET, SOCK_STREAM, 0, NULL, 0, WSA_FLAG_OVERLAPPED);
     g_fp_accept_ex(g_listen_socket, accept_over.client_socket, accept_over.buffer, 0,
         sizeof(SOCKADDR_IN) + 16, sizeof(SOCKADDR_IN) + 16, NULL, &accept_over.overlapped);
+
+    // 타이머 매니저 시작: 만기 시 IOCP에 IO_TIMER 이벤트 post
+    g_timer_manager.Start([](const TimerEvent& ev) {
+        auto* tov = g_timer_pool.Acquire();
+        tov->type = IO_TIMER;
+        tov->kind = ev.kind;
+        memset(&tov->overlapped, 0, sizeof(tov->overlapped));
+        PostQueuedCompletionStatus(g_h_iocp, 0,
+            static_cast<ULONG_PTR>(ev.entity_id), &tov->overlapped);
+    });
 
     vector<thread> worker_threads;
     int num_threads = thread::hardware_concurrency();
@@ -313,12 +352,16 @@ void worker_thread() {
             else {
                 SOCKET c_socket = ov_ex->client_socket;
                 int new_id = g_next_id++;
-                auto session = make_shared<SESSION>();
+                auto session = make_shared<Player>();
                 session->id = new_id;
                 session->socket = c_socket;
                 session->is_active = true;
 
-                g_clients[new_id] = session;
+                {
+                    ClientMap::accessor a;
+                    g_clients.insert(a, new_id);
+                    a->second = session;
+                }
                 CreateIoCompletionPort(reinterpret_cast<HANDLE>(c_socket), g_h_iocp, new_id, 0);
 
                 cout << "[Connect] Client Connected. ID: " << new_id << " (Total: " << g_clients.size() << ")" << endl;
@@ -340,22 +383,58 @@ void worker_thread() {
             continue;
         }
 
+        // 타이머 만기 이벤트는 PostQueuedCompletionStatus(bytes=0)로 들어오므로 disconnect 체크 전에 처리
+        if (ov_ex->type == IO_TIMER) {
+            auto* tov = reinterpret_cast<TimerOverlapped*>(ov_ex);
+            // Stage 4에서 kind/entity_id 기반 NPC AI 디스패치 추가 예정. 현재는 풀 반환만.
+            g_timer_pool.Release(tov);
+            continue;
+        }
+
         int client_id = static_cast<int>(completion_key);
 
         if (!result || bytes_transferred == 0) {
-            auto it = g_clients.find(client_id);
-            if (it != g_clients.end()) {
-                cout << "[Disconnect] Client Disconnected. ID: " << client_id << endl;
-                RemoveObjectFromSector(client_id, it->second->x, it->second->y, true);
-                g_clients.unsafe_erase(it);
+            shared_ptr<Player> disconnected;
+            {
+                ClientMap::const_accessor a;
+                if (g_clients.find(a, client_id)) disconnected = a->second;
             }
+            if (disconnected) {
+                cout << "[Disconnect] Client Disconnected. ID: " << client_id << endl;
+                RemoveObjectFromSector(client_id, disconnected->x, disconnected->y, true);
+
+                // view_list 스냅샷 + 클리어 → 시야에 있던 다른 entity들에게 Remove 통보, 그쪽 view_list에서도 제거
+                vector<int> viewers;
+                {
+                    lock_guard<mutex> lock(disconnected->view_lock);
+                    viewers.assign(disconnected->view_list.begin(), disconnected->view_list.end());
+                    disconnected->view_list.clear();
+                }
+                vector<shared_ptr<Player>> viewer_sessions;
+                viewer_sessions.reserve(viewers.size());
+                for (int id : viewers) {
+                    ClientMap::const_accessor a;
+                    if (g_clients.find(a, id)) viewer_sessions.push_back(a->second);
+                }
+                for (auto& other : viewer_sessions) {
+                    {
+                        lock_guard<mutex> lk(other->view_lock);
+                        other->view_list.erase(client_id);
+                    }
+                    SendRemoveObject(other, client_id);
+                }
+            }
+            g_clients.erase(client_id);
             continue;
         }
 
         if (ov_ex->type == IO_RECV) {
-            auto it = g_clients.find(client_id);
-            if (it != g_clients.end()) {
-                auto session = it->second;
+            shared_ptr<Player> session;
+            {
+                ClientMap::const_accessor a;
+                if (g_clients.find(a, client_id)) session = a->second;
+            }
+            if (session) {
                 
                 // 1. 수신된 데이터를 링 버퍼에 기록
                 if (!session->packet_buffer.Write(ov_ex->buffer, bytes_transferred)) {
@@ -389,7 +468,7 @@ void worker_thread() {
             }
         }
         else if (ov_ex->type == IO_SEND) {
-            delete ov_ex;
+            g_send_pool.Release(ov_ex);
         }
     }
 }
@@ -397,9 +476,12 @@ void worker_thread() {
 void process_packet(int client_id, unsigned char* ptr) {
     PACKET_TYPE type = static_cast<PACKET_TYPE>(ptr[1]);
 
-    auto it = g_clients.find(client_id);
-    if (it == g_clients.end()) return;
-    auto session = it->second;
+    shared_ptr<Player> session;
+    {
+        ClientMap::const_accessor a;
+        if (!g_clients.find(a, client_id)) return;
+        session = a->second;
+    }
 
     switch (type) {
     case C2S_LOGIN: {
@@ -421,27 +503,44 @@ void process_packet(int client_id, unsigned char* ptr) {
         info.hp = 100; info.max_hp = 100; info.exp = 0; info.level = 1; info.visualId = 0;
         session->do_send(info.size, &info);
 
-        // 2. 주변 플레이어들에게 나를 알리고, 나에게 주변 플레이어들을 알림
+        // 2. 초기 view_list 구축 + 상호 가시화
         int sx = session->x / SECTOR_SIZE;
         int sy = session->y / SECTOR_SIZE;
+        vector<int> candidate_ids;
         for (int dy = -1; dy <= 1; ++dy) {
             for (int dx = -1; dx <= 1; ++dx) {
                 int nx = sx + dx, ny = sy + dy;
                 if (nx < 0 || nx >= NUM_SECTORS_X || ny < 0 || ny >= NUM_SECTORS_Y) continue;
-                
                 lock_guard<mutex> lock(g_sectors[ny][nx].m_lock);
                 for (int other_id : g_sectors[ny][nx].players) {
                     if (other_id == client_id) continue;
-                    auto other_it = g_clients.find(other_id);
-                    if (other_it != g_clients.end()) {
-                        auto other_session = other_it->second;
-                        if (IsInView(session->x, session->y, other_session->x, other_session->y)) {
-                            SendAddObject(other_session, session); // 타인에게 나를 추가
-                            SendAddObject(session, other_session); // 나에게 타인을 추가
-                        }
-                    }
+                    candidate_ids.push_back(other_id);
                 }
             }
+        }
+        vector<shared_ptr<Player>> candidates;
+        candidates.reserve(candidate_ids.size());
+        for (int id : candidate_ids) {
+            ClientMap::const_accessor a;
+            if (g_clients.find(a, id)) candidates.push_back(a->second);
+        }
+        vector<shared_ptr<Player>> in_view;
+        {
+            lock_guard<mutex> lock(session->view_lock);
+            for (auto& other : candidates) {
+                if (IsInView(session->x, session->y, other->x, other->y)) {
+                    session->view_list.insert(other->id);
+                    in_view.push_back(other);
+                }
+            }
+        }
+        for (auto& other : in_view) {
+            {
+                lock_guard<mutex> lock(other->view_lock);
+                other->view_list.insert(client_id);
+            }
+            SendAddObject(other, session); // 타인에게 나를 추가
+            SendAddObject(session, other); // 나에게 타인을 추가
         }
 
         cout << "[Login] Client " << client_id << " logged in as: " << *atomic_load(&session->name) << " at (" << session->x << ", " << session->y << ")" << endl;
@@ -466,60 +565,168 @@ void process_packet(int client_id, unsigned char* ptr) {
         move_pkt.y = session->y;
         move_pkt.move_time = pkt->move_time;
 
-        // 주변 섹터에 알림 (시야 경계 처리 포함)
-        int old_sx = old_x / SECTOR_SIZE;
-        int old_sy = old_y / SECTOR_SIZE;
+        // view_list 기반 차분: 새 위치 9섹터에서 후보 수집 → 시야 필터 → 기존 view_list와 diff
+        // (기존 9섹터 풀스캔 방식은 멀리 이동 시 old view에 있던 원거리 entity에게 Remove를 못 보내는 버그가 있었음)
         int new_sx = session->x / SECTOR_SIZE;
         int new_sy = session->y / SECTOR_SIZE;
 
-        // 단순히 주변에 이동 알림 (최적화 전: 주변 9개 섹터 브로드캐스트)
-        // 실제로는 새로 시야에 들어온 사람에게는 Add, 나간 사람에게는 Remove를 보내야 함
+        vector<int> candidate_ids;
         for (int dy = -1; dy <= 1; ++dy) {
             for (int dx = -1; dx <= 1; ++dx) {
                 int nx = new_sx + dx, ny = new_sy + dy;
                 if (nx < 0 || nx >= NUM_SECTORS_X || ny < 0 || ny >= NUM_SECTORS_Y) continue;
-                
                 lock_guard<mutex> lock(g_sectors[ny][nx].m_lock);
                 for (int other_id : g_sectors[ny][nx].players) {
-                    auto other_it = g_clients.find(other_id);
-                    if (other_it == g_clients.end()) continue;
-                    auto other_session = other_it->second;
-
-                    bool was_in_view = IsInView(old_x, old_y, other_session->x, other_session->y);
-                    bool is_in_view = IsInView(session->x, session->y, other_session->x, other_session->y);
-
-                    if (is_in_view) {
-                        if (was_in_view) {
-                            other_session->do_send(move_pkt.size, &move_pkt);
-                        } else {
-                            // 새로 시야에 들어옴
-                            SendAddObject(other_session, session);
-                            SendAddObject(session, other_session);
-                        }
-                    } else if (was_in_view) {
-                        // 시야에서 벗어남
-                        SendRemoveObject(other_session, client_id);
-                        SendRemoveObject(session, other_id);
-                    }
+                    if (other_id == client_id) continue;
+                    candidate_ids.push_back(other_id);
                 }
             }
         }
+
+        // 후보 + 기존 view_list의 모든 ID를 일괄 조회
+        unordered_set<int> all_ids(candidate_ids.begin(), candidate_ids.end());
+        {
+            lock_guard<mutex> lock(session->view_lock);
+            for (int id : session->view_list) all_ids.insert(id);
+        }
+        unordered_map<int, shared_ptr<Player>> id_to_session;
+        for (int id : all_ids) {
+            ClientMap::const_accessor a;
+            if (g_clients.find(a, id)) id_to_session[id] = a->second;
+        }
+
+        // 시야 안인 entity 집합 (새 view)
+        unordered_set<int> new_view;
+        for (int id : candidate_ids) {
+            auto it = id_to_session.find(id);
+            if (it == id_to_session.end()) continue;
+            if (IsInView(session->x, session->y, it->second->x, it->second->y)) {
+                new_view.insert(id);
+            }
+        }
+
+        // diff: entered = new - old, left = old - new, stayed = new ∩ old. 한 락 안에서 처리 후 교체
+        vector<int> entered_ids, left_ids, stayed_ids;
+        {
+            lock_guard<mutex> lock(session->view_lock);
+            for (int id : new_view) {
+                if (session->view_list.count(id)) stayed_ids.push_back(id);
+                else entered_ids.push_back(id);
+            }
+            for (int id : session->view_list) {
+                if (!new_view.count(id)) left_ids.push_back(id);
+            }
+            session->view_list = new_view;
+        }
+
+        // 새로 시야에 들어온 entity: 상호 view_list 업데이트 + Add 전송
+        for (int id : entered_ids) {
+            auto it = id_to_session.find(id);
+            if (it == id_to_session.end()) continue;
+            auto& other = it->second;
+            {
+                lock_guard<mutex> lk(other->view_lock);
+                other->view_list.insert(client_id);
+            }
+            SendAddObject(other, session);
+            SendAddObject(session, other);
+        }
+        // 시야에서 벗어난 entity: 상호 view_list 정리 + Remove 전송
+        for (int id : left_ids) {
+            auto it = id_to_session.find(id);
+            if (it == id_to_session.end()) continue;
+            auto& other = it->second;
+            {
+                lock_guard<mutex> lk(other->view_lock);
+                other->view_list.erase(client_id);
+            }
+            SendRemoveObject(other, client_id);
+            SendRemoveObject(session, id);
+        }
+        // 유지된 entity: Move 패킷 전송
+        for (int id : stayed_ids) {
+            auto it = id_to_session.find(id);
+            if (it == id_to_session.end()) continue;
+            it->second->do_send(move_pkt.size, &move_pkt);
+        }
+        // 본인에게도 이동 확인 패킷 (클라이언트의 자기 위치 갱신용)
+        session->do_send(move_pkt.size, &move_pkt);
         break;
     }
     case C2S_LOGOUT: {
         cout << "[Logout] Client " << client_id << " requested logout." << endl;
-        
-        // 주변 플레이어들에게 나를 제거하라고 알림
-        S2C_RemoveObject rem_pkt;
-        rem_pkt.size = sizeof(rem_pkt);
-        rem_pkt.type = S2C_REMOVE_OBJECT;
-        rem_pkt.object_id = client_id;
-        BroadcastToNeighbors(session->x, session->y, rem_pkt.size, &rem_pkt);
-
+        // closesocket → IO 실패 → disconnect 경로가 view_list 정리/Remove 전송 담당
         closesocket(session->socket);
         break;
     }
     default:
         break;
     }
+}
+
+// --- TimerManager 검증 테스트 (--test-timer 모드) ---
+// N개의 더미 이벤트를 랜덤 딜레이로 schedule → 만기 순서/시간 정확도 측정 후 PASS/FAIL 출력
+int RunTimerTest() {
+    using namespace chrono;
+    constexpr int N = 1000;
+    constexpr int MIN_DELAY_MS = 50;
+    constexpr int MAX_DELAY_MS = 5000;
+    constexpr long long TOLERANCE_MS = 100;
+
+    cout << "[Timer Test] Scheduling " << N << " events, delays "
+         << MIN_DELAY_MS << "~" << MAX_DELAY_MS << "ms..." << endl;
+
+    struct FireRecord { int entity_id; steady_clock::time_point fire_time; };
+    vector<FireRecord> fires;
+    fires.reserve(N);
+    mutex log_mu;
+
+    TimerManager tm;
+    tm.Start([&](const TimerEvent& ev) {
+        auto now = steady_clock::now();
+        lock_guard<mutex> lock(log_mu);
+        fires.push_back({ ev.entity_id, now });
+    });
+
+    vector<int> expected_delays(N);
+    auto test_start = steady_clock::now();
+    for (int i = 0; i < N; ++i) {
+        int d = MIN_DELAY_MS + (rand() % (MAX_DELAY_MS - MIN_DELAY_MS));
+        expected_delays[i] = d;
+        tm.Schedule(i, TimerEventKind::TestPing, d);
+    }
+
+    this_thread::sleep_for(milliseconds(MAX_DELAY_MS + 1500));
+    tm.Stop();
+
+    const int fired = static_cast<int>(fires.size());
+    bool ordered = true;
+    for (size_t i = 1; i < fires.size(); ++i) {
+        if (fires[i].fire_time < fires[i - 1].fire_time) {
+            ordered = false;
+            cout << "[Timer Test] Out of order at index " << i << endl;
+            break;
+        }
+    }
+
+    long long max_lag = 0, total_lag = 0;
+    int over_tolerance = 0;
+    for (const auto& fr : fires) {
+        auto expected = test_start + milliseconds(expected_delays[fr.entity_id]);
+        long long lag = duration_cast<milliseconds>(fr.fire_time - expected).count();
+        if (lag < 0) lag = 0;
+        if (lag > max_lag) max_lag = lag;
+        if (lag > TOLERANCE_MS) over_tolerance++;
+        total_lag += lag;
+    }
+    long long avg_lag = (fired > 0) ? (total_lag / fired) : 0;
+
+    cout << "[Timer Test] Fired " << fired << "/" << N << endl;
+    cout << "[Timer Test] Ordering: " << (ordered ? "PASS" : "FAIL") << endl;
+    cout << "[Timer Test] Lag avg=" << avg_lag << "ms, max=" << max_lag
+         << "ms, over " << TOLERANCE_MS << "ms tolerance: " << over_tolerance << endl;
+
+    bool pass = (fired == N) && ordered && (over_tolerance == 0);
+    cout << "[Timer Test] Overall: " << (pass ? "PASS" : "FAIL") << endl;
+    return pass ? 0 : 1;
 }

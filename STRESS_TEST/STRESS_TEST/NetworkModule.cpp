@@ -28,7 +28,7 @@ const static int MAX_BUFF_SIZE = 255;
 
 #pragma comment (lib, "ws2_32.lib")
 
-#include "..\..\SERVER\SERVER\protocol.h"
+#include "..\..\MMOSERVER_Termproject\MMOSERVER_Termproject\protocol_2026.h"
 
 HANDLE g_hiocp;
 
@@ -64,15 +64,15 @@ atomic_int num_connections;
 atomic_int client_to_close;
 atomic_int active_clients;
 
-int			global_delay;				// ms´ÜÀ§, 1000ÀÌ ³ÑÀ¸¸é Å¬¶óÀÌ¾ðÆ® Áõ°¡ Á¾·á
-char		g_server_ip[64];			// Á¢¼ÓÇÒ ¼­¹ö IP ÁÖ¼Ò
+int			global_delay;				// msï¿½ï¿½ï¿½ï¿½, 1000ï¿½ï¿½ ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ Å¬ï¿½ï¿½ï¿½Ì¾ï¿½Æ® ï¿½ï¿½ï¿½ï¿½ ï¿½ï¿½ï¿½ï¿½
+char		g_server_ip[64];			// ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ ï¿½ï¿½ï¿½ï¿½ IP ï¿½Ö¼ï¿½
 
 vector <thread*> worker_threads;
 thread test_thread;
 
 float point_cloud[MAX_TEST * 2];
 
-// ³ªÁß¿¡ NPC±îÁö Ãß°¡ È®Àå ¿ë
+// ï¿½ï¿½ï¿½ß¿ï¿½ NPCï¿½ï¿½ï¿½ï¿½ ï¿½ß°ï¿½ È®ï¿½ï¿½ ï¿½ï¿½
 struct ALIEN {
 	int id;
 	int x, y;
@@ -89,7 +89,7 @@ void error_display(const char* msg, int err_no)
 		MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT),
 		(LPTSTR)&lpMsgBuf, 0, NULL);
 	std::cout << msg;
-	std::wcout << L"¿¡·¯" << lpMsgBuf << std::endl;
+	std::wcout << L"ï¿½ï¿½ï¿½ï¿½" << lpMsgBuf << std::endl;
 
 	MessageBox(hWnd, lpMsgBuf, L"ERROR", 0);
 	LocalFree(lpMsgBuf);
@@ -147,10 +147,10 @@ void ProcessPacket(int ci, unsigned char packet[])
 			//g_window->close();
 		}
 	}
-	case S2C_MOVE_PLAYER: {
-		S2C_MovePlayer* move_packet = reinterpret_cast<S2C_MovePlayer*>(packet);
-		if (move_packet->playerId < MAX_CLIENTS) {
-			int my_id = client_map[move_packet->playerId];
+	case S2C_MOVE_OBJECT: {
+		S2C_MoveObject* move_packet = reinterpret_cast<S2C_MoveObject*>(packet);
+		if (move_packet->object_id < MAX_CLIENTS) {
+			int my_id = client_map[move_packet->object_id];
 			if (-1 != my_id) {
 				g_clients[my_id].x = move_packet->x;
 				g_clients[my_id].y = move_packet->y;
@@ -166,8 +166,10 @@ void ProcessPacket(int ci, unsigned char packet[])
 		}
 	}
 					   break;
-	case S2C_ADD_PLAYER: break;
-	case S2C_REMOVE_PLAYER: break;
+	case S2C_ADD_OBJECT: break;
+	case S2C_REMOVE_OBJECT: break;
+	case S2C_CHAT_MESSAGE: break;
+	case S2C_STATUS_CHANGE: break;
 	case S2C_AVATAR_INFO:
 	{
 		g_clients[ci].connected = true;
@@ -222,7 +224,7 @@ void Worker_Thread()
 			while (io_size > 0) {
 				if (0 == psize) psize = buf[0];
 				if (io_size + pr_size >= psize) {
-					// Áö±Ý ÆÐÅ¶ ¿Ï¼º °¡´É
+					// ï¿½ï¿½ï¿½ï¿½ ï¿½ï¿½Å¶ ï¿½Ï¼ï¿½ ï¿½ï¿½ï¿½ï¿½
 					unsigned char packet[MAX_PACKET_SIZE];
 					memcpy(packet, g_clients[ci].packet_buf, pr_size);
 					memcpy(packet + pr_size, buf, psize - pr_size);
@@ -361,13 +363,17 @@ void Test_Thread()
 			C2S_Move my_packet;
 			my_packet.size = sizeof(my_packet);
 			my_packet.type = C2S_MOVE;
+			short nx = static_cast<short>(g_clients[i].x);
+			short ny = static_cast<short>(g_clients[i].y);
 			switch (rand() % 4) {
-			case 0: my_packet.dir = UP; break;
-			case 1: my_packet.dir = DOWN; break;
-			case 2: my_packet.dir = LEFT; break;
-			case 3: my_packet.dir = RIGHT; break;
+			case 0: if (ny > 0) ny--; break;
+			case 1: if (ny < WORLD_HEIGHT - 1) ny++; break;
+			case 2: if (nx > 0) nx--; break;
+			case 3: if (nx < WORLD_WIDTH - 1) nx++; break;
 			}
-			my_packet.move_time = static_cast<unsigned>(duration_cast<milliseconds>(high_resolution_clock::now().time_since_epoch()).count());
+			my_packet.x = nx;
+			my_packet.y = ny;
+			my_packet.move_time = static_cast<int>(duration_cast<milliseconds>(high_resolution_clock::now().time_since_epoch()).count());
 			SendPacket(i, &my_packet);
 		}
 	}
@@ -375,14 +381,14 @@ void Test_Thread()
 
 void InitializeNetwork()
 {
-	std::cout << "¼­¹ö IP ÁÖ¼Ò¸¦ ÀÔ·ÂÇÏ¼¼¿ä (±âº»°ª: 127.0.0.1): ";
+	std::cout << "ï¿½ï¿½ï¿½ï¿½ IP ï¿½Ö¼Ò¸ï¿½ ï¿½Ô·ï¿½ï¿½Ï¼ï¿½ï¿½ï¿½ (ï¿½âº»ï¿½ï¿½: 127.0.0.1): ";
 	std::string input_ip;
 	std::getline(std::cin, input_ip);
 	if (input_ip.empty())
 		strncpy_s(g_server_ip, "127.0.0.1", sizeof(g_server_ip) - 1);
 	else
 		strncpy_s(g_server_ip, input_ip.c_str(), sizeof(g_server_ip) - 1);
-	std::cout << "Á¢¼Ó IP: " << g_server_ip << std::endl;
+	std::cout << "ï¿½ï¿½ï¿½ï¿½ IP: " << g_server_ip << std::endl;
 
 	for (auto& cl : g_clients) {
 		cl.connected = false;
