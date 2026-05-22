@@ -1,0 +1,307 @@
+  3. 몬스터 NPC 스프라이트
+
+  3a. Peace + Roaming (피격 전엔 비공격적, 약한 몹)
+
+  A sprite sheet for a low-level passive dungeon creature: a bloated,
+  sickly forest goblin scavenger with tattered loincloth and rusty
+  dagger. Diablo-inspired, top-down 2D. 4 rows x 4 columns, each
+  cell 64x64 px. Total 256x256 px. Transparent background.
+  Same row order as hero: down/left/right/up walking, 4 frames each.
+  Character should look weak, hunched, with sallow green-gray skin.
+    Style: dark fantasy 2D top-down RPG, Diablo-inspired, gothic, gritty,
+  hand-painted illustration aesthetic with crisp edges suitable for
+  clean tile-based rendering. Muted color palette dominated by
+  charcoal, dark stone gray, blood red, tarnished bronze, deep cobalt,
+  torch-lit amber. High contrast lighting with warm rim light and
+  cool ambient shadow. No anime/chibi style, no cartoon outlines,
+  no modern cel-shading. PNG with transparent background unless
+  specified otherwise. View angle: strict orthogonal top-down
+  (not isometric), camera looking straight down at ~80 degrees.
+Top-down view at approximately 80 degrees (NOT pure overhead,
+  NOT isometric, NOT side view). Designed to be placed on a
+  flat orthogonal 64px tile grid. Character occupies 60-80% of
+  the tile cell, slight downward perspective so head and
+  shoulders dominate while feet are visible.
+
+  3b. Agro + Roaming (선공형 강한 몹 — Orc)
+
+  A sprite sheet for an aggressive dark fantasy orc warrior NPC,
+  top-down 2D, Diablo-inspired. Hulking green-skinned orc with
+  spiked iron pauldron, leather kilt, wielding a jagged cleaver.
+  Bloodthirsty stance, exposed yellow tusks.
+  4 rows x 4 columns, each cell 64x64 px. Total 256x256 px.
+  Transparent background. Same row layout: down/left/right/up walking.
+  Orc fills the cell more than the goblin, slightly larger silhouette
+  to convey threat. Battle scars and bandages visible.
+    Style: dark fantasy 2D top-down RPG, Diablo-inspired, gothic, gritty,
+  hand-painted illustration aesthetic with crisp edges suitable for
+  clean tile-based rendering. Muted color palette dominated by
+  charcoal, dark stone gray, blood red, tarnished bronze, deep cobalt,
+  torch-lit amber. High contrast lighting with warm rim light and
+  cool ambient shadow. No anime/chibi style, no cartoon outlines,
+  no modern cel-shading. PNG with transparent background unless
+  specified otherwise. View angle: strict orthogonal top-down
+  (not isometric), camera looking straight down at ~80 degrees.
+Top-down view at approximately 80 degrees (NOT pure overhead,
+  NOT isometric, NOT side view). Designed to be placed on a
+  flat orthogonal 64px tile grid. Character occupies 60-80% of
+  the tile cell, slight downward perspective so head and
+  shoulders dominate while feet are visible.
+
+  3c. Fixed (고정 몹 — 경비형)
+
+  A sprite sheet for a stationary skeleton sentinel NPC for a
+  top-down 2D dark fantasy dungeon, Diablo-inspired. Ancient
+  skeletal knight in tarnished armor, holding a tall halberd,
+  glowing faint blue eye sockets. 4 rows x 2 columns, each cell
+  64x64 px. Total 128x256 px. Transparent background.
+  - Row 1: idle facing DOWN, 2 frames (subtle breath/sway)
+  - Row 2: idle facing LEFT, 2 frames
+  - Row 3: idle facing RIGHT, 2 frames
+  - Row 4: idle facing UP, 2 frames
+    Style: dark fantasy 2D top-down RPG, Diablo-inspired, gothic, gritty,
+  hand-painted illustration aesthetic with crisp edges suitable for
+  clean tile-based rendering. Muted color palette dominated by
+  charcoal, dark stone gray, blood red, tarnished bronze, deep cobalt,
+  torch-lit amber. High contrast lighting with warm rim light and
+  cool ambient shadow. No anime/chibi style, no cartoon outlines,
+  no modern cel-shading. PNG with transparent background unless
+  specified otherwise. View angle: strict orthogonal top-down
+  (not isometric), camera looking straight down at ~80 degrees.
+Top-down view at approximately 80 degrees (NOT pure overhead,
+  NOT isometric, NOT side view). Designed to be placed on a
+  flat orthogonal 64px tile grid. Character occupies 60-80% of
+  the tile cell, slight downward perspective so head and
+  shoulders dominate while feet are visible.
+
+  3d. (가산점용) 보스
+
+  A boss monster sprite for top-down 2D dark fantasy RPG,
+  Diablo-inspired. A massive demonic overlord: 4 horns, crimson
+  skin, two-handed flame greatsword, smoldering eyes. Stands twice
+  the size of regular enemies. Single full-body pose, 192x192 px,
+  transparent background. Threatening centered stance facing down.
+  Aura of faint dark fire wisps around silhouette.
+    Style: dark fantasy 2D top-down RPG, Diablo-inspired, gothic, gritty,
+  hand-painted illustration aesthetic with crisp edges suitable for
+  clean tile-based rendering. Muted color palette dominated by
+  charcoal, dark stone gray, blood red, tarnished bronze, deep cobalt,
+  torch-lit amber. High contrast lighting with warm rim light and
+  cool ambient shadow. No anime/chibi style, no cartoon outlines,
+  no modern cel-shading. PNG with transparent background unless
+  specified otherwise. View angle: strict orthogonal top-down
+  (not isometric), camera looking straight down at ~80 degrees.
+Top-down view at approximately 80 degrees (NOT pure overhead,
+  NOT isometric, NOT side view). Designed to be placed on a
+  flat orthogonal 64px tile grid. Character occupies 60-80% of
+  the tile cell, slight downward perspective so head and
+  shoulders dominate while feet are visible.
+
+  ---
+  4. UI 요소
+
+  4a. HP/MP 구슬 (디아블로 시그니처)
+
+  Two ornate fantasy RPG status orbs for a game HUD, Diablo-inspired.
+  Side-by-side layout, total image 512x256 px. Transparent background.
+  - Left orb: red HP globe, glowing inner liquid (blood-like),
+    surrounded by an ornate tarnished bronze frame with skull motif
+  - Right orb: blue MP globe, swirling mana liquid, same bronze
+    frame style with arcane rune motif
+  Each orb is roughly 256x256 px circular with the frame.
+  The liquid inside should look ready to be programmatically masked
+  (simple radial shape, fillable from bottom up).
+   Style: dark fantasy 2D top-down RPG, Diablo-inspired, gothic, gritty,
+  hand-painted illustration aesthetic with crisp edges suitable for
+  clean tile-based rendering. Muted color palette dominated by
+  charcoal, dark stone gray, blood red, tarnished bronze, deep cobalt,
+  torch-lit amber. High contrast lighting with warm rim light and
+  cool ambient shadow. No anime/chibi style, no cartoon outlines,
+  no modern cel-shading. PNG with transparent background unless
+  specified otherwise. View angle: strict orthogonal top-down
+  (not isometric), camera looking straight down at ~80 degrees.
+
+  4b. 경험치(EXP) 바
+
+  A horizontal experience bar for a dark fantasy RPG HUD,
+  Diablo-inspired. Image size: 1024x48 px.
+  A long bronze-rimmed bar frame with gothic embellishments on
+  both ends, the inner fill area is empty (will be filled with
+  amber/gold glow at runtime). Transparent background.
+  Provide also a separate 16x32 px "fill texture" tile: a vertical
+  strip of glowing amber liquid that can be repeated horizontally
+  to fill the bar.
+   Style: dark fantasy 2D top-down RPG, Diablo-inspired, gothic, gritty,
+  hand-painted illustration aesthetic with crisp edges suitable for
+  clean tile-based rendering. Muted color palette dominated by
+  charcoal, dark stone gray, blood red, tarnished bronze, deep cobalt,
+  torch-lit amber. High contrast lighting with warm rim light and
+  cool ambient shadow. No anime/chibi style, no cartoon outlines,
+  no modern cel-shading. PNG with transparent background unless
+  specified otherwise. View angle: strict orthogonal top-down
+  (not isometric), camera looking straight down at ~80 degrees.
+
+  4c. 채팅창 / 메시지 패널
+
+  A dark fantasy RPG chat panel UI element, Diablo-inspired.
+  Image size 512x192 px. A weathered parchment scroll with
+  slightly torn edges, set inside a tarnished bronze frame with
+  small skull rivets at the four corners. The parchment area is
+  mostly empty (text will be drawn in engine), with a faint dark
+  ink texture so white/light text reads cleanly.
+  Transparent background outside the panel.
+    Style: dark fantasy 2D top-down RPG, Diablo-inspired, gothic, gritty,
+  hand-painted illustration aesthetic with crisp edges suitable for
+  clean tile-based rendering. Muted color palette dominated by
+  charcoal, dark stone gray, blood red, tarnished bronze, deep cobalt,
+  torch-lit amber. High contrast lighting with warm rim light and
+  cool ambient shadow. No anime/chibi style, no cartoon outlines,
+  no modern cel-shading. PNG with transparent background unless
+  specified otherwise. View angle: strict orthogonal top-down
+  (not isometric), camera looking straight down at ~80 degrees.
+
+  4d. (선택) 인벤토리 슬롯
+
+  An RPG inventory slot tile, dark fantasy, Diablo-inspired.
+  A single 64x64 px square: tarnished bronze rivet-cornered frame,
+  slightly recessed inner area with dark velvet texture.
+  Designed to tile horizontally and vertically into an inventory
+  grid. Transparent background outside the slot bevel.
+   Style: dark fantasy 2D top-down RPG, Diablo-inspired, gothic, gritty,
+  hand-painted illustration aesthetic with crisp edges suitable for
+  clean tile-based rendering. Muted color palette dominated by
+  charcoal, dark stone gray, blood red, tarnished bronze, deep cobalt,
+  torch-lit amber. High contrast lighting with warm rim light and
+  cool ambient shadow. No anime/chibi style, no cartoon outlines,
+  no modern cel-shading. PNG with transparent background unless
+  specified otherwise. View angle: strict orthogonal top-down
+  (not isometric), camera looking straight down at ~80 degrees.
+
+  ---
+  5. 전투/상태 이펙트 (스프라이트 시트)
+
+  5a. 슬래시 (검 휘두름)
+
+  A sword slash effect sprite sheet for a top-down 2D RPG,
+  Diablo-inspired. 1 row x 6 columns, each frame 96x96 px.
+  Total 576x96 px. Transparent background.
+  An arc-shaped white-to-red energy slash, appearing then fading,
+  6 frames of animation. Frame 1 = tiny streak, frame 3 = full arc
+  peak (brightest), frame 6 = thin fading wisp. Cool metallic
+  white core with hot red outer glow.
+    Style: dark fantasy 2D top-down RPG, Diablo-inspired, gothic, gritty,
+  hand-painted illustration aesthetic with crisp edges suitable for
+  clean tile-based rendering. Muted color palette dominated by
+  charcoal, dark stone gray, blood red, tarnished bronze, deep cobalt,
+  torch-lit amber. High contrast lighting with warm rim light and
+  cool ambient shadow. No anime/chibi style, no cartoon outlines,
+  no modern cel-shading. PNG with transparent background unless
+  specified otherwise. View angle: strict orthogonal top-down
+  (not isometric), camera looking straight down at ~80 degrees.
+
+  5b. 피격 핏방울
+
+  A blood splatter hit effect sprite sheet, top-down 2D,
+  Diablo-inspired (gritty but not over-the-top gory).
+  1 row x 5 columns, each frame 64x64 px. Total 320x64 px.
+  Transparent background. Frame 1 = small impact, frame 3 = full
+  splash with droplets, frame 5 = fading stain. Deep crimson color.
+    Style: dark fantasy 2D top-down RPG, Diablo-inspired, gothic, gritty,
+  hand-painted illustration aesthetic with crisp edges suitable for
+  clean tile-based rendering. Muted color palette dominated by
+  charcoal, dark stone gray, blood red, tarnished bronze, deep cobalt,
+  torch-lit amber. High contrast lighting with warm rim light and
+  cool ambient shadow. No anime/chibi style, no cartoon outlines,
+  no modern cel-shading. PNG with transparent background unless
+  specified otherwise. View angle: strict orthogonal top-down
+  (not isometric), camera looking straight down at ~80 degrees.
+
+  5c. 사망 이펙트 (영혼 떠오름)
+
+  A death effect sprite sheet for a top-down 2D dark fantasy RPG.
+  1 row x 8 columns, each frame 96x128 px. Total 768x128 px.
+  Transparent background.
+  A ghostly pale-blue soul wisp rising from the ground and
+  dissipating upward over 8 frames. Frame 1 = compact glow at
+  ground level, frames 2–5 = elongating into a humanoid wisp
+  silhouette, frames 6–8 = fragmenting into faint particles.
+   Style: dark fantasy 2D top-down RPG, Diablo-inspired, gothic, gritty,
+  hand-painted illustration aesthetic with crisp edges suitable for
+  clean tile-based rendering. Muted color palette dominated by
+  charcoal, dark stone gray, blood red, tarnished bronze, deep cobalt,
+  torch-lit amber. High contrast lighting with warm rim light and
+  cool ambient shadow. No anime/chibi style, no cartoon outlines,
+  no modern cel-shading. PNG with transparent background unless
+  specified otherwise. View angle: strict orthogonal top-down
+  (not isometric), camera looking straight down at ~80 degrees.
+
+  5d. 리스폰 / 부활 (빛기둥)
+
+  A resurrection light pillar effect sprite sheet, top-down 2D,
+  Diablo-inspired (holy but slightly grim). 1 row x 6 columns,
+  each frame 96x160 px. Total 576x160 px. Transparent background.
+  A vertical beam of warm golden light descending from above, with
+  particles swirling around it. Frame 1 = beam appears thin,
+  frame 3 = full bright column, frame 6 = beam fades leaving
+  sparkles. Ground impact ring on frames 3–5.
+   Style: dark fantasy 2D top-down RPG, Diablo-inspired, gothic, gritty,
+  hand-painted illustration aesthetic with crisp edges suitable for
+  clean tile-based rendering. Muted color palette dominated by
+  charcoal, dark stone gray, blood red, tarnished bronze, deep cobalt,
+  torch-lit amber. High contrast lighting with warm rim light and
+  cool ambient shadow. No anime/chibi style, no cartoon outlines,
+  no modern cel-shading. PNG with transparent background unless
+  specified otherwise. View angle: strict orthogonal top-down
+  (not isometric), camera looking straight down at ~80 degrees.
+
+  5e. 레벨업
+
+  A level-up burst effect sprite sheet for a top-down 2D RPG,
+  Diablo-inspired. 1 row x 7 columns, each frame 128x128 px.
+  Total 896x128 px. Transparent background.
+  A radial burst of gold-and-crimson energy rings expanding outward
+  from a central point, ending with sparkling motes drifting up.
+  Frame 1 = small concentrated glow, frame 4 = peak expansion
+  (largest ring), frame 7 = fade with rising sparks.
+  Style: dark fantasy 2D top-down RPG, Diablo-inspired, gothic, gritty,
+  hand-painted illustration aesthetic with crisp edges suitable for
+  clean tile-based rendering. Muted color palette dominated by
+  charcoal, dark stone gray, blood red, tarnished bronze, deep cobalt,
+  torch-lit amber. High contrast lighting with warm rim light and
+  cool ambient shadow. No anime/chibi style, no cartoon outlines,
+  no modern cel-shading. PNG with transparent background unless
+  specified otherwise. View angle: strict orthogonal top-down
+  (not isometric), camera looking straight down at ~80 degrees.
+
+  5f. (선택) 데미지 숫자 배경
+
+  A floating damage number plaque background for an RPG HUD,
+  Diablo-inspired. Image 128x48 px, transparent background.
+  A small torn parchment fragment with a dark blood-red stain,
+  designed to sit behind a bright red numeric text rendered in
+  the engine. Slight tilt of -5 degrees for dynamic feel.
+   Style: dark fantasy 2D top-down RPG, Diablo-inspired, gothic, gritty,
+  hand-painted illustration aesthetic with crisp edges suitable for
+  clean tile-based rendering. Muted color palette dominated by
+  charcoal, dark stone gray, blood red, tarnished bronze, deep cobalt,
+  torch-lit amber. High contrast lighting with warm rim light and
+  cool ambient shadow. No anime/chibi style, no cartoon outlines,
+  no modern cel-shading. PNG with transparent background unless
+  specified otherwise. View angle: strict orthogonal top-down
+  (not isometric), camera looking straight down at ~80 degrees.
+
+  ---
+  📦 우선순위 추천
+
+  Stage 5(전투+HP+사망/리스폰+채팅)에 최소한 필요한 것 (이거부터 만드세요):
+
+  1. 던전 타일맵 (1) — 현 체스보드 교체용, 게임 인상 70%
+  2. 플레이어 4방향 walk (2) — 캐릭터 이동 시각화
+  3. Agro Orc 스프라이트 (3b) — 가장 자주 보이는 적
+  4. HP/MP 구슬 (4a) — Stage 5 HP 시스템과 직결
+  5. 슬래시 + 핏방울 (5a, 5b) — 공격 명중감
+  6. 사망 + 리스폰 이펙트 (5c, 5d) — 30초 부활 사이클 시각화
+  7. 채팅창 (4c) — 채팅 패킷 도착 시 표시
+  8. 레벨업 이펙트 (5e) — EXP 시스템의 보상감
+
+  여유 되면: Peace 고블린(3a) → Skeleton(3c) → 인벤(4d) → 보스(3d)

@@ -146,6 +146,7 @@ void ProcessPacket(int ci, unsigned char packet[])
 			DisconnectClient(ci);
 			//g_window->close();
 		}
+		break;  // (이전 fall-through 버그 수정)
 	}
 	case S2C_MOVE_OBJECT: {
 		S2C_MoveObject* move_packet = reinterpret_cast<S2C_MoveObject*>(packet);
@@ -170,6 +171,12 @@ void ProcessPacket(int ci, unsigned char packet[])
 	case S2C_REMOVE_OBJECT: break;
 	case S2C_CHAT_MESSAGE: break;
 	case S2C_STATUS_CHANGE: break;
+	// Stage 5에 추가된 패킷들 — 스트레스 더미 클라는 시각 효과 / 데미지 무시
+	case S2C_ATTACK_ANIM: break;
+	case S2C_DAMAGE: break;
+	case S2C_DEATH: break;
+	case S2C_RESPAWN: break;
+	case S2C_LEVEL_UP: break;
 	case S2C_AVATAR_INFO:
 	{
 		g_clients[ci].connected = true;
@@ -187,8 +194,7 @@ void ProcessPacket(int ci, unsigned char packet[])
 		//SendPacket(my_id, &t_packet);
 	}
 	break;
-	default: MessageBox(hWnd, L"Unknown Packet Type", L"ERROR", 0);
-		while (true);
+	default: break;  // 알 수 없는 패킷은 조용히 무시 (기존: MessageBox+무한루프 → 테스트 전체 정지)
 	}
 }
 

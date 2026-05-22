@@ -12,11 +12,18 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <tbb/concurrent_hash_map.h>
+#include <random>
+#include <chrono>
 #include "protocol_2026.h"
 #include "Core/ObjectPool.h"
 #include "Core/Entity.h"
 #include "Core/OverlappedTypes.h"
 #include "Core/TimerManager.h"
+#include "Core/NPC.h"
+#include "Core/World.h"
+#include "Core/NpcSpawner.h"
+#include "Core/LuaVM.h"
+#include "Core/GameConfig.h"
 
 #pragma comment(lib, "ws2_32.lib")
 #pragma comment(lib, "mswsock.lib")
@@ -51,6 +58,9 @@ ObjectPool<TimerOverlapped> g_timer_pool;
 
 // 전역 타이머 매니저. main에서 Start, worker_thread가 IO_TIMER로 처리
 TimerManager g_timer_manager;
+
+// 전역 Lua VM. 부팅 시 npc_ai.lua 로드. AI 디스패치는 추후 단계에서 연결
+LuaVM g_lua;
 
 // --- 링 버퍼 (Ring Buffer) 구현 ---
 // 기존의 prev_recv 방식(포인터 이동)을 피하고, 원형 큐 형태로 데이터를 안전하게 적재 및 추출합니다.
@@ -114,7 +124,15 @@ struct Player : public Entity {
     shared_ptr<string> name;
     bool is_active;
 
-    Player() : Entity(), socket(INVALID_SOCKET), recv_overlapped(IO_RECV), is_active(false) {
+    // 전투/스탯 — Stage 5
+    atomic<int> hp;
+    atomic<int> max_hp;
+    atomic<unsigned long long> exp;
+    atomic<unsigned char> level;
+    atomic<long long> last_attack_ms;  // 쿨타임 검증용
+
+    Player() : Entity(), socket(INVALID_SOCKET), recv_overlapped(IO_RECV), is_active(false),
+               hp(100), max_hp(100), exp(0), level(1), last_attack_ms(0) {
         name = make_shared<string>("Guest");
     }
 
@@ -260,8 +278,620 @@ void SendRemoveObject(shared_ptr<Player> to_session, int obj_id) {
     pkt.size = sizeof(pkt);
     pkt.type = S2C_REMOVE_OBJECT;
     pkt.object_id = obj_id;
-    
+
     to_session->do_send(pkt.size, &pkt);
+}
+
+// --- NPC 관련 헬퍼 (Stage 4) ---
+
+// NPC 정보를 S2C_AddObject 포맷으로 플레이어에게 전송. client는 object_id >= NPC_ID_START로 NPC 식별
+void SendAddNpc(shared_ptr<Player> to_session, NPC& npc) {
+    S2C_AddObject pkt;
+    pkt.size = sizeof(pkt);
+    pkt.type = S2C_ADD_OBJECT;
+    pkt.object_id = npc.id;
+    pkt.x = npc.x;
+    pkt.y = npc.y;
+    pkt.visual_id = npc.visual_id;
+    strncpy_s(pkt.obj_name, sizeof(pkt.obj_name), npc.name, _TRUNCATE);
+    pkt.hp = npc.hp;
+    pkt.max_hp = npc.max_hp;
+    pkt.level = npc.level;
+    pkt.exp = 0;
+    to_session->do_send(pkt.size, &pkt);
+}
+
+// 워커 스레드 로컬 RNG. NPC AI tick에서 1칸 이동 방향 결정
+static thread_local std::mt19937 t_npc_rng{
+    static_cast<uint32_t>(std::chrono::steady_clock::now().time_since_epoch().count())
+        ^ static_cast<uint32_t>(std::hash<std::thread::id>{}(std::this_thread::get_id()))
+};
+
+void NpcOnMove(int npc_id);
+void NpcOnRespawn(int npc_id);
+void PlayerOnDeath(std::shared_ptr<Player> session);
+void PlayerOnHpRegen(int client_id);
+
+// 플레이어 시점에서 자기 시야 안의 NPC와 view_list를 동기화.
+// 새로 시야에 들어온 NPC: Add 전송 + 양방향 view 등록 + Lazy AI 활성
+// 시야에서 벗어난 NPC: Remove 전송 + 양방향 view 해제
+// 유지된 NPC: 아무 것도 하지 않음 (NPC가 직접 Move 패킷을 보냄)
+void SyncPlayerNpcView(shared_ptr<Player> player) {
+    int sx = player->x / SECTOR_SIZE;
+    int sy = player->y / SECTOR_SIZE;
+
+    vector<int> candidate_nids;
+    for (int dy = -1; dy <= 1; ++dy) {
+        for (int dx = -1; dx <= 1; ++dx) {
+            int nx = sx + dx, ny = sy + dy;
+            if (nx < 0 || nx >= NUM_SECTORS_X || ny < 0 || ny >= NUM_SECTORS_Y) continue;
+            lock_guard<mutex> lock(g_sectors[ny][nx].m_lock);
+            for (int nid : g_sectors[ny][nx].npcs) candidate_nids.push_back(nid);
+        }
+    }
+
+    unordered_set<int> new_view;
+    for (int nid : candidate_nids) {
+        NPC& n = GetNpc(nid);
+        if (IsInView(player->x, player->y, n.x, n.y)) {
+            new_view.insert(nid);
+        }
+    }
+
+    vector<int> entered, left;
+    {
+        lock_guard<mutex> lock(player->view_lock);
+        for (int nid : new_view) {
+            if (player->view_list.count(nid) == 0) entered.push_back(nid);
+        }
+        for (int id : player->view_list) {
+            if (!IsNpcId(id)) continue;          // player diff는 별도 경로에서 처리
+            if (new_view.count(id) == 0) left.push_back(id);
+        }
+        for (int nid : entered) player->view_list.insert(nid);
+        for (int nid : left)    player->view_list.erase(nid);
+    }
+
+    for (int nid : entered) {
+        NPC& n = GetNpc(nid);
+        {
+            lock_guard<mutex> lk(n.view_lock);
+            n.view_list.insert(player->id);
+        }
+        SendAddNpc(player, n);
+
+        // Lazy AI: 비활성 상태였다면 활성화 + 첫 타이머 등록 (CAS로 중복 등록 방지)
+        bool expected = false;
+        if (n.active.compare_exchange_strong(expected, true)) {
+            g_timer_manager.Schedule(nid, TimerEventKind::NpcMove, NPC_TICK_INTERVAL_MS);
+        }
+    }
+    for (int nid : left) {
+        NPC& n = GetNpc(nid);
+        {
+            lock_guard<mutex> lk(n.view_lock);
+            n.view_list.erase(player->id);
+        }
+        SendRemoveObject(player, nid);
+        // 비활성화는 NPC가 다음 tick에서 view_list 비었을 때 스스로 수행 (race-free)
+    }
+}
+
+// NPC AI tick. TimerEventKind::NpcMove 완료 시 worker_thread에서 호출.
+// AI 결정(이동 방향 / target 갱신)은 Lua의 OnTick에 위임. C++는 결과를 받아
+// 월드 상태(sector, view_list, 패킷 송신)만 갱신.
+void NpcOnMove(int npc_id) {
+    NPC& npc = GetNpc(npc_id);
+    if (npc.state == NpcFsmState::Dead) {
+        npc.active.store(false);
+        return;
+    }
+
+    short old_x = npc.x;
+    short old_y = npc.y;
+
+    // 1) view_list snapshot + 가장 가까운 player(chebyshev) 계산
+    vector<int> viewer_snapshot;
+    {
+        lock_guard<mutex> lk(npc.view_lock);
+        viewer_snapshot.assign(npc.view_list.begin(), npc.view_list.end());
+    }
+    int nearest_id = -1;
+    int nearest_dist = -1;
+    short nearest_x = -1, nearest_y = -1;
+    short target_x = -1, target_y = -1;  // 현재 추적 대상의 위치
+    int cur_target_id = npc.target_id;
+    for (int pid : viewer_snapshot) {
+        ClientMap::const_accessor a;
+        if (!g_clients.find(a, pid)) continue;
+        short px = a->second->x;
+        short py = a->second->y;
+        // Chebyshev distance (PDF의 11x11/15x15는 정사각형 영역)
+        int d = max(abs(px - old_x), abs(py - old_y));
+        if (nearest_id == -1 || d < nearest_dist) {
+            nearest_id = pid;
+            nearest_dist = d;
+            nearest_x = px;
+            nearest_y = py;
+        }
+        if (pid == cur_target_id) {
+            target_x = px;
+            target_y = py;
+        }
+    }
+    // target이 시야에 없으면 target_x/y = -1 그대로 → Lua가 추적 해제 결정
+
+    // 2) Lua AI tick 호출
+    NpcTickContext ctx;
+    ctx.id = npc_id;
+    ctx.npc_type = static_cast<int>(npc.type);
+    ctx.move_mode = static_cast<int>(npc.move_mode);
+    ctx.x = old_x;
+    ctx.y = old_y;
+    ctx.spawn_x = npc.spawn_x;
+    ctx.spawn_y = npc.spawn_y;
+    ctx.target_id = cur_target_id;
+    ctx.target_x = target_x;
+    ctx.target_y = target_y;
+    ctx.nearest_id = nearest_id;
+    ctx.nearest_x = nearest_x;
+    ctx.nearest_y = nearest_y;
+    ctx.nearest_dist = nearest_dist;
+
+    NpcTickResult result;
+    g_lua.NpcTick(ctx, result);  // 실패해도 result는 안전 디폴트(정지 + target 유지)
+
+    // 3) 결과 적용: target_id 갱신 + state 전환
+    int new_target = result.target_id;
+    if (new_target != cur_target_id) {
+        npc.target_id = new_target;
+    }
+    if (new_target != -1) {
+        npc.state = NpcFsmState::Chasing;
+    }
+    else {
+        npc.state = (npc.move_mode == NpcMoveMode::Roaming)
+            ? NpcFsmState::Roaming : NpcFsmState::Idle;
+    }
+
+    // 3.5) Agro 타겟이 카디널 인접(manhattan==1)에 있으면 이동 대신 공격
+    // Lua에서 would_step_onto 가드로 dx=dy=0 반환되었으므로 NPC는 이미 정지 상태.
+    if (new_target != -1) {
+        // 타겟 좌표 결정: cur_target_id 유지 → target_x/y, Agro 트리거 → nearest_x/y
+        short tgt_x = -1, tgt_y = -1;
+        if (new_target == cur_target_id && target_x != -1) {
+            tgt_x = target_x; tgt_y = target_y;
+        }
+        else if (new_target == nearest_id) {
+            tgt_x = nearest_x; tgt_y = nearest_y;
+        }
+
+        if (tgt_x != -1) {
+            int dxa = std::abs(static_cast<int>(tgt_x) - static_cast<int>(old_x));
+            int dya = std::abs(static_cast<int>(tgt_y) - static_cast<int>(old_y));
+            if (dxa + dya == 1) {
+                // 카디널 인접 — NPC 공격 쿨타임 검사
+                auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now().time_since_epoch()).count();
+                long long last_atk = npc.last_attack_ms.load();
+                if (last_atk == 0 || now_ms - last_atk >= NPC_ATTACK_INTERVAL_MS) {
+                    npc.last_attack_ms.store(now_ms);
+
+                    // 공격 방향 (타겟 쪽)
+                    unsigned char atk_dir = 0;
+                    if (tgt_x > old_x)      atk_dir = 2; // Right
+                    else if (tgt_x < old_x) atk_dir = 1; // Left
+                    else if (tgt_y > old_y) atk_dir = 0; // Down
+                    else                    atk_dir = 3; // Up
+
+                    // 타겟 플레이어에게 데미지 적용 (compare_exchange로 동시 공격 보호)
+                    shared_ptr<Player> target_player;
+                    {
+                        ClientMap::const_accessor a;
+                        if (g_clients.find(a, new_target)) target_player = a->second;
+                    }
+                    if (target_player) {
+                        int damage = static_cast<int>(npc.level) * NPC_BASE_DAMAGE;
+                        if (damage < 1) damage = 1;
+                        int old_hp = target_player->hp.load();
+                        int new_hp_val = 0;
+                        bool dealt = false;
+                        while (old_hp > 0) {
+                            int next = (old_hp > damage) ? (old_hp - damage) : 0;
+                            if (target_player->hp.compare_exchange_weak(old_hp, next)) {
+                                new_hp_val = next;
+                                dealt = true;
+                                break;
+                            }
+                        }
+
+                        if (dealt) {
+                            // S2C_ATTACK_ANIM 브로드캐스트 (NPC view_list 안 플레이어 + 타겟)
+                            S2C_AttackAnim anim;
+                            anim.size = sizeof(anim);
+                            anim.type = S2C_ATTACK_ANIM;
+                            anim.object_id = npc_id;
+                            anim.direction = atk_dir;
+
+                            unordered_set<int> atk_viewers;
+                            {
+                                lock_guard<mutex> lock(npc.view_lock);
+                                for (int vid : npc.view_list) atk_viewers.insert(vid);
+                            }
+                            atk_viewers.insert(new_target);
+                            for (int vid : atk_viewers) {
+                                ClientMap::const_accessor a;
+                                if (g_clients.find(a, vid)) a->second->do_send(anim.size, &anim);
+                            }
+
+                            // S2C_DAMAGE (타겟 + 시야 내 다른 플레이어)
+                            S2C_Damage dmg;
+                            dmg.size = sizeof(dmg);
+                            dmg.type = S2C_DAMAGE;
+                            dmg.attacker_id = npc_id;
+                            dmg.target_id = new_target;
+                            dmg.damage = damage;
+                            dmg.new_hp = new_hp_val;
+                            dmg.target_x = target_player->x;
+                            dmg.target_y = target_player->y;
+                            for (int vid : atk_viewers) {
+                                ClientMap::const_accessor a;
+                                if (g_clients.find(a, vid)) a->second->do_send(dmg.size, &dmg);
+                            }
+
+                            // 사망 체크 — Lazy AI 안 비활성화 사이클을 깨지 않도록 타이머 재스케줄 후 호출
+                            if (new_hp_val == 0) {
+                                PlayerOnDeath(target_player);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // 4) 이동 적용 + 월드 경계 클램프
+    short new_x = static_cast<short>(old_x + result.dx);
+    short new_y = static_cast<short>(old_y + result.dy);
+    if (new_x < 0) new_x = 0;
+    if (new_y < 0) new_y = 0;
+    if (new_x >= WORLD_WIDTH)  new_x = WORLD_WIDTH - 1;
+    if (new_y >= WORLD_HEIGHT) new_y = WORLD_HEIGHT - 1;
+
+    bool moved = (new_x != old_x || new_y != old_y);
+    if (moved) {
+        UpdateObjectSector(npc_id, old_x, old_y, new_x, new_y, false);
+        npc.x = new_x;
+        npc.y = new_y;
+    }
+
+    // 새 위치 주변 9섹터의 플레이어 후보 수집
+    int sx = new_x / SECTOR_SIZE;
+    int sy = new_y / SECTOR_SIZE;
+    vector<int> candidate_pids;
+    for (int dy = -1; dy <= 1; ++dy) {
+        for (int dx = -1; dx <= 1; ++dx) {
+            int nx = sx + dx, ny = sy + dy;
+            if (nx < 0 || nx >= NUM_SECTORS_X || ny < 0 || ny >= NUM_SECTORS_Y) continue;
+            lock_guard<mutex> lock(g_sectors[ny][nx].m_lock);
+            for (int pid : g_sectors[ny][nx].players) candidate_pids.push_back(pid);
+        }
+    }
+
+    unordered_map<int, shared_ptr<Player>> id_to_session;
+    unordered_set<int> new_view;
+    for (int pid : candidate_pids) {
+        ClientMap::const_accessor a;
+        if (!g_clients.find(a, pid)) continue;
+        auto& p = a->second;
+        if (IsInView(new_x, new_y, p->x, p->y)) {
+            new_view.insert(pid);
+            id_to_session[pid] = p;
+        }
+    }
+
+    vector<int> entered, left, stayed;
+    {
+        lock_guard<mutex> lock(npc.view_lock);
+        for (int pid : new_view) {
+            if (npc.view_list.count(pid)) stayed.push_back(pid);
+            else entered.push_back(pid);
+        }
+        for (int pid : npc.view_list) {
+            if (new_view.count(pid) == 0) left.push_back(pid);
+        }
+        npc.view_list = new_view;
+    }
+
+    // entered: player view에 NPC 추가 + Add 전송
+    for (int pid : entered) {
+        auto it = id_to_session.find(pid);
+        if (it == id_to_session.end()) continue;
+        auto& p = it->second;
+        {
+            lock_guard<mutex> lk(p->view_lock);
+            p->view_list.insert(npc_id);
+        }
+        SendAddNpc(p, npc);
+    }
+    // left: player view에서 NPC 제거 + Remove 전송
+    for (int pid : left) {
+        ClientMap::const_accessor a;
+        if (!g_clients.find(a, pid)) continue;
+        auto& p = a->second;
+        {
+            lock_guard<mutex> lk(p->view_lock);
+            p->view_list.erase(npc_id);
+        }
+        SendRemoveObject(p, npc_id);
+    }
+    // stayed: 이동했으면 Move 전송
+    if (moved) {
+        S2C_MoveObject pkt;
+        pkt.size = sizeof(pkt);
+        pkt.type = S2C_MOVE_OBJECT;
+        pkt.object_id = npc_id;
+        pkt.x = new_x;
+        pkt.y = new_y;
+        pkt.move_time = NPC_TICK_INTERVAL_MS;
+        for (int pid : stayed) {
+            auto it = id_to_session.find(pid);
+            if (it == id_to_session.end()) continue;
+            it->second->do_send(pkt.size, &pkt);
+        }
+    }
+
+    // 시야가 비었으면 비활성화, 아니면 재스케줄
+    bool has_viewer;
+    {
+        lock_guard<mutex> lock(npc.view_lock);
+        has_viewer = !npc.view_list.empty();
+        if (!has_viewer) npc.active.store(false);
+    }
+    if (has_viewer) {
+        g_timer_manager.Schedule(npc_id, TimerEventKind::NpcMove, NPC_TICK_INTERVAL_MS);
+    }
+}
+
+// NPC 리스폰. 30초 사망 타이머 만료 시 worker_thread에서 호출.
+// spawn_x/spawn_y로 위치 초기화, HP 풀회복, 섹터 재등록, 시야 내 플레이어에게 Add+Respawn 송신.
+void NpcOnRespawn(int npc_id) {
+    NPC& npc = GetNpc(npc_id);
+
+    // 1) 상태 리셋 (락 안에서 일관성 보장)
+    short rx, ry;
+    {
+        lock_guard<mutex> lk(npc.view_lock);
+        npc.hp = npc.max_hp;
+        npc.x = npc.spawn_x;
+        npc.y = npc.spawn_y;
+        npc.target_id = -1;
+        npc.state = (npc.move_mode == NpcMoveMode::Roaming) ? NpcFsmState::Roaming : NpcFsmState::Idle;
+        rx = npc.x;
+        ry = npc.y;
+    }
+    npc.active.store(false);
+
+    // 2) 섹터 재등록 (이전엔 RemoveObjectFromSector로 빠져있음)
+    UpdateObjectSector(npc_id, -1, -1, rx, ry, false);
+
+    // 3) 리스폰 위치의 시야(9섹터) 내 플레이어 찾아서 Add+Respawn 송신 + 상호 view 등록
+    int sx = rx / SECTOR_SIZE;
+    int sy = ry / SECTOR_SIZE;
+    vector<int> candidate_pids;
+    for (int dy = -1; dy <= 1; ++dy) {
+        for (int dx = -1; dx <= 1; ++dx) {
+            int nx = sx + dx, ny = sy + dy;
+            if (nx < 0 || nx >= NUM_SECTORS_X || ny < 0 || ny >= NUM_SECTORS_Y) continue;
+            lock_guard<mutex> lock(g_sectors[ny][nx].m_lock);
+            for (int pid : g_sectors[ny][nx].players) candidate_pids.push_back(pid);
+        }
+    }
+
+    bool any_viewer = false;
+    for (int pid : candidate_pids) {
+        ClientMap::const_accessor a;
+        if (!g_clients.find(a, pid)) continue;
+        auto& player = a->second;
+        if (!IsInView(rx, ry, player->x, player->y)) continue;
+
+        // 양방향 view_list 등록
+        {
+            lock_guard<mutex> lk(player->view_lock);
+            player->view_list.insert(npc_id);
+        }
+        {
+            lock_guard<mutex> lk(npc.view_lock);
+            npc.view_list.insert(pid);
+        }
+
+        // S2C_ADD_OBJECT (NPC를 화면에 다시 추가) + S2C_RESPAWN (pillar 이펙트)
+        SendAddNpc(player, npc);
+
+        S2C_Respawn rpkt;
+        rpkt.size = sizeof(rpkt);
+        rpkt.type = S2C_RESPAWN;
+        rpkt.object_id = npc_id;
+        rpkt.respawn_x = rx;
+        rpkt.respawn_y = ry;
+        rpkt.hp = npc.max_hp;
+        rpkt.max_hp = npc.max_hp;
+        player->do_send(rpkt.size, &rpkt);
+
+        any_viewer = true;
+    }
+
+    // 4) 시야에 플레이어가 있으면 AI 재가동
+    if (any_viewer) {
+        npc.active.store(true);
+        g_timer_manager.Schedule(npc_id, TimerEventKind::NpcMove, NPC_TICK_INTERVAL_MS);
+    }
+    // else: Lazy AI — 플레이어가 가까이 오면 SyncPlayerNpcView가 active=true로 만들고 첫 NpcMove 등록
+}
+
+// 플레이어 사망 처리: EXP 50% 손실 + spawn 위치 텔레포트 + HP 회복 + 시야 재구성.
+// 호출 시점: NPC 공격으로 HP가 0이 된 직후 (NpcOnMove 안에서)
+void PlayerOnDeath(std::shared_ptr<Player> session) {
+    int client_id = session->id;
+    short death_x = session->x;
+    short death_y = session->y;
+
+    // 1) 현재 시야의 다른 플레이어 스냅샷 (NPC 제외)
+    vector<int> old_viewers;
+    {
+        lock_guard<mutex> lk(session->view_lock);
+        for (int id : session->view_list) {
+            if (!IsNpcId(id)) old_viewers.push_back(id);
+        }
+    }
+
+    // 2) S2C_DEATH 송신 (death_x/y에서 soul 이펙트) — 자기 자신 + 시야 내 다른 플레이어
+    S2C_Death dpkt;
+    dpkt.size = sizeof(dpkt);
+    dpkt.type = S2C_DEATH;
+    dpkt.object_id = client_id;
+    dpkt.death_x = death_x;
+    dpkt.death_y = death_y;
+    session->do_send(dpkt.size, &dpkt);
+    for (int pid : old_viewers) {
+        ClientMap::const_accessor a;
+        if (g_clients.find(a, pid)) a->second->do_send(dpkt.size, &dpkt);
+    }
+
+    // 3) Old viewers 쪽에서 본 플레이어 제거 (REMOVE_OBJECT) + 자기 view_list 정리
+    for (int pid : old_viewers) {
+        ClientMap::const_accessor a;
+        if (!g_clients.find(a, pid)) continue;
+        {
+            lock_guard<mutex> lk(a->second->view_lock);
+            a->second->view_list.erase(client_id);
+        }
+        SendRemoveObject(a->second, client_id);
+    }
+    // 자기 view_list: 다른 플레이어 + NPC 모두 비움. 새 위치에서 다시 구축됨.
+    {
+        lock_guard<mutex> lk(session->view_lock);
+        session->view_list.clear();
+    }
+
+    // 4) 사망 페널티: EXP 50% 손실, HP 풀회복
+    unsigned long long lost_exp = session->exp.load() / 2;
+    session->exp.fetch_sub(lost_exp);
+    session->hp.store(session->max_hp.load());
+
+    // 5) 시작 위치로 텔레포트 + 섹터 갱신
+    short respawn_x = PLAYER_SPAWN_X;
+    short respawn_y = PLAYER_SPAWN_Y;
+    UpdateObjectSector(client_id, death_x, death_y, respawn_x, respawn_y, true);
+    session->x = respawn_x;
+    session->y = respawn_y;
+
+    // 6) 새 위치 9섹터에서 신규 viewer 후보 수집 → IsInView 필터 → 양방향 등록 + Add 패킷
+    int sx = respawn_x / SECTOR_SIZE;
+    int sy = respawn_y / SECTOR_SIZE;
+    vector<int> new_candidates;
+    for (int dy = -1; dy <= 1; ++dy) {
+        for (int dx = -1; dx <= 1; ++dx) {
+            int nx = sx + dx, ny = sy + dy;
+            if (nx < 0 || nx >= NUM_SECTORS_X || ny < 0 || ny >= NUM_SECTORS_Y) continue;
+            lock_guard<mutex> lock(g_sectors[ny][nx].m_lock);
+            for (int pid : g_sectors[ny][nx].players) {
+                if (pid != client_id) new_candidates.push_back(pid);
+            }
+        }
+    }
+    vector<shared_ptr<Player>> new_viewer_sessions;
+    for (int pid : new_candidates) {
+        ClientMap::const_accessor a;
+        if (!g_clients.find(a, pid)) continue;
+        auto& other = a->second;
+        if (!IsInView(respawn_x, respawn_y, other->x, other->y)) continue;
+
+        {
+            lock_guard<mutex> lk(session->view_lock);
+            session->view_list.insert(pid);
+        }
+        {
+            lock_guard<mutex> lk(other->view_lock);
+            other->view_list.insert(client_id);
+        }
+        SendAddObject(other, session);   // 다른 플레이어 화면에 부활자 추가
+        SendAddObject(session, other);   // 부활자 화면에 다른 플레이어 추가
+        new_viewer_sessions.push_back(other);
+    }
+
+    // 7) S2C_RESPAWN 송신 (pillar 이펙트) — 자기 자신 + 신규 viewer
+    S2C_Respawn rpkt;
+    rpkt.size = sizeof(rpkt);
+    rpkt.type = S2C_RESPAWN;
+    rpkt.object_id = client_id;
+    rpkt.respawn_x = respawn_x;
+    rpkt.respawn_y = respawn_y;
+    rpkt.hp = session->hp.load();
+    rpkt.max_hp = session->max_hp.load();
+    session->do_send(rpkt.size, &rpkt);
+    for (auto& other : new_viewer_sessions) {
+        other->do_send(rpkt.size, &rpkt);
+    }
+
+    // 8) 자기 자신에게 스탯 변경 통보 (HUD 갱신)
+    S2C_StatusChange sc;
+    sc.size = sizeof(sc);
+    sc.type = S2C_STATUS_CHANGE;
+    sc.object_id = client_id;
+    sc.hp = session->hp.load();
+    sc.max_hp = session->max_hp.load();
+    sc.exp = session->exp.load();
+    sc.level = session->level.load();
+    session->do_send(sc.size, &sc);
+
+    // 9) NPC 시야 동기화 (새 위치 주변)
+    SyncPlayerNpcView(session);
+}
+
+// 5초마다 호출되는 HP 회복 틱. max_hp의 HP_REGEN_PERCENT(10%)만큼 회복하고 재스케줄.
+// 플레이어가 disconnect 되었으면 g_clients에서 못 찾아 체인이 끊김 (자연 정리).
+void PlayerOnHpRegen(int client_id) {
+    std::shared_ptr<Player> session;
+    {
+        ClientMap::const_accessor a;
+        if (!g_clients.find(a, client_id)) return;  // 접속 종료된 세션 — 재스케줄 안 함
+        session = a->second;
+    }
+
+    int max_hp = session->max_hp.load();
+    int cur_hp = session->hp.load();
+
+    // 사망 직후가 아니고 HP가 최대치 미만일 때만 회복
+    if (cur_hp > 0 && cur_hp < max_hp) {
+        int heal = max_hp * HP_REGEN_PERCENT / 100;
+        if (heal < 1) heal = 1;
+
+        int observed = cur_hp;
+        while (true) {
+            int next = observed + heal;
+            if (next > max_hp) next = max_hp;
+            if (session->hp.compare_exchange_weak(observed, next)) {
+                cur_hp = next;
+                break;
+            }
+            if (observed <= 0 || observed >= max_hp) break;  // 그 사이 변동되면 중단
+        }
+
+        // 자기 자신에게 스탯 변경 통보 (HUD 갱신)
+        S2C_StatusChange sc;
+        sc.size = sizeof(sc);
+        sc.type = S2C_STATUS_CHANGE;
+        sc.object_id = client_id;
+        sc.hp = cur_hp;
+        sc.max_hp = max_hp;
+        sc.exp = session->exp.load();
+        sc.level = session->level.load();
+        session->do_send(sc.size, &sc);
+    }
+
+    // 다음 회복 tick 재스케줄
+    g_timer_manager.Schedule(client_id, TimerEventKind::HpRegen, HP_REGEN_INTERVAL_MS);
 }
 
 // --- 함수 선언 ---
@@ -303,6 +933,59 @@ int main(int argc, char* argv[]) {
     CreateIoCompletionPort(reinterpret_cast<HANDLE>(g_listen_socket), g_h_iocp, static_cast<ULONG_PTR>(-1), 0);
 
     cout << "[Server] MMO Server Started. Port: " << PORT << endl;
+
+    // --- Stage 4: NPC 스폰 ---
+    // 실행 디렉토리가 프로젝트 루트일 수도, x64/Release일 수도 있으므로 후보 경로를 순서대로 시도
+    InitWorld(NUM_NPCS);
+    const char* spawn_paths[] = {
+        "data/npc_spawn.txt",
+        "../../data/npc_spawn.txt",
+        "../../../data/npc_spawn.txt",
+    };
+    int spawned = -1;
+    for (const char* p : spawn_paths) {
+        spawned = LoadNpcSpawnScript(p);
+        if (spawned >= 0) break;
+    }
+    if (spawned > 0) {
+        for (int i = 0; i < spawned; ++i) {
+            NPC& n = g_npcs[i];
+            UpdateObjectSector(n.id, -1, -1, n.x, n.y, false);
+        }
+        cout << "[World] " << spawned << " NPCs placed into sectors." << endl;
+    }
+    else {
+        cout << "[World] No NPCs spawned (script missing or empty)." << endl;
+    }
+
+    // --- Lua AI 초기화: 스펙 상수 노출 → 스크립트 로드 ---
+    g_lua.OpenStdLibs();
+    // PDF 스펙 상수를 Lua 글로벌로 노출 (스크립트 가독성 + 추후 튜닝 용이)
+    g_lua.SetGlobalInt("TYPE_PEACE",   static_cast<long long>(NpcType::Peace));
+    g_lua.SetGlobalInt("TYPE_AGRO",    static_cast<long long>(NpcType::Agro));
+    g_lua.SetGlobalInt("MOVE_FIXED",   static_cast<long long>(NpcMoveMode::Fixed));
+    g_lua.SetGlobalInt("MOVE_ROAMING", static_cast<long long>(NpcMoveMode::Roaming));
+    g_lua.SetGlobalInt("AGRO_RANGE",   AGRO_DETECT_RANGE);
+    g_lua.SetGlobalInt("ROAM_RANGE",   ROAM_AREA_RANGE);
+
+    const char* lua_paths[] = {
+        "data/npc_ai.lua",
+        "../../data/npc_ai.lua",
+        "../../../data/npc_ai.lua",
+    };
+    bool lua_loaded = false;
+    for (const char* p : lua_paths) {
+        if (g_lua.DoFile(p)) { lua_loaded = true; break; }
+    }
+    if (!lua_loaded) {
+        cout << "[Lua] Failed to load npc_ai.lua: " << g_lua.GetLastError() << endl;
+        cout << "[Lua] NPC AI will be DISABLED (NpcTick will fail silently)." << endl;
+    }
+    else {
+        cout << "[Lua] npc_ai.lua loaded. AGRO_RANGE=" << AGRO_DETECT_RANGE
+             << " ROAM_RANGE=" << ROAM_AREA_RANGE
+             << " TICK=" << NPC_TICK_INTERVAL_MS << "ms" << endl;
+    }
 
     OVERLAPPED_EX accept_over(IO_ACCEPT);
     accept_over.client_socket = WSASocket(AF_INET, SOCK_STREAM, 0, NULL, 0, WSA_FLAG_OVERLAPPED);
@@ -386,8 +1069,23 @@ void worker_thread() {
         // 타이머 만기 이벤트는 PostQueuedCompletionStatus(bytes=0)로 들어오므로 disconnect 체크 전에 처리
         if (ov_ex->type == IO_TIMER) {
             auto* tov = reinterpret_cast<TimerOverlapped*>(ov_ex);
-            // Stage 4에서 kind/entity_id 기반 NPC AI 디스패치 추가 예정. 현재는 풀 반환만.
+            TimerEventKind kind = tov->kind;
+            int entity_id = static_cast<int>(completion_key);
             g_timer_pool.Release(tov);
+
+            switch (kind) {
+            case TimerEventKind::NpcMove:
+                if (IsNpcId(entity_id)) NpcOnMove(entity_id);
+                break;
+            case TimerEventKind::NpcRespawn:
+                if (IsNpcId(entity_id)) NpcOnRespawn(entity_id);
+                break;
+            case TimerEventKind::HpRegen:
+                if (!IsNpcId(entity_id)) PlayerOnHpRegen(entity_id);
+                break;
+            default:
+                break;
+            }
             continue;
         }
 
@@ -410,11 +1108,19 @@ void worker_thread() {
                     viewers.assign(disconnected->view_list.begin(), disconnected->view_list.end());
                     disconnected->view_list.clear();
                 }
+                // Player와 NPC를 분리 처리. Player는 Remove 패킷까지 보내고, NPC는 view_list만 정리
                 vector<shared_ptr<Player>> viewer_sessions;
-                viewer_sessions.reserve(viewers.size());
                 for (int id : viewers) {
-                    ClientMap::const_accessor a;
-                    if (g_clients.find(a, id)) viewer_sessions.push_back(a->second);
+                    if (IsNpcId(id)) {
+                        NPC& n = GetNpc(id);
+                        lock_guard<mutex> lk(n.view_lock);
+                        n.view_list.erase(client_id);
+                        // NPC 비활성화는 다음 tick에서 view_list 비었음을 확인하고 스스로 수행
+                    }
+                    else {
+                        ClientMap::const_accessor a;
+                        if (g_clients.find(a, id)) viewer_sessions.push_back(a->second);
+                    }
                 }
                 for (auto& other : viewer_sessions) {
                     {
@@ -543,18 +1249,89 @@ void process_packet(int client_id, unsigned char* ptr) {
             SendAddObject(session, other); // 나에게 타인을 추가
         }
 
+        // 시야 안의 NPC도 동기화 (entered만 처리됨 — login 직후 view_list는 비어있음)
+        SyncPlayerNpcView(session);
+
+        // HP 자동 회복 타이머 첫 등록 (5초마다 max_hp의 10% 회복)
+        g_timer_manager.Schedule(client_id, TimerEventKind::HpRegen, HP_REGEN_INTERVAL_MS);
+
         cout << "[Login] Client " << client_id << " logged in as: " << *atomic_load(&session->name) << " at (" << session->x << ", " << session->y << ")" << endl;
         break;
     }
-    case C2S_MOVE: {
-        C2S_Move* pkt = reinterpret_cast<C2S_Move*>(ptr);
+    case C2S_MOVE:
+    case C2S_TELEPORT: {
+        // 텔레포트(테스트용)는 쿨타임/거리 검증을 건너뛰지만 월드 경계 clamp + 시야 갱신은 동일.
+        const bool is_teleport = (type == C2S_TELEPORT);
+
+        short req_x, req_y;
+        int req_move_time;
+        if (is_teleport) {
+            C2S_Teleport* tp = reinterpret_cast<C2S_Teleport*>(ptr);
+            req_x = tp->x;
+            req_y = tp->y;
+            req_move_time = 0;
+        }
+        else {
+            C2S_Move* mp = reinterpret_cast<C2S_Move*>(ptr);
+            req_x = mp->x;
+            req_y = mp->y;
+            req_move_time = mp->move_time;
+        }
+
+        // 이동 쿨타임 검증용 현재 시각 (ms)
+        auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+        long long last = session->last_move_ms.load();
+
         short old_x = session->x;
         short old_y = session->y;
-        
+
+        // 월드 경계 클램프 (클라가 보낸 좌표 신뢰 X)
+        short new_x = req_x;
+        short new_y = req_y;
+        if (new_x < 0) new_x = 0;
+        if (new_y < 0) new_y = 0;
+        if (new_x >= WORLD_WIDTH)  new_x = WORLD_WIDTH - 1;
+        if (new_y >= WORLD_HEIGHT) new_y = WORLD_HEIGHT - 1;
+
+        // 이동량 검증: Chebyshev distance 기준
+        int dx = std::abs(static_cast<int>(new_x) - static_cast<int>(old_x));
+        int dy = std::abs(static_cast<int>(new_y) - static_cast<int>(old_y));
+        int dist = std::max(dx, dy);
+        if (dist == 0) {
+            // 제자리 이동 패킷은 무시
+            break;
+        }
+        if (!is_teleport) {
+            if (last != 0 && now_ms - last < PLAYER_MOVE_INTERVAL_MS) {
+                // 쿨타임 미충족 — 치트/연사 방지
+                break;
+            }
+            if (dist > 1) {
+                // 한 칸 초과 이동은 치트로 간주
+                break;
+            }
+        }
+        // 텔레포트 직후에도 last_move_ms를 갱신해 곧바로 한 칸 더 이동하는 것을 막음
+        session->last_move_ms.store(now_ms);
+
+        // 방향 갱신 — 공격 모션의 direction 결정용
+        // dx/dy 중 더 큰 축 우선. 동률이면 dx 우선. 0=Down, 1=Left, 2=Right, 3=Up.
+        int sdx = static_cast<int>(new_x) - static_cast<int>(old_x);
+        int sdy = static_cast<int>(new_y) - static_cast<int>(old_y);
+        if (std::abs(sdx) >= std::abs(sdy)) {
+            if (sdx > 0)      session->direction.store(2); // Right
+            else if (sdx < 0) session->direction.store(1); // Left
+        }
+        else {
+            if (sdy > 0)      session->direction.store(0); // Down
+            else if (sdy < 0) session->direction.store(3); // Up
+        }
+
         // Sector 업데이트
-        UpdateObjectSector(client_id, old_x, old_y, pkt->x, pkt->y, true);
-        session->x = pkt->x;
-        session->y = pkt->y;
+        UpdateObjectSector(client_id, old_x, old_y, new_x, new_y, true);
+        session->x = new_x;
+        session->y = new_y;
 
         // 이동 패킷 브로드캐스팅
         S2C_MoveObject move_pkt;
@@ -563,7 +1340,7 @@ void process_packet(int client_id, unsigned char* ptr) {
         move_pkt.object_id = client_id;
         move_pkt.x = session->x;
         move_pkt.y = session->y;
-        move_pkt.move_time = pkt->move_time;
+        move_pkt.move_time = req_move_time;
 
         // view_list 기반 차분: 새 위치 9섹터에서 후보 수집 → 시야 필터 → 기존 view_list와 diff
         // (기존 9섹터 풀스캔 방식은 멀리 이동 시 old view에 있던 원거리 entity에게 Remove를 못 보내는 버그가 있었음)
@@ -583,19 +1360,22 @@ void process_packet(int client_id, unsigned char* ptr) {
             }
         }
 
-        // 후보 + 기존 view_list의 모든 ID를 일괄 조회
-        unordered_set<int> all_ids(candidate_ids.begin(), candidate_ids.end());
+        // 후보 + 기존 view_list의 player ID(NPC 제외)만 일괄 조회
+        // NPC ID는 별도로 SyncPlayerNpcView가 처리 — 여기서 끌어오면 g_clients에 없어서 left 처리됨
+        unordered_set<int> all_player_ids(candidate_ids.begin(), candidate_ids.end());
         {
             lock_guard<mutex> lock(session->view_lock);
-            for (int id : session->view_list) all_ids.insert(id);
+            for (int id : session->view_list) {
+                if (!IsNpcId(id)) all_player_ids.insert(id);
+            }
         }
         unordered_map<int, shared_ptr<Player>> id_to_session;
-        for (int id : all_ids) {
+        for (int id : all_player_ids) {
             ClientMap::const_accessor a;
             if (g_clients.find(a, id)) id_to_session[id] = a->second;
         }
 
-        // 시야 안인 entity 집합 (새 view)
+        // 시야 안의 player 집합 (새 view, player만)
         unordered_set<int> new_view;
         for (int id : candidate_ids) {
             auto it = id_to_session.find(id);
@@ -605,7 +1385,7 @@ void process_packet(int client_id, unsigned char* ptr) {
             }
         }
 
-        // diff: entered = new - old, left = old - new, stayed = new ∩ old. 한 락 안에서 처리 후 교체
+        // diff: player만 — NPC entry는 view_list에 그대로 둔다 (SyncPlayerNpcView가 책임)
         vector<int> entered_ids, left_ids, stayed_ids;
         {
             lock_guard<mutex> lock(session->view_lock);
@@ -614,12 +1394,14 @@ void process_packet(int client_id, unsigned char* ptr) {
                 else entered_ids.push_back(id);
             }
             for (int id : session->view_list) {
+                if (IsNpcId(id)) continue;
                 if (!new_view.count(id)) left_ids.push_back(id);
             }
-            session->view_list = new_view;
+            for (int id : left_ids) session->view_list.erase(id);
+            for (int id : entered_ids) session->view_list.insert(id);
         }
 
-        // 새로 시야에 들어온 entity: 상호 view_list 업데이트 + Add 전송
+        // 새로 시야에 들어온 player: 상호 view_list 업데이트 + Add 전송
         for (int id : entered_ids) {
             auto it = id_to_session.find(id);
             if (it == id_to_session.end()) continue;
@@ -631,7 +1413,7 @@ void process_packet(int client_id, unsigned char* ptr) {
             SendAddObject(other, session);
             SendAddObject(session, other);
         }
-        // 시야에서 벗어난 entity: 상호 view_list 정리 + Remove 전송
+        // 시야에서 벗어난 player: 상호 view_list 정리 + Remove 전송
         for (int id : left_ids) {
             auto it = id_to_session.find(id);
             if (it == id_to_session.end()) continue;
@@ -643,7 +1425,7 @@ void process_packet(int client_id, unsigned char* ptr) {
             SendRemoveObject(other, client_id);
             SendRemoveObject(session, id);
         }
-        // 유지된 entity: Move 패킷 전송
+        // 유지된 player: Move 패킷 전송
         for (int id : stayed_ids) {
             auto it = id_to_session.find(id);
             if (it == id_to_session.end()) continue;
@@ -651,6 +1433,225 @@ void process_packet(int client_id, unsigned char* ptr) {
         }
         // 본인에게도 이동 확인 패킷 (클라이언트의 자기 위치 갱신용)
         session->do_send(move_pkt.size, &move_pkt);
+
+        // NPC 시야 동기화 (별도 경로 — player diff와 view_list 영역이 분리됨)
+        SyncPlayerNpcView(session);
+        break;
+    }
+    case C2S_ATTACK: {
+        // 쿨타임 (1초)
+        auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+        long long last_atk = session->last_attack_ms.load();
+        if (last_atk != 0 && now_ms - last_atk < ATTACK_INTERVAL_MS) break;
+        session->last_attack_ms.store(now_ms);
+
+        unsigned char dir = session->direction.load();
+        short ax = session->x, ay = session->y;
+        int lv = session->level.load();
+        int damage = lv * BASE_DAMAGE_PER_LEVEL;
+
+        // 1) S2C_ATTACK_ANIM 브로드캐스트 (시야 내 다른 플레이어 + 자기 자신)
+        S2C_AttackAnim anim;
+        anim.size = sizeof(anim);
+        anim.type = S2C_ATTACK_ANIM;
+        anim.object_id = client_id;
+        anim.direction = dir;
+
+        vector<int> viewer_pids;
+        {
+            lock_guard<mutex> lock(session->view_lock);
+            for (int vid : session->view_list) {
+                if (!IsNpcId(vid)) viewer_pids.push_back(vid);
+            }
+        }
+        for (int vid : viewer_pids) {
+            ClientMap::const_accessor a;
+            if (g_clients.find(a, vid)) a->second->do_send(anim.size, &anim);
+        }
+        session->do_send(anim.size, &anim);
+
+        // 2) 인접 4타일(상/하/좌/우)에서 NPC 찾기 → 데미지 + S2C_DAMAGE 브로드캐스트
+        int adj[4][2] = { {ax, ay - 1}, {ax, ay + 1}, {ax - 1, ay}, {ax + 1, ay} };
+        for (int i = 0; i < 4; ++i) {
+            int tx = adj[i][0], ty = adj[i][1];
+            if (tx < 0 || tx >= WORLD_WIDTH || ty < 0 || ty >= WORLD_HEIGHT) continue;
+            int sx = tx / SECTOR_SIZE, sy = ty / SECTOR_SIZE;
+
+            vector<int> npc_ids;
+            {
+                lock_guard<mutex> lock(g_sectors[sy][sx].m_lock);
+                for (int nid : g_sectors[sy][sx].npcs) {
+                    NPC& nn = GetNpc(nid);
+                    if (nn.x == tx && nn.y == ty) npc_ids.push_back(nid);
+                }
+            }
+
+            for (int nid : npc_ids) {
+                NPC& n = GetNpc(nid);
+                int new_hp = 0;
+                short nx = 0, ny = 0;
+                bool dealt = false;
+                {
+                    lock_guard<mutex> lock(n.view_lock);
+                    if (n.hp > 0) {
+                        n.hp -= damage;
+                        if (n.hp < 0) n.hp = 0;
+                        new_hp = n.hp;
+                        nx = n.x;
+                        ny = n.y;
+                        dealt = true;
+                    }
+                }
+                if (!dealt) continue;
+
+                // S2C_DAMAGE — NPC view_list의 모든 플레이어 + 공격자(중복 방지 위해 set 사용)
+                S2C_Damage dmg;
+                dmg.size = sizeof(dmg);
+                dmg.type = S2C_DAMAGE;
+                dmg.attacker_id = client_id;
+                dmg.target_id = nid;
+                dmg.damage = damage;
+                dmg.new_hp = new_hp;
+                dmg.target_x = nx;
+                dmg.target_y = ny;
+
+                unordered_set<int> dmg_viewers;
+                {
+                    lock_guard<mutex> lock(n.view_lock);
+                    for (int vid : n.view_list) dmg_viewers.insert(vid);
+                }
+                dmg_viewers.insert(client_id);  // 공격자도 항상 받음
+                for (int vid : dmg_viewers) {
+                    ClientMap::const_accessor a;
+                    if (g_clients.find(a, vid)) a->second->do_send(dmg.size, &dmg);
+                }
+
+                // NPC 사망 처리: state=Dead + 시야 정리 + 섹터 제거 + 30초 리스폰 예약
+                if (new_hp == 0) {
+                    unordered_set<int> death_viewers;
+                    {
+                        lock_guard<mutex> lock(n.view_lock);
+                        for (int vid : n.view_list) death_viewers.insert(vid);
+                        n.view_list.clear();
+                        n.state = NpcFsmState::Dead;
+                        n.target_id = -1;
+                    }
+                    death_viewers.insert(client_id);  // 공격자가 시야 밖에서 죽일 일은 없지만 안전망
+
+                    // 시야 안 모든 플레이어의 view_list에서도 이 NPC 제거 (다음 SyncPlayerNpcView가
+                    // sector에서 못 찾아 left로 자연 처리되지만, 즉시 정리해두면 일관)
+                    for (int vid : death_viewers) {
+                        ClientMap::const_accessor a;
+                        if (g_clients.find(a, vid)) {
+                            lock_guard<mutex> lock(a->second->view_lock);
+                            a->second->view_list.erase(nid);
+                        }
+                    }
+                    n.active.store(false);
+                    RemoveObjectFromSector(nid, nx, ny, false);
+
+                    // S2C_DEATH 브로드캐스트
+                    S2C_Death dpkt;
+                    dpkt.size = sizeof(dpkt);
+                    dpkt.type = S2C_DEATH;
+                    dpkt.object_id = nid;
+                    dpkt.death_x = nx;
+                    dpkt.death_y = ny;
+                    for (int vid : death_viewers) {
+                        ClientMap::const_accessor a;
+                        if (g_clients.find(a, vid)) a->second->do_send(dpkt.size, &dpkt);
+                    }
+
+                    // 30초 뒤 리스폰 예약
+                    g_timer_manager.Schedule(nid, TimerEventKind::NpcRespawn, NPC_RESPAWN_MS);
+
+                    // EXP 부여: npc.level² × 2 × (Agro? ×2) × (Roaming? ×2)
+                    unsigned long long exp_gain = (unsigned long long)n.level * n.level * BASE_EXP_MULTIPLIER;
+                    if (n.type == NpcType::Agro)            exp_gain *= 2;
+                    if (n.move_mode == NpcMoveMode::Roaming) exp_gain *= 2;
+                    session->exp.fetch_add(exp_gain);
+
+                    // 레벨업 체크 (한 번에 여러 레벨 가능)
+                    bool leveled_up = false;
+                    while (true) {
+                        unsigned char cur_lv = session->level.load();
+                        unsigned long long need = (unsigned long long)cur_lv * cur_lv * BASE_EXP_MULTIPLIER;
+                        unsigned long long cur_exp = session->exp.load();
+                        if (cur_exp < need) break;
+                        // exp -= need + level += 1 (atomic 2-step, level은 한 번만 증가)
+                        if (session->exp.compare_exchange_weak(cur_exp, cur_exp - need)) {
+                            session->level.fetch_add(1);
+                            // max_hp += 20 + HP 풀회복
+                            int new_max = session->max_hp.fetch_add(20) + 20;
+                            session->hp.store(new_max);
+                            leveled_up = true;
+                        }
+                    }
+
+                    // 레벨업 했으면 S2C_LEVEL_UP 브로드캐스트 (시야 + 자기)
+                    if (leveled_up) {
+                        S2C_LevelUp lvl;
+                        lvl.size = sizeof(lvl);
+                        lvl.type = S2C_LEVEL_UP;
+                        lvl.object_id = client_id;
+                        lvl.new_level = session->level.load();
+                        lvl.new_max_hp = session->max_hp.load();
+
+                        unordered_set<int> lvl_viewers;
+                        {
+                            lock_guard<mutex> lk(session->view_lock);
+                            for (int vid : session->view_list) {
+                                if (!IsNpcId(vid)) lvl_viewers.insert(vid);
+                            }
+                        }
+                        for (int vid : lvl_viewers) {
+                            ClientMap::const_accessor aa;
+                            if (g_clients.find(aa, vid)) aa->second->do_send(lvl.size, &lvl);
+                        }
+                        session->do_send(lvl.size, &lvl);
+                    }
+
+                    // 자기 자신에게 스탯 갱신 (HP/EXP/Level 모두 한 번에)
+                    S2C_StatusChange sc;
+                    sc.size = sizeof(sc);
+                    sc.type = S2C_STATUS_CHANGE;
+                    sc.object_id = client_id;
+                    sc.hp = session->hp.load();
+                    sc.max_hp = session->max_hp.load();
+                    sc.exp = session->exp.load();
+                    sc.level = session->level.load();
+                    session->do_send(sc.size, &sc);
+                }
+            }
+        }
+        break;
+    }
+    case C2S_CHAT: {
+        C2S_Chat* p = reinterpret_cast<C2S_Chat*>(ptr);
+
+        // 안전 복사 + null 종결 보장
+        S2C_ChatMessage msg;
+        msg.size = sizeof(msg);
+        msg.type = S2C_CHAT_MESSAGE;
+        msg.object_id = client_id;
+        strncpy_s(msg.message, sizeof(msg.message), p->message, _TRUNCATE);
+        msg.message[MAX_CHAT_MSG_LEN - 1] = '\0';
+
+        // 자기 자신 + 시야 내 다른 플레이어에게 송신 (NPC는 채팅 안 받음)
+        session->do_send(msg.size, &msg);
+
+        vector<int> viewers;
+        {
+            lock_guard<mutex> lock(session->view_lock);
+            for (int vid : session->view_list) {
+                if (!IsNpcId(vid)) viewers.push_back(vid);
+            }
+        }
+        for (int vid : viewers) {
+            ClientMap::const_accessor a;
+            if (g_clients.find(a, vid)) a->second->do_send(msg.size, &msg);
+        }
         break;
     }
     case C2S_LOGOUT: {

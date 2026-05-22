@@ -1,0 +1,14 @@
+# NPC 스폰 스크립트 (Stage 4)
+# 형식: count type move_mode visual_id name area_x1 area_y1 area_x2 area_y2
+#   type      : Peace | Agro
+#   move_mode : Fixed | Roaming
+#   visual_id : 클라이언트 렌더링용 정수 (의미는 클라이언트 자유)
+#   name      : 영문/숫자/언더스코어 (공백 금지, 최대 30자, 자동으로 _xxxxx 접미사가 붙음)
+#   area_x1/y1 ~ area_x2/y2 : 스폰 가능한 사각형 영역 ([x1,x2), [y1,y2))
+#
+# 합계는 NUM_NPCS(=200000) 이내. 초과분은 무시.
+
+50000  Peace    Roaming  1  Slime     0     0     2000  2000
+50000  Peace    Fixed    2  Mushroom  0     0     2000  2000
+50000  Peace    Roaming  3  Goblin    0     0     2000  2000
+50000  Agro     Roaming  4  Orc       0     0     2000  2000

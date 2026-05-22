@@ -69,7 +69,10 @@
   <ImportGroup Label="PropertySheets" Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
     <Import Project="$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props" Condition="exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')" Label="LocalAppDataPlatform" />
   </ImportGroup>
-  <PropertyGroup Label="UserMacros" />
+  <PropertyGroup Label="UserMacros">
+    <!-- Lua 5.5 NuGet 패키지: static 링크로 DLL 배포 불필요. Lua.targets가 include/lib 경로 자동 처리 -->
+    <LuaType>static</LuaType>
+  </PropertyGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'">
     <ClCompile>
       <WarningLevel>Level3</WarningLevel>
@@ -130,6 +133,9 @@
   <ItemGroup>
     <ClCompile Include="MMOSERVER_Termproject.cpp" />
     <ClCompile Include="Core\TimerManager.cpp" />
+    <ClCompile Include="Core\World.cpp" />
+    <ClCompile Include="Core\NpcSpawner.cpp" />
+    <ClCompile Include="Core\LuaVM.cpp" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="protocol_2026.h" />
@@ -138,6 +144,10 @@
     <ClInclude Include="Core\NPC.h" />
     <ClInclude Include="Core\OverlappedTypes.h" />
     <ClInclude Include="Core\TimerManager.h" />
+    <ClInclude Include="Core\World.h" />
+    <ClInclude Include="Core\NpcSpawner.h" />
+    <ClInclude Include="Core\LuaVM.h" />
+    <ClInclude Include="Core\GameConfig.h" />
   </ItemGroup>
   <ItemGroup>
     <None Include="..\..\DEVELOPMENT_LOG.md" />
@@ -147,6 +157,7 @@
   <ImportGroup Label="ExtensionTargets">
     <Import Project="..\packages\inteltbb.redist.win.2023.0.0.716\build\native\inteltbb.redist.win.targets" Condition="Exists('..\packages\inteltbb.redist.win.2023.0.0.716\build\native\inteltbb.redist.win.targets')" />
     <Import Project="..\packages\inteltbb.devel.win.2023.0.0.716\build\native\inteltbb.devel.win.targets" Condition="Exists('..\packages\inteltbb.devel.win.2023.0.0.716\build\native\inteltbb.devel.win.targets')" />
+    <Import Project="..\packages\lua.5.5.0\build\native\Lua.targets" Condition="Exists('..\packages\lua.5.5.0\build\native\Lua.targets')" />
   </ImportGroup>
   <Target Name="EnsureNuGetPackageBuildImports" BeforeTargets="PrepareForBuild">
     <PropertyGroup>
@@ -154,5 +165,6 @@
     </PropertyGroup>
     <Error Condition="!Exists('..\packages\inteltbb.redist.win.2023.0.0.716\build\native\inteltbb.redist.win.targets')" Text="$([System.String]::Format('$(ErrorText)', '..\packages\inteltbb.redist.win.2023.0.0.716\build\native\inteltbb.redist.win.targets'))" />
     <Error Condition="!Exists('..\packages\inteltbb.devel.win.2023.0.0.716\build\native\inteltbb.devel.win.targets')" Text="$([System.String]::Format('$(ErrorText)', '..\packages\inteltbb.devel.win.2023.0.0.716\build\native\inteltbb.devel.win.targets'))" />
+    <Error Condition="!Exists('..\packages\lua.5.5.0\build\native\Lua.targets')" Text="$([System.String]::Format('$(ErrorText)', '..\packages\lua.5.5.0\build\native\Lua.targets'))" />
   </Target>
 </Project>

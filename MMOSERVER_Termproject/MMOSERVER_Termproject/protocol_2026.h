@@ -12,26 +12,31 @@ constexpr int MAX_CHAT_MSG_LEN = 200;
 
 enum PACKET_TYPE {
 	C2S_LOGIN,			// Client to Server: Login request
-	// »ç¿ëÀÚ ÀÌ¸§À» Æ÷ÇÔÇÑ ·Î±×ÀÎ ¿äÃ» ÆĞÅ¶	
+	// ï¿½ï¿½ï¿½ï¿½ï¿½ ï¿½Ì¸ï¿½ï¿½ï¿½ ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ ï¿½Î±ï¿½ï¿½ï¿½ ï¿½ï¿½Ã» ï¿½ï¿½Å¶	
 	C2S_MOVE,			// Client to Server: Move request
-	// ÀÌµ¿ ¹æÇâ°ú ÀÌµ¿ ½Ã°£À» Æ÷ÇÔÇÑ ÀÌµ¿ ¿äÃ» ÆĞÅ¶
+	// ï¿½Ìµï¿½ ï¿½ï¿½ï¿½ï¿½ï¿½ ï¿½Ìµï¿½ ï¿½Ã°ï¿½ï¿½ï¿½ ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ ï¿½Ìµï¿½ ï¿½ï¿½Ã» ï¿½ï¿½Å¶
 	C2S_CHAT,			// Client to Server: Chat message
-	// Ã¤ÆÃ ¸Ş½ÃÁö¸¦ Æ÷ÇÔÇÑ Ã¤ÆÃ ¿äÃ» ÆĞÅ¶
+	// Ã¤ï¿½ï¿½ ï¿½Ş½ï¿½ï¿½ï¿½ï¿½ï¿½ ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ Ã¤ï¿½ï¿½ ï¿½ï¿½Ã» ï¿½ï¿½Å¶
 	C2S_ATTACK,			// Client to Server: Attack request
-	// °ø°İ ¿äÃ» ÆĞÅ¶ (4 ¹æÇâ µ¿½Ã °ø°İ)
+	// ï¿½ï¿½ï¿½ï¿½ ï¿½ï¿½Ã» ï¿½ï¿½Å¶ (4 ï¿½ï¿½ï¿½ï¿½ ï¿½ï¿½ï¿½ï¿½ ï¿½ï¿½ï¿½ï¿½)
 	C2S_TELEPORT,		// Client to Server: Teleport request
-	// ÅÚ·¹Æ÷Æ® ¿äÃ» ÆĞÅ¶ (¸ñÀûÁö ÁÂÇ¥ Æ÷ÇÔ)
-	// STRESS TEST¿ëÀ¸·Î Ãß°¡ÇÑ ÆĞÅ¶ÀÔ´Ï´Ù. ½ÃÀÛ ¸¶À»¿¡ ¸ô¸®´Â °ÍÀ» ¹æÁö.
+	// ï¿½Ú·ï¿½ï¿½ï¿½Æ® ï¿½ï¿½Ã» ï¿½ï¿½Å¶ (ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ ï¿½ï¿½Ç¥ ï¿½ï¿½ï¿½ï¿½)
+	// STRESS TESTï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ ï¿½ß°ï¿½ï¿½ï¿½ ï¿½ï¿½Å¶ï¿½Ô´Ï´ï¿½. ï¿½ï¿½ï¿½ï¿½ ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ ï¿½ï¿½ï¿½ï¿½ ï¿½ï¿½ï¿½ï¿½.
 	C2S_LOGOUT,			// Client to Server: Logout request
 
 	S2C_LOGIN_RESULT,	//	Server to Client: Login result
-	// ·Î±×ÀÎ °á°ú ÆĞÅ¶ (¼º°ø ¿©ºÎ¿Í ¸Ş½ÃÁö Æ÷ÇÔ)
+	// ï¿½Î±ï¿½ï¿½ï¿½ ï¿½ï¿½ï¿½ ï¿½ï¿½Å¶ (ï¿½ï¿½ï¿½ï¿½ ï¿½ï¿½ï¿½Î¿ï¿½ ï¿½Ş½ï¿½ï¿½ï¿½ ï¿½ï¿½ï¿½ï¿½)
 	S2C_AVATAR_INFO,	//	Server to Client: Avatar information
 	S2C_ADD_OBJECT,		//	Server to Client: Add player or NPC		
 	S2C_REMOVE_OBJECT,	//	Server to Client: Remove player or NPC
 	S2C_MOVE_OBJECT,	//	Server to Client: Move player or NPC
 	S2C_CHAT_MESSAGE,	//	Server to Client: Chat message
-	S2C_STATUS_CHANGE,	//	Server to Client: Update player or NPC status (e.g., health, buffs)	
+	S2C_STATUS_CHANGE,	//	Server to Client: Update player or NPC status (e.g., health, buffs)
+	S2C_ATTACK_ANIM,	//	Server to Client: ê³µê²©ìê°€ ê³µê²© ëª¨ì…˜ì„ ì‹œì‘í–ˆìŒ ì•Œë¦¼ (ë¸Œë¡œë“œìºìŠ¤íŠ¸)
+	S2C_DAMAGE,			//	Server to Client: í”¼ê²© í†µì§€ (ê³µê²©ì/ëŒ€ìƒ/ë°ë¯¸ì§€/ëŒ€ìƒ ìƒˆ HP) â€” í´ë¼ê°€ í˜ˆí” ì´í™íŠ¸ + HP ê°±ì‹ 
+	S2C_DEATH,			//	Server to Client: ì—”í‹°í‹° ì‚¬ë§ (ë¸Œë¡œë“œìºìŠ¤íŠ¸)
+	S2C_RESPAWN,		//	Server to Client: ì—”í‹°í‹° ë¦¬ìŠ¤í° (ë¸Œë¡œë“œìºìŠ¤íŠ¸)
+	S2C_LEVEL_UP,		//	Server to Client: ë ˆë²¨ì—… ì•Œë¦¼ (ë¸Œë¡œë“œìºìŠ¤íŠ¸) â€” í´ë¼ê°€ burst ì´í™íŠ¸
 };
 
 #pragma pack(push, 1) // Ensure no padding between struct members
@@ -136,6 +141,55 @@ struct S2C_StatusChange {
 	int max_hp;
 	unsigned long long exp;
 	unsigned char level;
+};
+
+// ê³µê²© ëª¨ì…˜ ì‹œì‘ (ë¸Œë¡œë“œìºìŠ¤íŠ¸). í´ë¼ê°€ ì›Œë¦¬ì–´ attack ì‹œíŠ¸ë¥¼ direction ë°©í–¥ìœ¼ë¡œ ì¬ìƒ.
+struct S2C_AttackAnim {
+	unsigned char size;
+	PACKET_TYPE   type;
+	int object_id;
+	unsigned char direction; // 0=Down, 1=Left, 2=Right, 3=Up
+};
+
+// í”¼ê²© í†µì§€. í´ë¼ê°€ target ìœ„ì¹˜ì— í˜ˆí” ì´í™íŠ¸ + targetì˜ HP HUD ê°±ì‹ .
+struct S2C_Damage {
+	unsigned char size;
+	PACKET_TYPE   type;
+	int attacker_id;
+	int target_id;
+	int damage;
+	int new_hp;       // targetì˜ ìƒˆ HP (ì´ì „ HP - damage, 0 ì´ìƒ)
+	short target_x;
+	short target_y;
+};
+
+// ì—”í‹°í‹° ì‚¬ë§. í´ë¼ê°€ ì‚¬ë§ ìœ„ì¹˜ì— soul ì´í™íŠ¸.
+struct S2C_Death {
+	unsigned char size;
+	PACKET_TYPE   type;
+	int object_id;
+	short death_x;
+	short death_y;
+};
+
+// ì—”í‹°í‹° ë¦¬ìŠ¤í°. í´ë¼ê°€ ë¦¬ìŠ¤í° ìœ„ì¹˜ì— pillar ì´í™íŠ¸.
+struct S2C_Respawn {
+	unsigned char size;
+	PACKET_TYPE   type;
+	int object_id;
+	short respawn_x;
+	short respawn_y;
+	int hp;
+	int max_hp;
+};
+
+// ë ˆë²¨ì—…. í´ë¼ê°€ burst ì´í™íŠ¸ + ìê¸° ìì‹ ì´ë©´ HUD ê°±ì‹ .
+struct S2C_LevelUp {
+	unsigned char size;
+	PACKET_TYPE   type;
+	int object_id;
+	unsigned char new_level;
+	int new_max_hp;
 };
 
 #pragma pack(pop) // Restore default packing

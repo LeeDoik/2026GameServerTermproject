@@ -1,0 +1,119 @@
+#define _CRT_SECURE_NO_WARNINGS
+#include "NpcSpawner.h"
+#include "World.h"
+#include "../protocol_2026.h"
+
+#include <cstdio>
+#include <cstring>
+#include <cstdlib>
+#include <random>
+#include <string>
+#include <iostream>
+
+namespace {
+
+// 텍스트 토큰 → enum 파서
+bool ParseType(const char* s, NpcType& out) {
+    if (_stricmp(s, "Peace") == 0) { out = NpcType::Peace; return true; }
+    if (_stricmp(s, "Agro")  == 0) { out = NpcType::Agro;  return true; }
+    return false;
+}
+bool ParseMoveMode(const char* s, NpcMoveMode& out) {
+    if (_stricmp(s, "Fixed")   == 0) { out = NpcMoveMode::Fixed;   return true; }
+    if (_stricmp(s, "Roaming") == 0) { out = NpcMoveMode::Roaming; return true; }
+    return false;
+}
+
+} // anon
+
+int LoadNpcSpawnScript(const char* path) {
+    FILE* fp = std::fopen(path, "r");
+    if (!fp) {
+        std::cerr << "[NpcSpawner] Failed to open " << path << std::endl;
+        return -1;
+    }
+
+    // 결정적 스폰을 위해 고정 시드 사용 (동일 스크립트는 매번 동일 배치)
+    std::mt19937 rng(0xA37E1A20u);
+
+    int spawn_index = 0;
+    char line[512];
+    int line_no = 0;
+
+    while (std::fgets(line, sizeof(line), fp)) {
+        ++line_no;
+        // 주석/빈 줄 스킵
+        char* p = line;
+        while (*p == ' ' || *p == '\t') ++p;
+        if (*p == '#' || *p == '\n' || *p == '\r' || *p == '\0') continue;
+
+        int count = 0;
+        char type_s[32], move_s[32], name_s[32];
+        int visual_id = 0;
+        int ax1 = 0, ay1 = 0, ax2 = 0, ay2 = 0;
+        int matched = std::sscanf(p, "%d %31s %31s %d %31s %d %d %d %d",
+            &count, type_s, move_s, &visual_id, name_s, &ax1, &ay1, &ax2, &ay2);
+        if (matched != 9) {
+            std::cerr << "[NpcSpawner] Line " << line_no << " parse error: " << line;
+            continue;
+        }
+
+        NpcType type;
+        NpcMoveMode mode;
+        if (!ParseType(type_s, type) || !ParseMoveMode(move_s, mode)) {
+            std::cerr << "[NpcSpawner] Line " << line_no << " unknown enum: " << type_s << " " << move_s << std::endl;
+            continue;
+        }
+        if (ax1 < 0) ax1 = 0;
+        if (ay1 < 0) ay1 = 0;
+        if (ax2 > WORLD_WIDTH)  ax2 = WORLD_WIDTH;
+        if (ay2 > WORLD_HEIGHT) ay2 = WORLD_HEIGHT;
+        if (ax2 <= ax1 || ay2 <= ay1) {
+            std::cerr << "[NpcSpawner] Line " << line_no << " invalid area." << std::endl;
+            continue;
+        }
+
+        std::uniform_int_distribution<int> dist_x(ax1, ax2 - 1);
+        std::uniform_int_distribution<int> dist_y(ay1, ay2 - 1);
+
+        for (int i = 0; i < count; ++i) {
+            if (spawn_index >= NUM_NPCS) {
+                std::cerr << "[NpcSpawner] NUM_NPCS capacity reached at line " << line_no << std::endl;
+                std::fclose(fp);
+                g_npc_count = spawn_index;
+                return spawn_index;
+            }
+            NPC& n = g_npcs[spawn_index];
+            n.id = NPC_ID_START + spawn_index;
+            n.type = type;
+            n.move_mode = mode;
+            n.state = (mode == NpcMoveMode::Roaming) ? NpcFsmState::Roaming : NpcFsmState::Idle;
+            n.visual_id = visual_id;
+            n.area_x1 = static_cast<short>(ax1);
+            n.area_y1 = static_cast<short>(ay1);
+            n.area_x2 = static_cast<short>(ax2);
+            n.area_y2 = static_cast<short>(ay2);
+            short sx = static_cast<short>(dist_x(rng));
+            short sy = static_cast<short>(dist_y(rng));
+            n.spawn_x = sx;
+            n.spawn_y = sy;
+            n.x = sx;
+            n.y = sy;
+            n.hp = 100;
+            n.max_hp = 100;
+            n.level = 1;
+            n.target_id = -1;
+            n.active.store(false);
+
+            // name: "<prefix>_<id마지막 5자리>" 형태로 구별 가능하게
+            std::snprintf(n.name, sizeof(n.name), "%s_%05d", name_s, spawn_index % 100000);
+
+            ++spawn_index;
+        }
+    }
+    std::fclose(fp);
+
+    g_npc_count = spawn_index;
+    std::cout << "[NpcSpawner] Spawned " << spawn_index << " NPCs from " << path << std::endl;
+    return spawn_index;
+}
