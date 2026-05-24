@@ -1,6 +1,7 @@
 #define _CRT_SECURE_NO_WARNINGS
 #include "NpcSpawner.h"
 #include "World.h"
+#include "Map.h"
 #include "../protocol_2026.h"
 
 #include <cstdio>
@@ -83,6 +84,38 @@ int LoadNpcSpawnScript(const char* path) {
                 g_npc_count = spawn_index;
                 return spawn_index;
             }
+
+            // Stage 6: 장애물 회피 — 무작위 추첨 후 IsBlocked면 재시도
+            short sx = 0, sy = 0;
+            bool placed = false;
+            for (int attempt = 0; attempt < 32; ++attempt) {
+                short tx = static_cast<short>(dist_x(rng));
+                short ty = static_cast<short>(dist_y(rng));
+                if (!Map::IsBlocked(tx, ty)) {
+                    sx = tx; sy = ty;
+                    placed = true;
+                    break;
+                }
+            }
+            if (!placed) {
+                // fallback: area 선형 스캔. area 전체가 막혀 있으면 spawn 포기.
+                for (int yy = ay1; yy < ay2 && !placed; ++yy) {
+                    for (int xx = ax1; xx < ax2; ++xx) {
+                        if (!Map::IsBlocked(xx, yy)) {
+                            sx = static_cast<short>(xx);
+                            sy = static_cast<short>(yy);
+                            placed = true;
+                            break;
+                        }
+                    }
+                }
+            }
+            if (!placed) {
+                std::cerr << "[NpcSpawner] No walkable tile in area at line "
+                          << line_no << " — skipping NPC slot." << std::endl;
+                continue;  // spawn_index 유지 — 이 슬롯은 건너뜀
+            }
+
             NPC& n = g_npcs[spawn_index];
             n.id = NPC_ID_START + spawn_index;
             n.type = type;
@@ -93,8 +126,6 @@ int LoadNpcSpawnScript(const char* path) {
             n.area_y1 = static_cast<short>(ay1);
             n.area_x2 = static_cast<short>(ax2);
             n.area_y2 = static_cast<short>(ay2);
-            short sx = static_cast<short>(dist_x(rng));
-            short sy = static_cast<short>(dist_y(rng));
             n.spawn_x = sx;
             n.spawn_y = sy;
             n.x = sx;

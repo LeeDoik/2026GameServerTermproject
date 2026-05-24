@@ -1,0 +1,167 @@
+#define _CRT_SECURE_NO_WARNINGS
+#include "JsonFileBackend.h"
+
+#include <cstdio>
+#include <cstring>
+#include <cctype>
+#include <cstdlib>
+#include <direct.h>
+#include <sys/stat.h>
+#include <string>
+#include <utility>
+
+namespace {
+
+// username 안전화: 영숫자 + 언더스코어만 허용. 그 외는 '_'로 치환.
+// 파일 시스템 traversal 방지 + Windows 예약 문자 회피.
+std::string SafeUsername(const std::string& in) {
+    std::string out;
+    out.reserve(in.size());
+    for (char c : in) {
+        if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+            (c >= '0' && c <= '9') || c == '_') {
+            out.push_back(c);
+        }
+        else {
+            out.push_back('_');
+        }
+    }
+    if (out.empty()) out = "_";
+    return out;
+}
+
+void EnsureDir(const std::string& path) {
+    struct _stat st;
+    if (_stat(path.c_str(), &st) == 0) return;
+    _mkdir(path.c_str());
+}
+
+// 단순 키 검색: "\"key\":" 패턴 위치를 찾아 그 뒤의 값 시작을 가리킴.
+// 못 찾으면 nullptr.
+const char* FindKey(const char* json, const char* key) {
+    std::string pat = "\"";
+    pat += key;
+    pat += "\":";
+    const char* p = std::strstr(json, pat.c_str());
+    if (!p) return nullptr;
+    p += pat.size();
+    while (*p == ' ' || *p == '\t') ++p;
+    return p;
+}
+
+bool ReadString(const char* p, std::string& out) {
+    if (*p != '"') return false;
+    ++p;
+    out.clear();
+    while (*p && *p != '"') {
+        if (*p == '\\' && p[1]) { out.push_back(p[1]); p += 2; }
+        else { out.push_back(*p++); }
+    }
+    return *p == '"';
+}
+
+bool ReadInt(const char* p, long long& out) {
+    char* end = nullptr;
+    out = std::strtoll(p, &end, 10);
+    return end != p;
+}
+
+} // anon
+
+JsonFileBackend::JsonFileBackend(std::string root_dir) : root_dir_(std::move(root_dir)) {
+    EnsureDir(root_dir_);
+}
+
+std::string JsonFileBackend::PathFor(const std::string& username) const {
+    std::string safe = SafeUsername(username);
+    std::string p = root_dir_;
+    if (!p.empty() && p.back() != '/' && p.back() != '\\') p.push_back('/');
+    p += safe;
+    p += ".json";
+    return p;
+}
+
+IDbBackend::LoadResult JsonFileBackend::Load(const std::string& username, PlayerSnapshot& out) {
+    LoadResult res;
+    out.username = username;
+
+    std::string path = PathFor(username);
+    FILE* fp = std::fopen(path.c_str(), "rb");
+    if (!fp) {
+        // 파일 없음 = 신규 캐릭터 (백엔드 호출 자체는 성공으로 간주)
+        res.ok = true;
+        res.exists = false;
+        return res;
+    }
+
+    std::fseek(fp, 0, SEEK_END);
+    long size = std::ftell(fp);
+    std::fseek(fp, 0, SEEK_SET);
+    if (size <= 0 || size > 64 * 1024) {
+        std::fclose(fp);
+        res.ok = false;
+        return res;
+    }
+    std::string buf(static_cast<size_t>(size), '\0');
+    size_t read = std::fread(buf.data(), 1, static_cast<size_t>(size), fp);
+    std::fclose(fp);
+    if (read != static_cast<size_t>(size)) {
+        res.ok = false;
+        return res;
+    }
+
+    const char* json = buf.c_str();
+
+    // username
+    if (const char* p = FindKey(json, "username")) {
+        std::string s;
+        if (ReadString(p, s)) out.username = std::move(s);
+    }
+
+    long long v = 0;
+    if (const char* p = FindKey(json, "hp"))      { if (ReadInt(p, v)) out.hp = static_cast<int>(v); }
+    if (const char* p = FindKey(json, "max_hp"))  { if (ReadInt(p, v)) out.max_hp = static_cast<int>(v); }
+    if (const char* p = FindKey(json, "exp"))     { if (ReadInt(p, v)) out.exp = static_cast<unsigned long long>(v); }
+    if (const char* p = FindKey(json, "level"))   { if (ReadInt(p, v)) out.level = static_cast<unsigned char>(v); }
+    if (const char* p = FindKey(json, "x"))       { if (ReadInt(p, v)) out.x = static_cast<short>(v); }
+    if (const char* p = FindKey(json, "y"))       { if (ReadInt(p, v)) out.y = static_cast<short>(v); }
+
+    res.ok = true;
+    res.exists = true;
+    return res;
+}
+
+bool JsonFileBackend::Save(const PlayerSnapshot& snap) {
+    std::string path = PathFor(snap.username);
+    // 임시 파일에 먼저 쓰고 rename — 부분 쓰기로 인한 손상 방지 (atomic-ish)
+    std::string tmp = path + ".tmp";
+
+    FILE* fp = std::fopen(tmp.c_str(), "wb");
+    if (!fp) return false;
+
+    // 외부 라이브러리 없이 6개 필드 one-liner JSON. username은 안전화된 키 그대로 사용.
+    int n = std::fprintf(
+        fp,
+        "{\"username\":\"%s\",\"hp\":%d,\"max_hp\":%d,\"exp\":%llu,\"level\":%u,\"x\":%d,\"y\":%d}\n",
+        SafeUsername(snap.username).c_str(),
+        snap.hp,
+        snap.max_hp,
+        static_cast<unsigned long long>(snap.exp),
+        static_cast<unsigned int>(snap.level),
+        static_cast<int>(snap.x),
+        static_cast<int>(snap.y));
+    std::fclose(fp);
+
+    if (n <= 0) {
+        std::remove(tmp.c_str());
+        return false;
+    }
+
+    // Windows: 기존 파일 있으면 rename 실패. 먼저 제거.
+    std::remove(path.c_str());
+    if (std::rename(tmp.c_str(), path.c_str()) != 0) {
+        std::remove(tmp.c_str());
+        return false;
+    }
+    return true;
+}

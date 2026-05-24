@@ -24,6 +24,11 @@
 #include "Core/NpcSpawner.h"
 #include "Core/LuaVM.h"
 #include "Core/GameConfig.h"
+#include "Core/Map.h"
+#include "Core/AStar.h"
+#include "Core/Db/DbTypes.h"
+#include "Core/Db/JsonFileBackend.h"
+#include "Core/Db/DbWorker.h"
 
 #pragma comment(lib, "ws2_32.lib")
 #pragma comment(lib, "mswsock.lib")
@@ -61,6 +66,21 @@ TimerManager g_timer_manager;
 
 // 전역 Lua VM. 부팅 시 npc_ai.lua 로드. AI 디스패치는 추후 단계에서 연결
 LuaVM g_lua;
+
+// Stage 6.3: DB 워커. JSON 파일 백엔드를 기본으로 시작.
+DbWorker g_db_worker;
+
+// IOCP에 DB 완료 통보용 OVERLAPPED. 첫 두 필드(WSAOVERLAPPED, IO_TYPE) 레이아웃 호환.
+struct DbOverlapped {
+    WSAOVERLAPPED overlapped;
+    IO_TYPE type;
+    DbResponse response;
+
+    DbOverlapped() : type(IO_DB_DONE) {
+        memset(&overlapped, 0, sizeof(overlapped));
+    }
+};
+ObjectPool<DbOverlapped> g_db_pool;
 
 // --- 링 버퍼 (Ring Buffer) 구현 ---
 // 기존의 prev_recv 방식(포인터 이동)을 피하고, 원형 큐 형태로 데이터를 안전하게 적재 및 추출합니다.
@@ -311,6 +331,10 @@ void NpcOnMove(int npc_id);
 void NpcOnRespawn(int npc_id);
 void PlayerOnDeath(std::shared_ptr<Player> session);
 void PlayerOnHpRegen(int client_id);
+void OnPlayerSpawn(int client_id, const PlayerSnapshot& snap, bool exists);
+void OnDbResponse(DbResponse& resp);
+void PlayerOnAutoSave();
+PlayerSnapshot SnapshotPlayer(const std::shared_ptr<Player>& session);
 
 // 플레이어 시점에서 자기 시야 안의 NPC와 view_list를 동기화.
 // 새로 시야에 들어온 NPC: Add 전송 + 양방향 view 등록 + Lazy AI 활성
@@ -550,13 +574,49 @@ void NpcOnMove(int npc_id) {
         }
     }
 
-    // 4) 이동 적용 + 월드 경계 클램프
+    // 4) 이동 적용 + 월드 경계 클램프 + 장애물 회피
     short new_x = static_cast<short>(old_x + result.dx);
     short new_y = static_cast<short>(old_y + result.dy);
     if (new_x < 0) new_x = 0;
     if (new_y < 0) new_y = 0;
     if (new_x >= WORLD_WIDTH)  new_x = WORLD_WIDTH - 1;
     if (new_y >= WORLD_HEIGHT) new_y = WORLD_HEIGHT - 1;
+
+    // Stage 6.2: 막힌 타일로 향하면 추적 중일 때 A*로 우회, 아니면 stay
+    if (Map::IsBlocked(new_x, new_y)) {
+        bool detoured = false;
+        if (new_target != -1) {
+            short tgt_x_path = -1, tgt_y_path = -1;
+            if (new_target == cur_target_id && target_x != -1) {
+                tgt_x_path = target_x;
+                tgt_y_path = target_y;
+            }
+            else if (new_target == nearest_id) {
+                tgt_x_path = nearest_x;
+                tgt_y_path = nearest_y;
+            }
+            if (tgt_x_path != -1) {
+                int dx_alt = 0, dy_alt = 0;
+                if (AStar::AStarStep(old_x, old_y, tgt_x_path, tgt_y_path, dx_alt, dy_alt)
+                    && (dx_alt != 0 || dy_alt != 0)) {
+                    int alt_x = static_cast<int>(old_x) + dx_alt;
+                    int alt_y = static_cast<int>(old_y) + dy_alt;
+                    // 스폰 박스(Lua와 동일한 ±ROAM_AREA_RANGE) 일관성 + 장애물 재확인
+                    if (std::abs(alt_x - static_cast<int>(npc.spawn_x)) <= ROAM_AREA_RANGE
+                        && std::abs(alt_y - static_cast<int>(npc.spawn_y)) <= ROAM_AREA_RANGE
+                        && !Map::IsBlocked(alt_x, alt_y)) {
+                        new_x = static_cast<short>(alt_x);
+                        new_y = static_cast<short>(alt_y);
+                        detoured = true;
+                    }
+                }
+            }
+        }
+        if (!detoured) {
+            new_x = old_x;
+            new_y = old_y;
+        }
+    }
 
     bool moved = (new_x != old_x || new_y != old_y);
     if (moved) {
@@ -894,6 +954,156 @@ void PlayerOnHpRegen(int client_id) {
     g_timer_manager.Schedule(client_id, TimerEventKind::HpRegen, HP_REGEN_INTERVAL_MS);
 }
 
+// Stage 6.3: 현재 플레이어 상태를 PlayerSnapshot으로 캡쳐 (Save용)
+PlayerSnapshot SnapshotPlayer(const std::shared_ptr<Player>& session) {
+    PlayerSnapshot snap;
+    auto name_ptr = atomic_load(&session->name);
+    snap.username = name_ptr ? *name_ptr : std::string{};
+    snap.hp      = session->hp.load();
+    snap.max_hp  = session->max_hp.load();
+    snap.exp     = session->exp.load();
+    snap.level   = session->level.load();
+    snap.x       = session->x;
+    snap.y       = session->y;
+    return snap;
+}
+
+// LOGIN 흐름의 후반부 (DB Load 응답 도착 후): spawn 위치 결정 + S2C_AvatarInfo + view 구축 + HpRegen 시작
+void OnPlayerSpawn(int client_id, const PlayerSnapshot& snap, bool exists) {
+    shared_ptr<Player> session;
+    {
+        ClientMap::const_accessor a;
+        if (!g_clients.find(a, client_id)) return;  // 응답 도착 전 클라가 끊김
+        session = a->second;
+    }
+
+    // 모든 LOGIN은 Aetheria Village 영역 안 walkable 좌표에서 시작 (신규/기존 동일).
+    // 스탯(hp/exp/level)만 DB에서 복원하고 위치는 항상 마을 안 무작위로 통일.
+    short sx_pos = PLAYER_SPAWN_X;
+    short sy_pos = PLAYER_SPAWN_Y;
+    {
+        int range_x = VILLAGE_X2 - VILLAGE_X1;
+        int range_y = VILLAGE_Y2 - VILLAGE_Y1;
+        for (int attempt = 0; attempt < 32; ++attempt) {
+            short tx = static_cast<short>(VILLAGE_X1 + rand() % range_x);
+            short ty = static_cast<short>(VILLAGE_Y1 + rand() % range_y);
+            if (!Map::IsBlocked(tx, ty)) { sx_pos = tx; sy_pos = ty; break; }
+        }
+    }
+    if (exists) {
+        int loaded_max_hp = snap.max_hp > 0 ? snap.max_hp : 100;
+        int loaded_hp     = snap.hp > 0 ? snap.hp : loaded_max_hp;
+        session->max_hp.store(loaded_max_hp);
+        session->hp.store(loaded_hp);
+        session->exp.store(snap.exp);
+        session->level.store(snap.level > 0 ? snap.level : 1);
+    }
+    // 신규 캐릭은 atomic 기본값 (Player ctor: hp=100, max_hp=100, exp=0, level=1) 그대로 사용
+
+    session->x = sx_pos;
+    session->y = sy_pos;
+    UpdateObjectSector(client_id, -1, -1, session->x, session->y, true);
+
+    // 1. 본인에게 아바타 정보 전송 (DB에서 복원된 hp/exp/level 반영)
+    S2C_AvatarInfo info;
+    info.size = sizeof(info);
+    info.type = S2C_AVATAR_INFO;
+    info.playerId = client_id;
+    info.x = session->x;
+    info.y = session->y;
+    info.hp = session->hp.load();
+    info.max_hp = session->max_hp.load();
+    info.exp = session->exp.load();
+    info.level = session->level.load();
+    info.visualId = 0;
+    session->do_send(info.size, &info);
+
+    // 2. 초기 view_list 구축 + 상호 가시화
+    int sx = session->x / SECTOR_SIZE;
+    int sy = session->y / SECTOR_SIZE;
+    vector<int> candidate_ids;
+    for (int dy = -1; dy <= 1; ++dy) {
+        for (int dx = -1; dx <= 1; ++dx) {
+            int nx = sx + dx, ny = sy + dy;
+            if (nx < 0 || nx >= NUM_SECTORS_X || ny < 0 || ny >= NUM_SECTORS_Y) continue;
+            lock_guard<mutex> lock(g_sectors[ny][nx].m_lock);
+            for (int other_id : g_sectors[ny][nx].players) {
+                if (other_id == client_id) continue;
+                candidate_ids.push_back(other_id);
+            }
+        }
+    }
+    vector<shared_ptr<Player>> candidates;
+    candidates.reserve(candidate_ids.size());
+    for (int id : candidate_ids) {
+        ClientMap::const_accessor a;
+        if (g_clients.find(a, id)) candidates.push_back(a->second);
+    }
+    vector<shared_ptr<Player>> in_view;
+    {
+        lock_guard<mutex> lock(session->view_lock);
+        for (auto& other : candidates) {
+            if (IsInView(session->x, session->y, other->x, other->y)) {
+                session->view_list.insert(other->id);
+                in_view.push_back(other);
+            }
+        }
+    }
+    for (auto& other : in_view) {
+        {
+            lock_guard<mutex> lock(other->view_lock);
+            other->view_list.insert(client_id);
+        }
+        SendAddObject(other, session);
+        SendAddObject(session, other);
+    }
+
+    SyncPlayerNpcView(session);
+    g_timer_manager.Schedule(client_id, TimerEventKind::HpRegen, HP_REGEN_INTERVAL_MS);
+
+    auto name_ptr = atomic_load(&session->name);
+    cout << "[Login] Client " << client_id << " (" << (exists ? "loaded" : "new")
+         << ") as " << (name_ptr ? *name_ptr : std::string{}) << " at ("
+         << session->x << ", " << session->y << ") hp=" << session->hp.load()
+         << " lv=" << static_cast<int>(session->level.load()) << endl;
+}
+
+// DB 응답 디스패치 (worker_thread의 IO_DB_DONE 분기에서 호출).
+void OnDbResponse(DbResponse& resp) {
+    switch (resp.kind) {
+    case DbReqKind::Load:
+        if (!resp.ok) {
+            cerr << "[Db] Load failed for client " << resp.client_id << endl;
+            // 실패해도 신규 캐릭으로 spawn 처리 — 게임은 계속
+            OnPlayerSpawn(resp.client_id, resp.data, false);
+            break;
+        }
+        OnPlayerSpawn(resp.client_id, resp.data, resp.exists);
+        break;
+    case DbReqKind::Save:
+        if (!resp.ok) {
+            cerr << "[Db] Save failed for client " << resp.client_id
+                 << " (user=" << resp.data.username << ")" << endl;
+        }
+        break;
+    }
+}
+
+// 30초마다 모든 활성 플레이어 상태를 EnqueueSave.
+void PlayerOnAutoSave() {
+    vector<shared_ptr<Player>> snapshots;
+    for (auto it = g_clients.begin(); it != g_clients.end(); ++it) {
+        if (it->second) snapshots.push_back(it->second);
+    }
+    for (auto& p : snapshots) {
+        auto name_ptr = atomic_load(&p->name);
+        if (!name_ptr || name_ptr->empty()) continue;  // 아직 LOGIN 전이거나 익명
+        g_db_worker.EnqueueSave(p->id, SnapshotPlayer(p));
+    }
+    // 다음 자동 저장 tick 재스케줄 (entity_id=0은 dummy)
+    g_timer_manager.Schedule(0, TimerEventKind::PlayerAutoSave, PLAYER_AUTO_SAVE_INTERVAL_MS);
+}
+
 // --- 함수 선언 ---
 void worker_thread();
 void process_packet(int client_id, unsigned char* ptr);
@@ -933,6 +1143,21 @@ int main(int argc, char* argv[]) {
     CreateIoCompletionPort(reinterpret_cast<HANDLE>(g_listen_socket), g_h_iocp, static_cast<ULONG_PTR>(-1), 0);
 
     cout << "[Server] MMO Server Started. Port: " << PORT << endl;
+
+    // --- Stage 6: 장애물 맵 로드 (NPC 스폰보다 먼저: 스폰 시 IsBlocked 회피 가능) ---
+    const char* obstacle_paths[] = {
+        "data/obstacles.txt",
+        "../../data/obstacles.txt",
+        "../../../data/obstacles.txt",
+    };
+    int obstacle_rects = -1;
+    for (const char* p : obstacle_paths) {
+        obstacle_rects = Map::LoadObstacles(p);
+        if (obstacle_rects >= 0) break;
+    }
+    if (obstacle_rects < 0) {
+        cout << "[Map] obstacles.txt not found — world has no obstacles." << endl;
+    }
 
     // --- Stage 4: NPC 스폰 ---
     // 실행 디렉토리가 프로젝트 루트일 수도, x64/Release일 수도 있으므로 후보 경로를 순서대로 시도
@@ -1002,6 +1227,33 @@ int main(int argc, char* argv[]) {
             static_cast<ULONG_PTR>(ev.entity_id), &tov->overlapped);
     });
 
+    // --- Stage 6.3: DB 워커 시작 (JSON 파일 백엔드) ---
+    // 응답 콜백: PostQueuedCompletionStatus로 IOCP에 IO_DB_DONE 이벤트 post.
+    // data/ 부모 디렉토리 위치를 먼저 찾고, 그 아래 players/ 사용 (JsonFileBackend가 자동 mkdir)
+    const char* parent_candidates[] = { "data", "../../data", "../../../data" };
+    std::string db_root = "data/players";
+    for (const char* p : parent_candidates) {
+        DWORD attr = GetFileAttributesA(p);
+        if (attr != INVALID_FILE_ATTRIBUTES && (attr & FILE_ATTRIBUTE_DIRECTORY)) {
+            db_root = std::string(p) + "/players";
+            break;
+        }
+    }
+    cout << "[Db] JSON backend root: " << db_root << endl;
+    g_db_worker.Start(
+        std::make_unique<JsonFileBackend>(db_root),
+        [](DbResponse&& resp) {
+            auto* dov = g_db_pool.Acquire();
+            dov->type = IO_DB_DONE;
+            dov->response = std::move(resp);
+            memset(&dov->overlapped, 0, sizeof(dov->overlapped));
+            PostQueuedCompletionStatus(g_h_iocp, 0,
+                static_cast<ULONG_PTR>(dov->response.client_id), &dov->overlapped);
+        });
+
+    // 주기적 자동 저장 타이머 첫 등록
+    g_timer_manager.Schedule(0, TimerEventKind::PlayerAutoSave, PLAYER_AUTO_SAVE_INTERVAL_MS);
+
     vector<thread> worker_threads;
     int num_threads = thread::hardware_concurrency();
     for (int i = 0; i < num_threads; ++i) {
@@ -1009,7 +1261,8 @@ int main(int argc, char* argv[]) {
     }
 
     for (auto& t : worker_threads) t.join();
-    
+
+    g_db_worker.Stop();
     closesocket(g_listen_socket);
     WSACleanup();
     return 0;
@@ -1083,9 +1336,22 @@ void worker_thread() {
             case TimerEventKind::HpRegen:
                 if (!IsNpcId(entity_id)) PlayerOnHpRegen(entity_id);
                 break;
+            case TimerEventKind::PlayerAutoSave:
+                PlayerOnAutoSave();
+                break;
             default:
                 break;
             }
+            continue;
+        }
+
+        // Stage 6.3: DB 완료 이벤트 (DbWorker → PostQueuedCompletionStatus)
+        if (ov_ex->type == IO_DB_DONE) {
+            auto* dov = reinterpret_cast<DbOverlapped*>(ov_ex);
+            // OnDbResponse 안에서 OnPlayerSpawn 등이 호출됨 — 응답 데이터를 옮긴 뒤 풀로 회수
+            DbResponse resp = std::move(dov->response);
+            g_db_pool.Release(dov);
+            OnDbResponse(resp);
             continue;
         }
 
@@ -1099,6 +1365,15 @@ void worker_thread() {
             }
             if (disconnected) {
                 cout << "[Disconnect] Client Disconnected. ID: " << client_id << endl;
+
+                // Stage 6.3: 최종 상태를 DB에 저장 (이름이 비어있으면 LOGIN 전이므로 skip)
+                {
+                    auto name_ptr = atomic_load(&disconnected->name);
+                    if (name_ptr && !name_ptr->empty()) {
+                        g_db_worker.EnqueueSave(client_id, SnapshotPlayer(disconnected));
+                    }
+                }
+
                 RemoveObjectFromSector(client_id, disconnected->x, disconnected->y, true);
 
                 // view_list 스냅샷 + 클리어 → 시야에 있던 다른 entity들에게 Remove 통보, 그쪽 view_list에서도 제거
@@ -1191,71 +1466,11 @@ void process_packet(int client_id, unsigned char* ptr) {
 
     switch (type) {
     case C2S_LOGIN: {
+        // Stage 6.3: LOGIN 비동기화 — DB Load 큐잉. 응답 도착 시 OnPlayerSpawn에서 spawn/view 처리.
         C2S_Login* pkt = reinterpret_cast<C2S_Login*>(ptr);
-        atomic_store(&session->name, make_shared<string>(pkt->username));
-        
-        // Spawn 위치 지정 및 Sector 등록
-        session->x = rand() % WORLD_WIDTH;
-        session->y = rand() % WORLD_HEIGHT;
-        UpdateObjectSector(client_id, -1, -1, session->x, session->y, true);
-
-        // 1. 본인에게 아바타 정보 전송
-        S2C_AvatarInfo info;
-        info.size = sizeof(info);
-        info.type = S2C_AVATAR_INFO;
-        info.playerId = client_id;
-        info.x = session->x;
-        info.y = session->y;
-        info.hp = 100; info.max_hp = 100; info.exp = 0; info.level = 1; info.visualId = 0;
-        session->do_send(info.size, &info);
-
-        // 2. 초기 view_list 구축 + 상호 가시화
-        int sx = session->x / SECTOR_SIZE;
-        int sy = session->y / SECTOR_SIZE;
-        vector<int> candidate_ids;
-        for (int dy = -1; dy <= 1; ++dy) {
-            for (int dx = -1; dx <= 1; ++dx) {
-                int nx = sx + dx, ny = sy + dy;
-                if (nx < 0 || nx >= NUM_SECTORS_X || ny < 0 || ny >= NUM_SECTORS_Y) continue;
-                lock_guard<mutex> lock(g_sectors[ny][nx].m_lock);
-                for (int other_id : g_sectors[ny][nx].players) {
-                    if (other_id == client_id) continue;
-                    candidate_ids.push_back(other_id);
-                }
-            }
-        }
-        vector<shared_ptr<Player>> candidates;
-        candidates.reserve(candidate_ids.size());
-        for (int id : candidate_ids) {
-            ClientMap::const_accessor a;
-            if (g_clients.find(a, id)) candidates.push_back(a->second);
-        }
-        vector<shared_ptr<Player>> in_view;
-        {
-            lock_guard<mutex> lock(session->view_lock);
-            for (auto& other : candidates) {
-                if (IsInView(session->x, session->y, other->x, other->y)) {
-                    session->view_list.insert(other->id);
-                    in_view.push_back(other);
-                }
-            }
-        }
-        for (auto& other : in_view) {
-            {
-                lock_guard<mutex> lock(other->view_lock);
-                other->view_list.insert(client_id);
-            }
-            SendAddObject(other, session); // 타인에게 나를 추가
-            SendAddObject(session, other); // 나에게 타인을 추가
-        }
-
-        // 시야 안의 NPC도 동기화 (entered만 처리됨 — login 직후 view_list는 비어있음)
-        SyncPlayerNpcView(session);
-
-        // HP 자동 회복 타이머 첫 등록 (5초마다 max_hp의 10% 회복)
-        g_timer_manager.Schedule(client_id, TimerEventKind::HpRegen, HP_REGEN_INTERVAL_MS);
-
-        cout << "[Login] Client " << client_id << " logged in as: " << *atomic_load(&session->name) << " at (" << session->x << ", " << session->y << ")" << endl;
+        std::string username = pkt->username;
+        atomic_store(&session->name, make_shared<string>(username));
+        g_db_worker.EnqueueLoad(client_id, std::move(username));
         break;
     }
     case C2S_MOVE:
@@ -1293,6 +1508,11 @@ void process_packet(int client_id, unsigned char* ptr) {
         if (new_y < 0) new_y = 0;
         if (new_x >= WORLD_WIDTH)  new_x = WORLD_WIDTH - 1;
         if (new_y >= WORLD_HEIGHT) new_y = WORLD_HEIGHT - 1;
+
+        // Stage 6: 장애물 칸으로의 이동/텔레포트는 거부 (no-op)
+        if (Map::IsBlocked(new_x, new_y)) {
+            break;
+        }
 
         // 이동량 검증: Chebyshev distance 기준
         int dx = std::abs(static_cast<int>(new_x) - static_cast<int>(old_x));

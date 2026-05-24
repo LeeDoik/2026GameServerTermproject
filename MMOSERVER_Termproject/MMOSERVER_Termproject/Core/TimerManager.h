@@ -16,6 +16,7 @@ enum class TimerEventKind : unsigned char {
     HpRegen,
     AttackCooldown,
     SkillCooldown,
+    PlayerAutoSave,  // Stage 6.3 — 주기적 DB 자동 저장
     TestPing,    // 검증 테스트용
 };
 

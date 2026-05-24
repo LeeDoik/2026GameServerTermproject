@@ -1,3 +1,4 @@
+#define _CRT_SECURE_NO_WARNINGS
 #include <SFML/Graphics.hpp>
 #include <SFML/Network.hpp>
 #include <iostream>
@@ -21,7 +22,8 @@ sf::TcpSocket socket;
 
 constexpr auto SCREEN_WIDTH = 16;
 constexpr auto SCREEN_HEIGHT = 16;
-constexpr auto TILE_WIDTH = 65;
+// Stage 6.4: DCSS 32×32 타일을 2배 스케일로 64px 출력 (정수배 → 보간 없음, 깔끔)
+constexpr auto TILE_WIDTH = 64;
 constexpr auto WINDOW_WIDTH = SCREEN_WIDTH * TILE_WIDTH;
 constexpr auto WINDOW_HEIGHT = SCREEN_HEIGHT * TILE_WIDTH;
 constexpr int BUF_SIZE = 1024;
@@ -75,7 +77,6 @@ private:
 
     // 워리어용 애니메이션 상태 (is_hero == true 일 때만 사용)
     bool m_is_hero = false;
-    int m_direction = HERO_DIR_DOWN;
     int m_frame_idx = 0;       // 0~3, walk cycle
     sf::Clock m_idle_timer;    // 마지막 이동 이후 경과 시간
 
@@ -88,6 +89,7 @@ private:
 
 public:
     int m_x, m_y;
+    int m_direction = HERO_DIR_DOWN;   // 미니맵 방향 화살표용 — public 노출
     char name[MAX_NAME_LEN];
     OBJECT(sf::Texture& t, int x, int y, int x2, int y2) {
         m_showing = false;
@@ -114,6 +116,17 @@ public:
         m_attack_tex = attack_t;
         m_sprite.setTexture(walk_t);
         m_sprite.setTextureRect(sf::IntRect(0, 0, HERO_TILE, HERO_TILE));
+        m_sprite.setScale(1.0f, 1.0f);  // 워리어 시트는 64x64 셀 → 화면 64px와 1:1
+    }
+
+    // Stage 6.4: DCSS NPC sprite (32x32 단일 셀, 방향/애니메이션 없음). sheet의 col로 선택.
+    void set_npc(sf::Texture& sheet, int col) {
+        m_is_hero = false;
+        m_walk_tex = nullptr;
+        m_attack_tex = nullptr;
+        m_sprite.setTexture(sheet);
+        m_sprite.setTextureRect(sf::IntRect(col * 32, 0, 32, 32));
+        m_sprite.setScale((float)TILE_WIDTH / 32.0f, (float)TILE_WIDTH / 32.0f);
     }
 
     // 공격 모션 트리거. direction은 0~3 (Down/Left/Right/Up).
@@ -182,8 +195,8 @@ public:
             }
         }
 
-        float rx = (m_x - g_left_x) * 65.0f + 1;
-        float ry = (m_y - g_top_y) * 65.0f + 1;
+        float rx = (m_x - g_left_x) * (float)TILE_WIDTH;
+        float ry = (m_y - g_top_y) * (float)TILE_WIDTH;
         m_sprite.setPosition(rx, ry);
         g_window->draw(m_sprite);
         auto size = m_name.getGlobalBounds();
@@ -205,17 +218,141 @@ OBJECT avatar;
 std::unordered_map <int, OBJECT> players;
 std::string avatar_name;
 
-// 던전 타일맵: 256x256 PNG, 4행x4열, 각 64x64.
-// 행 = 지역 종류 (0:NW균열석 / 1:SW혈흔 / 2:NE벽돌 / 3:SE룬), 열 = 같은 지역의 4가지 variant.
+// 던전 타일맵 (Stage 6.4 DCSS): 128x128 PNG, 4행x4열, 각 32x32. setScale 2.0으로 64px 출력.
+// 행 = 지역 (0:NW설원 / 1:SW초원 / 2:NE사막 / 3:SE숲), 열 = 같은 지역의 4가지 variant.
 sf::Texture* dungeon_tiles;
 sf::Sprite tile_sprite;
-constexpr int TILE_SRC_SIZE = 64;          // 원본 픽셀
+constexpr int TILE_SRC_SIZE = 32;          // DCSS 원본 32x32, 화면에선 setScale 2.0으로 64px 출력
 constexpr int REGION_HALF   = WORLD_WIDTH / 2;  // 2000/2 = 1000 (지역 경계)
+
+// 장애물 sprite 시트 (Stage 6.4): 160x32 PNG, 5열 (NW crystal / SW boulder / NE sandstone / SE tree / Village brick), 각 32x32
+sf::Texture* obstacle_tex;
+sf::Sprite obstacle_sprite;
+
+// === Stage 6.1: 장애물 시각화 ===
+// 서버 obstacles.txt와 동일한 데이터를 클라도 로드해서 흰 사각형으로 표시 (임시 디자인)
+constexpr size_t OBSTACLE_BITMAP_BYTES = (size_t(WORLD_WIDTH) * WORLD_HEIGHT + 7) / 8;
+std::vector<unsigned char> g_obstacle_bits;
+sf::RectangleShape g_wall_shape;
+
+// === Aetheria Village (시작 마을) ===
+// 기획서 "평원(중앙) + 시작 안전지대" 명세 기반. 80x80 영역, 외벽은 obstacles.txt에 정의.
+constexpr int VILLAGE_X1 = 960;
+constexpr int VILLAGE_Y1 = 960;
+constexpr int VILLAGE_X2 = 1040;
+constexpr int VILLAGE_Y2 = 1040;
+constexpr int FOUNTAIN_X = 1000;
+constexpr int FOUNTAIN_Y = 1000;
+
+sf::RectangleShape g_village_floor;  // 베이지 반투명 바닥
+
+// Stage 6.4 마을 데코 시트: 256x32 (8열×1행, 32×32 each)
+// col 0=fountain, 1=statue, 2=wizard(장로), 3=dwarf(무기), 4=human(방어구), 5=halfling(포션),
+//     6=gate_left, 7=gate_right
+sf::Texture* village_deco_tex;
+sf::Sprite   village_deco_sprite;
+
+// 마을 NPC (직업별 sprite + 머리 위 마커)
+struct VillageNpcMarker { int x, y; int sprite_col; const char* label; };
+const VillageNpcMarker g_village_npcs[] = {
+    {  985,  985, 2, "!" },   // 장로 (퀘스트)
+    { 1015,  985, 3, "$" },   // 무기 상인
+    {  985, 1015, 4, "$" },   // 방어구 상인
+    { 1015, 1015, 5, "$" },   // 포션 상인
+};
+
+// 마을 모서리 동상
+struct VillageStatue { int x, y; };
+const VillageStatue g_village_statues[] = {
+    {  965,  965 }, { 1035,  965 }, {  965, 1035 }, { 1035, 1035 },
+};
+
+// Stage 6.4: 4지역 랜드마크/보스/장식 — RPG 진행 흐름 (마을 → SW → SE → NE → NW)
+struct WorldDeco {
+    int x, y;
+    int sprite_col;         // landmarks-dcss.png 시트 인덱스 (0~11)
+    const char* label;      // "" 이면 라벨 없음
+    bool is_boss;           // 미니맵에 큰 빨간 점으로 표시
+};
+
+// 거점 + 보스존 (각 지역 입구쪽 거점 + 깊은 곳 보스)
+const WorldDeco g_landmarks[] = {
+    // SW 초원 (Lv 1-10)
+    {  500, 1200,  0, "Slime Camp [Lv 1-10]",      false },
+    {  300, 1700,  4, "[BOSS] Slime King",         true  },
+    // SE 숲 (Lv 10-20)
+    { 1500, 1200,  1, "Sacred Grove [Lv 10-20]",   false },
+    { 1700, 1700,  5, "[BOSS] Hydra",              true  },
+    // NE 사막 (Lv 20-30)
+    { 1500,  800,  2, "Pyramid Ruin [Lv 20-30]",   false },
+    { 1700,  300,  6, "[BOSS] Golden Dragon",      true  },
+    // NW 설원 (Lv 30-40)
+    {  500,  800,  3, "Frozen Shrine [Lv 30-40]",  false },
+    {  300,  300,  7, "[BOSS] Cerebov",            true  },
+};
+
+// 흩어진 장식 (라벨 없음, 시각만)
+const WorldDeco g_decorations[] = {
+    // SW 꽃밭 (col 10)
+    {  200, 1100, 10, "", false }, {  600, 1300, 10, "", false },
+    {  400, 1600, 10, "", false }, {  800, 1800, 10, "", false },
+    // SE 큰 나무 (col 11)
+    { 1200, 1200, 11, "", false }, { 1700, 1400, 11, "", false },
+    { 1300, 1700, 11, "", false }, { 1900, 1500, 11, "", false },
+    // NE 부서진 기둥 (col 9)
+    { 1200,  200,  9, "", false }, { 1600,  500,  9, "", false },
+    { 1900,  300,  9, "", false }, { 1400,  700,  9, "", false },
+    // NW 얼음 결정 (col 8)
+    {  200,  200,  8, "", false }, {  700,  100,  8, "", false },
+    {  400,  500,  8, "", false }, {  800,  700,  8, "", false },
+};
+
+static bool client_is_blocked(int x, int y) {
+    if (g_obstacle_bits.empty()) return false;
+    if (x < 0 || y < 0 || x >= WORLD_WIDTH || y >= WORLD_HEIGHT) return false;
+    size_t idx = size_t(y) * WORLD_WIDTH + size_t(x);
+    return ((g_obstacle_bits[idx >> 3] >> (idx & 7)) & 1u) != 0;
+}
+
+static bool load_obstacles_file(const char* path) {
+    FILE* fp = std::fopen(path, "r");
+    if (!fp) return false;
+    g_obstacle_bits.assign(OBSTACLE_BITMAP_BYTES, 0);
+    int rect_count = 0;
+    char line[256];
+    while (std::fgets(line, sizeof(line), fp)) {
+        char* p = line;
+        while (*p == ' ' || *p == '\t') ++p;
+        if (*p == '#' || *p == '\n' || *p == '\r' || *p == '\0') continue;
+        char kind[16];
+        int x1 = 0, y1 = 0, x2 = 0, y2 = 0;
+        if (std::sscanf(p, "%15s %d %d %d %d", kind, &x1, &y1, &x2, &y2) != 5) continue;
+        if (_stricmp(kind, "rect") != 0) continue;
+        if (x1 < 0) x1 = 0;
+        if (y1 < 0) y1 = 0;
+        if (x2 > WORLD_WIDTH)  x2 = WORLD_WIDTH;
+        if (y2 > WORLD_HEIGHT) y2 = WORLD_HEIGHT;
+        if (x2 <= x1 || y2 <= y1) continue;
+        for (int y = y1; y < y2; ++y) {
+            for (int x = x1; x < x2; ++x) {
+                size_t idx = size_t(y) * WORLD_WIDTH + size_t(x);
+                g_obstacle_bits[idx >> 3] |= (unsigned char)(1u << (idx & 7));
+            }
+        }
+        ++rect_count;
+    }
+    std::fclose(fp);
+    cout << "[Client] obstacles loaded from " << path << ": " << rect_count << " rects\n";
+    return true;
+}
 
 // 4방향 walk 스프라이트 시트 (모두 동일 레이아웃: 256x256, Row=방향, Col=walk프레임)
 sf::Texture* hero_tex;        // 플레이어 워리어 walk
 sf::Texture* hero_attack_tex; // 플레이어 워리어 attack (192x256, 4행x3열, 각 64x64)
-sf::Texture* orc_tex;         // NPC: Agro Orc
+sf::Texture* orc_tex;         // NPC: Agro Orc (fallback — visual_id 범위 밖일 때만)
+sf::Texture* npcs_tex;        // Stage 6.4: DCSS NPC 시트 (512x32, 16 cols, 32×32 each, visual_id 1~16)
+sf::Texture* landmarks_tex;   // Stage 6.4: 랜드마크+보스+장식 시트 (384x32, 12 cols)
+sf::Sprite   landmark_sprite;
 
 // HUD 리소스
 sf::Texture* orb_tex;    // 512x256 (HP구슬 좌측 256, MP구슬 우측 256)
@@ -258,8 +395,8 @@ struct Effect {
             world_y < g_top_y || world_y >= g_top_y + SCREEN_HEIGHT) return;
         int f = current_frame();
         sprite.setTextureRect(sf::IntRect(f * frame_w, 0, frame_w, frame_h));
-        float rx = (world_x - g_left_x) * 65.0f + 1.0f + offset_x;
-        float ry = (world_y - g_top_y) * 65.0f + 1.0f + offset_y;
+        float rx = (world_x - g_left_x) * (float)TILE_WIDTH + offset_x;
+        float ry = (world_y - g_top_y) * (float)TILE_WIDTH + offset_y;
         sprite.setPosition(rx, ry);
         g_window->draw(sprite);
     }
@@ -352,8 +489,12 @@ static bool LoadTextureWithFallback(sf::Texture* tex, const char* name,
 
 void client_initialize()
 {
-    dungeon_tiles = new sf::Texture;
-    hero_tex      = new sf::Texture;
+    dungeon_tiles    = new sf::Texture;
+    obstacle_tex     = new sf::Texture;
+    village_deco_tex = new sf::Texture;
+    npcs_tex         = new sf::Texture;
+    landmarks_tex    = new sf::Texture;
+    hero_tex         = new sf::Texture;
     hero_attack_tex = new sf::Texture;
     orc_tex       = new sf::Texture;
     orb_tex       = new sf::Texture;
@@ -366,7 +507,15 @@ void client_initialize()
     levelup_tex   = new sf::Texture;
     slash_tex     = new sf::Texture;
 
-    if (!LoadTextureWithFallback(dungeon_tiles,  "dungeon-tiles-256x256.png",        "tiles"))     exit(-1);
+    if (!LoadTextureWithFallback(dungeon_tiles,  "dungeon-tiles-dcss.png",           "tiles"))     exit(-1);
+    if (!LoadTextureWithFallback(obstacle_tex,     "obstacles-dcss.png",             "tiles"))     exit(-1);
+    if (!LoadTextureWithFallback(village_deco_tex, "village-deco-dcss.png",          "tiles"))     exit(-1);
+    if (!LoadTextureWithFallback(npcs_tex,         "npcs-dcss.png",                  "tiles"))     exit(-1);
+    npcs_tex->setSmooth(false);
+    if (!LoadTextureWithFallback(landmarks_tex,    "landmarks-dcss.png",             "tiles"))     exit(-1);
+    landmarks_tex->setSmooth(false);
+    landmark_sprite.setTexture(*landmarks_tex);
+    landmark_sprite.setScale((float)TILE_WIDTH / 32.0f, (float)TILE_WIDTH / 32.0f);
     if (!LoadTextureWithFallback(hero_tex,       "hero-walk-256x256-4dir.png",       "hero"))      exit(-1);
     if (!LoadTextureWithFallback(hero_attack_tex,"hero-attack-192x256-4dir.png",     "hero"))      exit(-1);
     if (!LoadTextureWithFallback(orc_tex,        "red-orc-walk-256-4dir.png",        "monsters"))  exit(-1);
@@ -381,8 +530,39 @@ void client_initialize()
     if (!LoadTextureWithFallback(slash_tex,      "slash-effect-576x96.png",          "effects"))   exit(-1);
 
     tile_sprite.setTexture(*dungeon_tiles);
-    // 원본 64px 타일을 화면 65px 칸에 맞춰 스케일 (1px 갭/겹침 방지)
+    // DCSS 32x32 원본을 64px 칸에 정수배(2x) 업스케일. setSmooth(false)로 픽셀아트 보존.
+    dungeon_tiles->setSmooth(false);
     tile_sprite.setScale((float)TILE_WIDTH / TILE_SRC_SIZE, (float)TILE_WIDTH / TILE_SRC_SIZE);
+
+    // 장애물 sprite: 32×32 원본을 setScale 2.0으로 64px 출력. 지역별 column 선택.
+    obstacle_tex->setSmooth(false);
+    obstacle_sprite.setTexture(*obstacle_tex);
+    obstacle_sprite.setScale((float)TILE_WIDTH / 32.0f, (float)TILE_WIDTH / 32.0f);
+    // 기존 fallback (흰 사각형) — 텍스처 없을 때만 사용. 일반 동작은 sprite 우선.
+    g_wall_shape.setSize(sf::Vector2f((float)TILE_WIDTH, (float)TILE_WIDTH));
+    g_wall_shape.setFillColor(sf::Color::White);
+
+    // 마을 바닥 (반투명 베이지, 타일당 1개)
+    g_village_floor.setSize(sf::Vector2f((float)TILE_WIDTH, (float)TILE_WIDTH));
+    g_village_floor.setFillColor(sf::Color(230, 215, 170, 110));
+
+    // 마을 데코 sprite (분수/동상/NPC) — 32×32 원본을 setScale 2.0으로 64px 출력
+    village_deco_tex->setSmooth(false);
+    village_deco_sprite.setTexture(*village_deco_tex);
+    village_deco_sprite.setScale((float)TILE_WIDTH / 32.0f, (float)TILE_WIDTH / 32.0f);
+
+    // 서버와 같은 obstacles.txt를 클라가 읽어 흰 사각형으로 표시
+    const char* obstacle_paths[] = {
+        "data/obstacles.txt",
+        "../../data/obstacles.txt",
+        "../../../data/obstacles.txt",
+    };
+    for (const char* p : obstacle_paths) {
+        if (load_obstacles_file(p)) break;
+    }
+    if (g_obstacle_bits.empty()) {
+        cout << "[Client] obstacles.txt not found — no wall overlay.\n";
+    }
 
     // exp fill은 가로로 반복해서 채워야 하므로 wrap repeat 활성화
     exp_fill_tex->setRepeated(true);
@@ -404,6 +584,10 @@ void client_finish()
     g_effects.clear();
     delete g_font;
     delete dungeon_tiles;
+    delete obstacle_tex;
+    delete village_deco_tex;
+    delete npcs_tex;
+    delete landmarks_tex;
     delete hero_tex;
     delete hero_attack_tex;
     delete orc_tex;
@@ -471,7 +655,13 @@ void ProcessPacket(char* ptr)
         // 다른 플레이어는 attack 시트도 전달 (공격 시 모션 재생됨)
         players[id] = OBJECT{};
         if (id >= NPC_ID_START) {
-            players[id].set_hero(*orc_tex);   // NPC = 빨간 오크 (공격 모션 없음)
+            // Stage 6.4: visual_id (1~16) → DCSS 시트 column (0~15). 범위 밖이면 fallback orc.
+            int col = my_packet->visual_id - 1;
+            if (col >= 0 && col < 16) {
+                players[id].set_npc(*npcs_tex, col);
+            } else {
+                players[id].set_hero(*orc_tex);  // unknown visual_id → 기존 orc
+            }
         }
         else {
             players[id].set_hero(*hero_tex, hero_attack_tex);  // 다른 플레이어 = 워리어
@@ -694,6 +884,151 @@ static void draw_circular_gauge(float cx, float cy, float radius,
     g_window->draw(liquid);
 }
 
+// === 미니맵 (Stage 6.4) ===
+// 좌상단 200x200 px, 자신 중심 ±50 타일 영역. 1타일=2px.
+// 표시: 배경/마을 영역/4지역 경계선/장애물/시야내 entity/자신 방향 화살표
+static void draw_minimap() {
+    constexpr int   MINIMAP_SIZE = 200;
+    constexpr int   MINIMAP_RANGE = 50;
+    constexpr float MINIMAP_PX_PER_TILE = (float)MINIMAP_SIZE / (2.0f * MINIMAP_RANGE);
+    constexpr float ox = 10.0f, oy = 10.0f;
+
+    const int my_x = avatar.m_x;
+    const int my_y = avatar.m_y;
+    const int wx_min = my_x - MINIMAP_RANGE;
+    const int wy_min = my_y - MINIMAP_RANGE;
+    const int wx_max = my_x + MINIMAP_RANGE;
+    const int wy_max = my_y + MINIMAP_RANGE;
+
+    auto w2m = [&](int wx, int wy) -> sf::Vector2f {
+        return { ox + (wx - wx_min) * MINIMAP_PX_PER_TILE,
+                 oy + (wy - wy_min) * MINIMAP_PX_PER_TILE };
+    };
+
+    // 배경
+    sf::RectangleShape bg(sf::Vector2f((float)MINIMAP_SIZE, (float)MINIMAP_SIZE));
+    bg.setPosition(ox, oy);
+    bg.setFillColor(sf::Color(20, 25, 40, 215));
+    bg.setOutlineColor(sf::Color::White);
+    bg.setOutlineThickness(2.0f);
+    g_window->draw(bg);
+
+    // 마을 영역 (베이지 반투명)
+    {
+        int vx1 = std::max(wx_min, (int)VILLAGE_X1);
+        int vy1 = std::max(wy_min, (int)VILLAGE_Y1);
+        int vx2 = std::min(wx_max, (int)VILLAGE_X2);
+        int vy2 = std::min(wy_max, (int)VILLAGE_Y2);
+        if (vx1 < vx2 && vy1 < vy2) {
+            auto p1 = w2m(vx1, vy1);
+            float w = (vx2 - vx1) * MINIMAP_PX_PER_TILE;
+            float h = (vy2 - vy1) * MINIMAP_PX_PER_TILE;
+            sf::RectangleShape vrect(sf::Vector2f(w, h));
+            vrect.setPosition(p1);
+            vrect.setFillColor(sf::Color(230, 215, 170, 130));
+            g_window->draw(vrect);
+        }
+    }
+
+    // 4지역 경계선 (x=1000, y=1000 십자)
+    if (REGION_HALF >= wx_min && REGION_HALF <= wx_max) {
+        float vx = ox + (REGION_HALF - wx_min) * MINIMAP_PX_PER_TILE;
+        sf::RectangleShape ln(sf::Vector2f(1.0f, (float)MINIMAP_SIZE));
+        ln.setPosition(vx, oy);
+        ln.setFillColor(sf::Color(255, 255, 255, 80));
+        g_window->draw(ln);
+    }
+    if (REGION_HALF >= wy_min && REGION_HALF <= wy_max) {
+        float vy = oy + (REGION_HALF - wy_min) * MINIMAP_PX_PER_TILE;
+        sf::RectangleShape ln(sf::Vector2f((float)MINIMAP_SIZE, 1.0f));
+        ln.setPosition(ox, vy);
+        ln.setFillColor(sf::Color(255, 255, 255, 80));
+        g_window->draw(ln);
+    }
+
+    // 장애물 (회색 quads, VertexArray 일괄 draw)
+    sf::VertexArray obstacles(sf::Quads);
+    for (int wy = wy_min; wy <= wy_max; wy++) {
+        for (int wx = wx_min; wx <= wx_max; wx++) {
+            if (!client_is_blocked(wx, wy)) continue;
+            auto p = w2m(wx, wy);
+            sf::Color c(140, 140, 145);
+            obstacles.append(sf::Vertex(p, c));
+            obstacles.append(sf::Vertex({p.x + MINIMAP_PX_PER_TILE, p.y}, c));
+            obstacles.append(sf::Vertex({p.x + MINIMAP_PX_PER_TILE, p.y + MINIMAP_PX_PER_TILE}, c));
+            obstacles.append(sf::Vertex({p.x, p.y + MINIMAP_PX_PER_TILE}, c));
+        }
+    }
+    if (obstacles.getVertexCount() > 0) g_window->draw(obstacles);
+
+    // 시야 내 다른 entity (플레이어 = 초록, NPC = 빨강)
+    for (auto& kv : players) {
+        auto& p = kv.second;
+        if (p.m_x < wx_min || p.m_x > wx_max || p.m_y < wy_min || p.m_y > wy_max) continue;
+        auto pos = w2m(p.m_x, p.m_y);
+        bool is_npc = (kv.first >= NPC_ID_START);
+        sf::Color c = is_npc ? sf::Color(230, 70, 70) : sf::Color(70, 230, 90);
+        float size = MINIMAP_PX_PER_TILE * 2.0f;
+        sf::RectangleShape dot(sf::Vector2f(size, size));
+        dot.setPosition(pos.x - size * 0.25f, pos.y - size * 0.25f);
+        dot.setFillColor(c);
+        g_window->draw(dot);
+    }
+
+    // 4지역 랜드마크/보스존 (미니맵 범위 안만)
+    for (const auto& d : g_landmarks) {
+        if (d.x < wx_min || d.x > wx_max || d.y < wy_min || d.y > wy_max) continue;
+        auto pos = w2m(d.x, d.y);
+        float size = d.is_boss ? MINIMAP_PX_PER_TILE * 5.0f : MINIMAP_PX_PER_TILE * 3.5f;
+        sf::Color c = d.is_boss ? sf::Color(255, 60, 60) : sf::Color(255, 220, 60);
+        sf::RectangleShape dot(sf::Vector2f(size, size));
+        dot.setPosition(pos.x - size / 2.0f, pos.y - size / 2.0f);
+        dot.setFillColor(c);
+        dot.setOutlineColor(sf::Color::Black);
+        dot.setOutlineThickness(1.0f);
+        g_window->draw(dot);
+    }
+
+    // 자신 (중앙 노란 삼각형, 방향 회전)
+    {
+        float cx = ox + MINIMAP_SIZE / 2.0f;
+        float cy = oy + MINIMAP_SIZE / 2.0f;
+        sf::ConvexShape arrow;
+        arrow.setPointCount(3);
+        arrow.setPoint(0, sf::Vector2f( 0.0f, -7.0f));  // 끝점 (Up 기준)
+        arrow.setPoint(1, sf::Vector2f(-5.0f,  5.0f));
+        arrow.setPoint(2, sf::Vector2f( 5.0f,  5.0f));
+        arrow.setFillColor(sf::Color::Yellow);
+        arrow.setOutlineColor(sf::Color::Black);
+        arrow.setOutlineThickness(1.0f);
+        arrow.setPosition(cx, cy);
+        float rot = 0.0f;
+        switch (avatar.m_direction) {
+            case HERO_DIR_UP:    rot =   0.0f; break;
+            case HERO_DIR_RIGHT: rot =  90.0f; break;
+            case HERO_DIR_DOWN:  rot = 180.0f; break;
+            case HERO_DIR_LEFT:  rot = 270.0f; break;
+        }
+        arrow.setRotation(rot);
+        g_window->draw(arrow);
+    }
+
+    // 좌표 헤더 (미니맵 위에 작은 텍스트)
+    {
+        sf::Text t;
+        t.setFont(*g_font);
+        char buf[64];
+        sprintf_s(buf, "(%d, %d)", avatar.m_x, avatar.m_y);
+        t.setString(buf);
+        t.setCharacterSize(14);
+        t.setFillColor(sf::Color::White);
+        t.setOutlineColor(sf::Color::Black);
+        t.setOutlineThickness(1.5f);
+        t.setPosition(ox + 4, oy + MINIMAP_SIZE + 4);
+        g_window->draw(t);
+    }
+}
+
 // HUD 그리기 (월드 렌더 위에 오버레이). 모든 값은 g_my_* 전역에서 읽음.
 // Stage 5에서 S2C_StatusChange로 hp/exp가 업데이트되면 자동으로 HUD에도 반영됨.
 static void draw_hud()
@@ -814,6 +1149,46 @@ static void draw_hud()
         hud_sprite.setScale(BAR_W / 1024.0f, BAR_H / 48.0f);
         hud_sprite.setPosition(bar_x, bar_y);
         g_window->draw(hud_sprite);
+
+        // 레벨 + EXP 텍스트 (EXP 바 가운데에 오버레이)
+        {
+            sf::Text txt;
+            txt.setFont(*g_font);
+            char buf[80];
+            sprintf_s(buf, "Lv %u    EXP  %llu / %llu",
+                (unsigned)g_my_level,
+                (unsigned long long)g_my_exp,
+                (unsigned long long)max_exp);
+            txt.setString(buf);
+            txt.setCharacterSize(16);
+            txt.setFillColor(sf::Color::White);
+            txt.setOutlineColor(sf::Color::Black);
+            txt.setOutlineThickness(2.0f);
+            txt.setStyle(sf::Text::Bold);
+            sf::FloatRect b = txt.getLocalBounds();
+            txt.setOrigin(b.left + b.width / 2.0f, b.top + b.height / 2.0f);
+            txt.setPosition(bar_x + BAR_W / 2.0f, bar_y + BAR_H / 2.0f);
+            g_window->draw(txt);
+        }
+    }
+
+    // ---- 큰 레벨 배지 (HP orb 위에) ----
+    {
+        sf::Text lv;
+        lv.setFont(*g_font);
+        char buf[32];
+        sprintf_s(buf, "Lv %u", (unsigned)g_my_level);
+        lv.setString(buf);
+        lv.setCharacterSize(28);
+        lv.setFillColor(sf::Color(255, 230, 90));
+        lv.setOutlineColor(sf::Color::Black);
+        lv.setOutlineThickness(3.0f);
+        lv.setStyle(sf::Text::Bold);
+        sf::FloatRect b = lv.getLocalBounds();
+        lv.setOrigin(b.left + b.width / 2.0f, b.top + b.height / 2.0f);
+        float center_hp = 10.0f + ORB_SIZE * 0.5f;
+        lv.setPosition(center_hp, orb_y - 18.0f);
+        g_window->draw(lv);
     }
 }
 
@@ -839,19 +1214,112 @@ void client_main()
             // 지역 결정: 2000x2000을 4분할 → 행 인덱스(0~3) = 타일시트의 row
             //   NW(x<1000,y<1000)=0 균열석 / SW(x<1000,y>=1000)=1 혈흔
             //   NE(x>=1000,y<1000)=2 벽돌  / SE(x>=1000,y>=1000)=3 룬
-            int region_row = (tile_x >= REGION_HALF ? 2 : 0) + (tile_y >= REGION_HALF ? 1 : 0);
-
-            // variant: 같은 (wx,wy)는 항상 같은 variant (좌표 해시) → 패턴이 자연스럽게 섞임
-            unsigned int h = (unsigned int)(tile_x * 73856093) ^ (unsigned int)(tile_y * 19349663);
-            int variant_col = h & 0x3;
+            int region_row, variant_col;
+            // 마을 영역 안: 단일 sandstone 타일로 통일 (광장 일체감)
+            if (tile_x >= VILLAGE_X1 && tile_x < VILLAGE_X2 &&
+                tile_y >= VILLAGE_Y1 && tile_y < VILLAGE_Y2) {
+                region_row = 2;   // row 2 = NE 사암 패밀리 (밝은 베이지)
+                variant_col = 2;  // col 2 = sandstone_floor_0 (단일 variant 고정)
+            } else {
+                region_row = (tile_x >= REGION_HALF ? 2 : 0) + (tile_y >= REGION_HALF ? 1 : 0);
+                // variant: 같은 (wx,wy)는 항상 같은 variant (좌표 해시) → 패턴이 자연스럽게 섞임
+                unsigned int h = (unsigned int)(tile_x * 73856093) ^ (unsigned int)(tile_y * 19349663);
+                variant_col = h & 0x3;
+            }
 
             tile_sprite.setTextureRect(sf::IntRect(
                 variant_col * TILE_SRC_SIZE, region_row * TILE_SRC_SIZE,
                 TILE_SRC_SIZE, TILE_SRC_SIZE));
             tile_sprite.setPosition((float)(TILE_WIDTH * i), (float)(TILE_WIDTH * j));
             g_window->draw(tile_sprite);
+
+            // 마을 바닥 오버레이 (Aetheria Village 영역 안만)
+            if (tile_x >= VILLAGE_X1 && tile_x < VILLAGE_X2 &&
+                tile_y >= VILLAGE_Y1 && tile_y < VILLAGE_Y2) {
+                g_village_floor.setPosition((float)(TILE_WIDTH * i), (float)(TILE_WIDTH * j));
+                g_window->draw(g_village_floor);
+            }
+
+            // 장애물 sprite (Stage 6.4 DCSS) — 지역/마을 외벽에 따라 column 선택
+            if (client_is_blocked(tile_x, tile_y)) {
+                int obs_col;
+                bool in_village = (tile_x >= VILLAGE_X1 && tile_x < VILLAGE_X2 &&
+                                   tile_y >= VILLAGE_Y1 && tile_y < VILLAGE_Y2);
+                if (in_village) {
+                    obs_col = 4;  // brick (마을 외벽)
+                } else {
+                    // 0=NW설원(crystal) / 1=SW초원(boulder) / 2=NE사막(sandstone) / 3=SE숲(tree)
+                    obs_col = (tile_x >= REGION_HALF ? 2 : 0) + (tile_y >= REGION_HALF ? 1 : 0);
+                }
+                obstacle_sprite.setTextureRect(sf::IntRect(obs_col * 32, 0, 32, 32));
+                obstacle_sprite.setPosition((float)(TILE_WIDTH * i), (float)(TILE_WIDTH * j));
+                g_window->draw(obstacle_sprite);
+            }
         }
     }
+
+    // === 마을 장식 (Stage 6.4 DCSS sprite) — 시야 안일 때만 그림 ===
+    auto in_view_tile = [](int wx, int wy) {
+        return wx >= g_left_x && wx < g_left_x + SCREEN_WIDTH
+            && wy >= g_top_y  && wy < g_top_y  + SCREEN_HEIGHT;
+    };
+    // 헬퍼: 마을 데코 sprite를 (tile_x, tile_y) 위치에 col 인덱스로 그림
+    auto draw_village_sprite = [&](int wx, int wy, int col) {
+        village_deco_sprite.setTextureRect(sf::IntRect(col * 32, 0, 32, 32));
+        float px = (wx - g_left_x) * (float)TILE_WIDTH;
+        float py = (wy - g_top_y)  * (float)TILE_WIDTH;
+        village_deco_sprite.setPosition(px, py);
+        g_window->draw(village_deco_sprite);
+    };
+    // 4 모서리 동상
+    for (const auto& st : g_village_statues) {
+        if (!in_view_tile(st.x, st.y)) continue;
+        draw_village_sprite(st.x, st.y, 1);  // col 1 = statue_angel
+    }
+    // 중앙 분수
+    if (in_view_tile(FOUNTAIN_X, FOUNTAIN_Y)) {
+        draw_village_sprite(FOUNTAIN_X, FOUNTAIN_Y, 0);  // col 0 = sparkling_fountain
+    }
+    // 입구 4방향 게이트 sprite (외벽 입구 양쪽 1칸)
+    if (in_view_tile(994, VILLAGE_Y1)) draw_village_sprite(994, VILLAGE_Y1, 6);  // 북 좌
+    if (in_view_tile(1005, VILLAGE_Y1)) draw_village_sprite(1005, VILLAGE_Y1, 7); // 북 우
+    if (in_view_tile(994, VILLAGE_Y2-1)) draw_village_sprite(994, VILLAGE_Y2-1, 6);
+    if (in_view_tile(1005, VILLAGE_Y2-1)) draw_village_sprite(1005, VILLAGE_Y2-1, 7);
+    if (in_view_tile(VILLAGE_X1, 994)) draw_village_sprite(VILLAGE_X1, 994, 6);
+    if (in_view_tile(VILLAGE_X1, 1005)) draw_village_sprite(VILLAGE_X1, 1005, 7);
+    if (in_view_tile(VILLAGE_X2-1, 994)) draw_village_sprite(VILLAGE_X2-1, 994, 6);
+    if (in_view_tile(VILLAGE_X2-1, 1005)) draw_village_sprite(VILLAGE_X2-1, 1005, 7);
+    // 마을 NPC 4명 + 머리 위 라벨
+    for (const auto& npc : g_village_npcs) {
+        if (!in_view_tile(npc.x, npc.y)) continue;
+        draw_village_sprite(npc.x, npc.y, npc.sprite_col);
+        sf::Text t;
+        t.setFont(*g_font);
+        t.setString(npc.label);
+        t.setCharacterSize(20);
+        t.setFillColor(sf::Color::Yellow);
+        t.setOutlineColor(sf::Color::Black);
+        t.setOutlineThickness(2.0f);
+        t.setStyle(sf::Text::Bold);
+        sf::FloatRect b = t.getLocalBounds();
+        t.setOrigin(b.left + b.width / 2.0f, b.top + b.height / 2.0f);
+        float px = (npc.x - g_left_x + 0.5f) * (float)TILE_WIDTH;
+        float py = (npc.y - g_top_y) * (float)TILE_WIDTH - 6.0f;
+        t.setPosition(px, py);
+        g_window->draw(t);
+    }
+
+    // === Stage 6.4: 4지역 장식 + 랜드마크/보스 sprite (캐릭터 아래에 배치) ===
+    auto draw_landmark_sprite = [&](const WorldDeco& d) {
+        if (!in_view_tile(d.x, d.y)) return;
+        landmark_sprite.setTextureRect(sf::IntRect(d.sprite_col * 32, 0, 32, 32));
+        float px = (d.x - g_left_x) * (float)TILE_WIDTH;
+        float py = (d.y - g_top_y)  * (float)TILE_WIDTH;
+        landmark_sprite.setPosition(px, py);
+        g_window->draw(landmark_sprite);
+    };
+    for (const auto& d : g_decorations) draw_landmark_sprite(d);
+    for (const auto& d : g_landmarks)   draw_landmark_sprite(d);
 
     avatar.draw();
     for (auto& pl : players) pl.second.draw();
@@ -864,16 +1332,45 @@ void client_main()
                        [](const Effect& e) { return e.is_done(); }),
         g_effects.end());
 
-    sf::Text text;
-    text.setFont(*g_font);
-    char buf[100];
-    sprintf_s(buf, "(%d, %d)", avatar.m_x, avatar.m_y);
-    text.setString(buf);
-    text.setFillColor(sf::Color::White);
-    text.setOutlineColor(sf::Color::Black);
-    text.setOutlineThickness(2.0f);
-    g_window->draw(text);
+    // === 마을 라벨 (Aetheria Village + 입구 4방향) — 캐릭터/이펙트 위에 ===
+    {
+        auto draw_world_text = [&](int wx, int wy, const std::string& s,
+                                    unsigned int size, sf::Color color) {
+            // 시야 밖이면 스킵
+            if (wx < g_left_x - 2 || wx >= g_left_x + SCREEN_WIDTH + 2 ||
+                wy < g_top_y  - 2 || wy >= g_top_y  + SCREEN_HEIGHT + 2) return;
+            sf::Text t;
+            t.setFont(*g_font);
+            t.setString(s);
+            t.setCharacterSize(size);
+            t.setFillColor(color);
+            t.setOutlineColor(sf::Color::Black);
+            t.setOutlineThickness(2.0f);
+            sf::FloatRect b = t.getLocalBounds();
+            t.setOrigin(b.left + b.width / 2.0f, b.top + b.height / 2.0f);
+            float cx = (wx - g_left_x + 0.5f) * TILE_WIDTH;
+            float cy = (wy - g_top_y  + 0.5f) * TILE_WIDTH;
+            t.setPosition(cx, cy);
+            g_window->draw(t);
+        };
+        // 마을 이름 (상단 안쪽)
+        draw_world_text(FOUNTAIN_X, VILLAGE_Y1 + 5, "Aetheria Village", 22, sf::Color::White);
+        // 입구 라벨 4방향 — RPG 진행 흐름 (Lv 순)
+        draw_world_text(FOUNTAIN_X,     VILLAGE_Y1 - 2, "^ Desert/Snow (Lv 20+)", 14, sf::Color(255, 220, 170));
+        draw_world_text(FOUNTAIN_X,     VILLAGE_Y2 + 1, "v Plain/Grove (Lv 1+)",  14, sf::Color(170, 255, 170));
+        draw_world_text(VILLAGE_X1 - 4, FOUNTAIN_Y,     "< Snow/Plain",           14, sf::Color(190, 230, 255));
+        draw_world_text(VILLAGE_X2 + 3, FOUNTAIN_Y,     "Desert/Grove >",         14, sf::Color(255, 200, 140));
 
+        // 4지역 랜드마크/보스 라벨 (sprite 위쪽 1타일에 표시)
+        for (const auto& d : g_landmarks) {
+            if (d.label[0] == '\0') continue;
+            sf::Color lc = d.is_boss ? sf::Color(255, 100, 100) : sf::Color(255, 230, 130);
+            draw_world_text(d.x, d.y - 1, d.label, 16, lc);
+        }
+    }
+
+    // 좌표 텍스트는 미니맵 하단 헤더로 이동 — 별도 그리기 제거
+    draw_minimap();
     draw_hud();
 }
 
@@ -940,10 +1437,10 @@ int main()
                 case sf::Keyboard::Up:    target_y -= 1; moved = true; break;
                 case sf::Keyboard::Down:  target_y += 1; moved = true; break;
                 // 테스트용 텔레포트: 1=상 / 2=하 / 3=좌 / 4=우, 100칸씩 이동
-                case sf::Keyboard::Num1:  target_y -= 100; teleported = true; break;
-                case sf::Keyboard::Num2:  target_y += 100; teleported = true; break;
-                case sf::Keyboard::Num3:  target_x -= 100; teleported = true; break;
-                case sf::Keyboard::Num4:  target_x += 100; teleported = true; break;
+                case sf::Keyboard::Num1:  target_y -= 10; teleported = true; break;
+                case sf::Keyboard::Num2:  target_y += 10; teleported = true; break;
+                case sf::Keyboard::Num3:  target_x -= 10; teleported = true; break;
+                case sf::Keyboard::Num4:  target_x += 10; teleported = true; break;
                 // 디버그용 이펙트 트리거: 5=혈흔 / 6=사망 / 7=리스폰 / 8=레벨업 / 9=슬래시
                 case sf::Keyboard::Num5:  spawn_effect_blood(avatar.m_x, avatar.m_y);   break;
                 case sf::Keyboard::Num6:  spawn_effect_death(avatar.m_x, avatar.m_y);   break;

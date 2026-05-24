@@ -136,6 +136,10 @@
     <ClCompile Include="Core\World.cpp" />
     <ClCompile Include="Core\NpcSpawner.cpp" />
     <ClCompile Include="Core\LuaVM.cpp" />
+    <ClCompile Include="Core\Map.cpp" />
+    <ClCompile Include="Core\AStar.cpp" />
+    <ClCompile Include="Core\Db\JsonFileBackend.cpp" />
+    <ClCompile Include="Core\Db\DbWorker.cpp" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="protocol_2026.h" />
@@ -148,6 +152,12 @@
     <ClInclude Include="Core\NpcSpawner.h" />
     <ClInclude Include="Core\LuaVM.h" />
     <ClInclude Include="Core\GameConfig.h" />
+    <ClInclude Include="Core\Map.h" />
+    <ClInclude Include="Core\AStar.h" />
+    <ClInclude Include="Core\Db\DbTypes.h" />
+    <ClInclude Include="Core\Db\IDbBackend.h" />
+    <ClInclude Include="Core\Db\JsonFileBackend.h" />
+    <ClInclude Include="Core\Db\DbWorker.h" />
   </ItemGroup>
   <ItemGroup>
     <None Include="..\..\DEVELOPMENT_LOG.md" />

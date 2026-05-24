@@ -1,11 +1,11 @@
 # Aetheria Online MMO 서버 재설계 계획
 
-> 최종 업데이트: 2026-05-22
-> Stage 1~5 완료. Stage 6부터 진행 예정.
+> 최종 업데이트: 2026-05-24
+> Stage 1~5 완료. Stage 6 (Map + A* + DB JSON stub) 완료. SQL Server 백엔드는 선택사항.
 
 ---
 
-## 0. 진행 현황 (2026-05-22)
+## 0. 진행 현황 (2026-05-24)
 
 | 단계 | 상태 | 핵심 결과 |
 |---|---|---|
@@ -17,10 +17,12 @@
 | Stage 4.5 — Lua 5.5 인터프리터 연동 | ✅ 완료 | npc_ai.lua 로드 + Hello() 호출 OK |
 | Stage 4.6 — NPC AI Lua 이관 + PDF 스펙 정합 | ✅ 완료 | 0.5s tick / Agro 11x11 / 로밍 20x20 / 첫 인식 target 고정 |
 | Stage 5 — 전투 + HP/EXP + 사망/리스폰(30s) + 채팅 | ✅ 완료 | 프로토콜 5종 추가, 클라 시각/HUD/이펙트 통합, 588 connect / 0 error |
-| Stage 6 — A* + 장애물 + DB | ⏳ 다음 | |
+| Stage 6.1 — 장애물 맵 (Map.h/.cpp + obstacles.txt) | ✅ 완료 | 64 rect / 5.18% 점유, 200K NPC 회피 스폰, 30초 stress 0 신규 에러 |
+| Stage 6.2 — A* 길찾기 (4방향 격자, bbox+8 / 256 노드 한도) | ✅ 완료 | NPC Agro 추적 시 막힌 경로 자동 우회. 1767줄 / 0 신규 에러 |
+| Stage 6.3 — DB 영속성 (JSON 파일 stub + IDbBackend 추상화) | ✅ 완료 | LOGIN 비동기화, 30초간 586개 JSON 저장, 1765줄 / 0 신규 에러 |
 | Stage 7 — 가산점 (스킬/보스/파티/아이템/퀘스트) | ⏳ 보류 | |
 
-**현재 부하 테스트 결과** (Stage 5 완료 시점, 2026-05-22): Release x64 기준 30초간 588 connect / 588 login / 520 disconnect / **0 error / 0 reject**. 200K NPC + 신규 패킷 5종 + signed char 수정 적용 상태에서 Stage 4 대비 성능 회귀 없음.
+**현재 부하 테스트 결과** (Stage 6.1 완료 시점, 2026-05-24): Release x64 기준 30초간 약 580+ connect / 신규 stderr 에러 0건. 200K NPC 활성 + 64개 장애물 rect (5.18% 점유) + 충돌 체크 통합 상태에서 Stage 5 대비 성능 회귀 없음.
 
 ---
 
@@ -333,14 +335,98 @@ PDF 기본 스펙을 코드/스크립트로 모두 반영. AI 결정 로직은 C
 
 ---
 
-### ⏳ Stage 6 — A* 길찾기 + 장애물 + DB 영속성
+### ✅ Stage 6.1 — 장애물 맵 (완료, 2026-05-24)
 
-**작업**:
-- `Server/Game/AStar.cpp` — 격자 A* (octile distance). NPC Agro 추적 시에만 호출. 경로 캐싱
-- `Server/Game/Map.cpp` — 장애물 비트맵 로딩 (2000x2000 비트 = 500KB). 이동/스폰 시 충돌 검사
-- `Server/Db/DbWorker.cpp` — ODBC 연결 풀, 별도 워커 스레드가 큐 폴링. 비동기 완료는 `PostQueuedCompletionStatus`로 워커에 통보 (`IO_DB_DONE`)
+**신규 파일**:
+- `Core/Map.h` — `Map::g_obstacle_bits[BITMAP_BYTES]` (1bit/tile, 500KB), `IsBlocked(x,y) / IsWalkable(x,y)` inline, `InBounds(x,y)`. 월드 밖은 항상 blocked로 취급
+- `Core/Map.cpp` — `LoadObstacles(path)`: `rect x1 y1 x2 y2` 라인 파싱 → 반열림 구간 [x1,x2)×[y1,y2) 마킹. 적용된 rect 수 반환
+- `data/obstacles.txt` — 64개 rect (NW 균열석 / NE 벽돌 마을 / SW 혈흔 미로 / SE 룬 서클 컨셉). 207,100 타일 = 5.18% 점유. PLAYER_SPAWN(1000,1000) ±50, 4지역 경계 ±20 통로 안전 지대 확보
 
-**리스크 대응**: Stage 5 끝나는 시점에 DB stub(JSON 파일 dump)으로 우회 가능한 인터페이스 추상화 → DB 일정 밀려도 영속성 흉내는 가능
+**통합**:
+- `main()` 부팅 시퀀스: NPC 스폰 *직전*에 `Map::LoadObstacles` 호출 (NpcSpawner가 IsBlocked 회피 가능하도록)
+- `MMOSERVER_Termproject.vcxproj`: ClCompile/ClInclude에 Map.cpp/.h 등록
+- `C2S_MOVE / C2S_TELEPORT` 핸들러: 클램프 직후 `if (Map::IsBlocked(new_x, new_y)) break;` — 장애물 칸으로의 이동/텔레포트 거부
+- `NpcOnMove` (Lua dx/dy 적용 후): 새 좌표 IsBlocked면 old로 되돌리고 stay (A* 도입 전 임시 정책 — 사용자 합의)
+- `NpcSpawner::LoadNpcSpawnScript`: 무작위 좌표 추첨을 최대 32회 재시도, fallback으로 area 선형 스캔. 모든 칸이 막혀있으면 슬롯 스킵
+- `LOGIN` 핸들러: `rand() % WORLD_*` 좌표를 32회 추첨해 walkable 보장, 실패 시 PLAYER_SPAWN(1000,1000) 폴백
+
+**검증 (Release x64, 30초 stress, NPC 200K 활성, 2026-05-24)**:
+- Boot: `[Map] Loaded 64 rects, 207100 blocked tiles (5.1775% of world)`
+- `[NpcSpawner] Spawned 200000 NPCs` — 한 슬롯도 빠짐없이 walkable 위치 확보
+- 로그인 좌표 샘플: (41,467) (1169,1724) (1281,827) (1961,491) (995,1942) — 모두 walkable 영역
+- 30초간 약 580+ connect, 신규 stderr 0건 (기존 npc_spawn 경로 후보 탐색 메시지 2줄만 — Stage 5 회귀와 동일)
+
+**표절 회피**:
+- 비트맵 + IsBlocked는 표준 비트 시프트만 사용 (`Docs/npc.cpp`에 동등 코드 없음)
+- LoadObstacles는 표준 sscanf 기반의 라인 파서 (NpcSpawner와 동일 패턴 — 자체 작성)
+
+---
+
+### ✅ Stage 6.2 — A* 길찾기 (완료, 2026-05-24)
+
+**신규 파일**:
+- `Core/AStar.h` — `AStar::AStarStep(sx, sy, gx, gy, dx, dy)` 단일 API. 첫 step만 4방향(dx+dy 절댓값 합 1)으로 반환
+- `Core/AStar.cpp` — `std::priority_queue + unordered_map<key,g>` 표준 A*. manhattan heuristic, 4방향 이웃, key = `x * Map::H + y`
+  - 검색 영역: (start, goal) bbox + margin 8 (~17x17 워크스페이스)
+  - 노드 상한 `MAX_NODES = 256` — 200K NPC가 동시에 막혀도 cataclysm 방지
+  - 목표 칸 자체는 walkable 여부 무관 (플레이어가 서 있을 수 있음)
+  - stale entry는 `cur.g > g_score[ck]` 체크로 스킵
+
+**통합 (`MMOSERVER_Termproject.cpp` NpcOnMove)**:
+- Lua가 반환한 (dx, dy)가 막힌 칸을 가리키면:
+  - `new_target != -1` (추적 중)이면 A* 호출 → 첫 step 채택
+  - 채택 조건: 스폰 박스 (±ROAM_AREA_RANGE) 내 + 재확인 IsBlocked == false
+  - 그 외 (로밍 중 또는 A* 실패) 기존 stay 정책 유지
+- 호출 빈도: NPC tick의 일부만 막힘 + 추적 중인 NPC만 → 200K 전체 중 미미한 비율
+
+**검증 (Release x64, 30초 stress, NPC 200K 활성, 2026-05-24)**:
+- 1,767 라인 stdout / 신규 stderr 0건 / 처리량 Stage 6.1(1,764)과 동등
+- A* 노드 한도(256) + bbox(17×17) 조합으로 worst case 호출 비용 무시 가능
+
+**표절 회피**:
+- `std::priority_queue + unordered_map` 표준 라이브러리 조합만 사용
+- 격자 A*는 cppreference/Wikipedia 일반 idiom — `Docs/npc.cpp`엔 길찾기 코드 자체가 없음
+
+---
+
+### ✅ Stage 6.3 — DB 영속성 (완료, 2026-05-24)
+
+**신규 파일**:
+- `Core/Db/DbTypes.h` — `PlayerSnapshot`(username/hp/max_hp/exp/level/x/y), `DbRequest/Response`, `DbReqKind` enum
+- `Core/Db/IDbBackend.h` — `Load(username, out)` / `Save(snap)` 추상 인터페이스. 첫 구현은 JSON 파일, 추후 ODBC 백엔드 교체 가능
+- `Core/Db/JsonFileBackend.h/.cpp` — 한 유저당 한 JSON 파일(`<root>/<username>.json`). 외부 JSON 라이브러리 없이 자체 minimal 파서(키 검색 + sscanf). 안전한 username sanitize (영숫자/언더스코어만, 그 외 `_`로 치환). atomic write (`.tmp` → rename)
+- `Core/Db/DbWorker.h/.cpp` — `std::queue + mutex + condition_variable` 기반 단일 워커 스레드. `EnqueueLoad/EnqueueSave` API. 완료 시 외부 콜백 호출(콜백이 `PostQueuedCompletionStatus`로 `IO_DB_DONE` 이벤트 post)
+- `data/players/` — JSON 저장 디렉토리 (백엔드 ctor가 mkdir)
+
+**통합**:
+- `OverlappedTypes.h`: `IO_DB_DONE` 추가
+- `TimerManager.h`: `TimerEventKind::PlayerAutoSave` 추가
+- `GameConfig.h`: `PLAYER_AUTO_SAVE_INTERVAL_MS = 30000`
+- `MMOSERVER_Termproject.cpp`:
+  - 전역 `DbWorker g_db_worker;` + `DbOverlapped` 구조체 + `ObjectPool<DbOverlapped> g_db_pool;`
+  - main(): `data/`(또는 `../../data/`, `../../../data/`) 위치 자동 탐색 → `JsonFileBackend(<root>/players)` 으로 DbWorker.Start. 첫 PlayerAutoSave 타이머 30초 후 등록. 종료 시 `g_db_worker.Stop()` 호출하여 워커 스레드 join
+  - worker_thread: IO_TIMER 분기에 `PlayerAutoSave` 추가 + 신규 분기 `IO_DB_DONE` (DbOverlapped → DbResponse 이동 → 풀로 회수 → OnDbResponse 디스패치)
+  - LOGIN 핸들러: 기존 spawn 코드 제거, `g_db_worker.EnqueueLoad(client_id, username)` 한 줄로 단순화
+  - 신규 함수 `OnPlayerSpawn(client_id, snap, exists)`: 기존 LOGIN의 spawn~view~HpRegen 코드를 옮김 + DB에서 복원한 hp/max_hp/exp/level 적용. 저장 좌표가 장애물/월드 밖이면 PLAYER_SPAWN(1000,1000) 폴백
+  - 신규 함수 `OnDbResponse(resp)`: Load → OnPlayerSpawn, Save → stderr에 실패만 로깅
+  - 신규 함수 `PlayerOnAutoSave()`: g_clients 스냅샷 → 각자 EnqueueSave → 30초 재스케줄
+  - 신규 함수 `SnapshotPlayer(session)`: atomic 필드 → PlayerSnapshot 캡쳐
+  - disconnect 경로: 이름 있는 클라는 closesocket 직전에 EnqueueSave
+
+**검증 (Release x64, 30초 stress, NPC 200K 활성, 2026-05-24)**:
+- Boot: `[Db] JSON backend root: ../../../data/players`
+- LOGIN: `[Login] Client 0 (new) as 1 at (41, 468) hp=100 lv=1` — 비동기 DB Load 응답 도착 후 spawn 처리
+- **30초간 586개 JSON 파일 생성** (`data/players/<n>.json`)
+- 샘플 1.json: `{"username":"1","hp":100,"max_hp":100,"exp":0,"level":1,"x":1000,"y":1000}` — PlayerOnDeath 리스폰(1000,1000) 후 disconnect된 케이스
+- 처리량 1,765줄 / 신규 stderr 0건 (Stage 6.2와 동등)
+
+**표절 회피**:
+- ODBC/실습 DB 코드 미사용. JSON 자체 minimal 파서로 자체 구현 — `Docs/npc.cpp`와 무관
+- 비동기 모델: `std::condition_variable + queue` + `PostQueuedCompletionStatus`로 IOCP 통합. 표준 idiom
+
+**SQL Server 백엔드 확장 (선택사항)**:
+- `Core/Db/OdbcBackend.h/.cpp` 추가 + `main()`에서 `JsonFileBackend` 대신 새 백엔드 주입만 하면 교체 완료 (IDbBackend 인터페이스 그대로)
+- 채점 환경에 SQL Server가 없을 경우 JSON stub만으로도 "비동기 DB 워커 큐 + 영속성" 명세는 충족
 
 ---
 
@@ -443,12 +529,14 @@ MMOSERVER_Termproject/MMOSERVER_Termproject/
 
 ---
 
-## 우선순위 TOP 3 (남은 작업 기준, 2026-05-22 업데이트)
+## 우선순위 TOP 3 (남은 작업 기준, 2026-05-24 업데이트)
 
-### 1순위: **Stage 6 — A* + 장애물 + DB (현재 다음)**
-- PDF 구현 점수의 마지막 명시 항목 (A* 길찾기 / 장애물 / DB 영속성)
-- Agro NPC가 장애물 우회해서 플레이어 추적 가능해야 함 (현재는 직선 step_toward만)
-- DB 누락은 큰 감점 → ODBC 워커 큐 + 비동기 완료 IO_DB_DONE 이벤트로 IOCP 통합
+### 1순위: **Stage 7 가산점 (게임성 40점) — Stage 6 완료, 이제 추가 점수 확보 단계**
+- PDF 명시 항목 (IOCP/타이머/스크립트/시야/AI/A\*/DB) 전부 충족
+- 다음 우선순위: 스크립트 NPC 배치(✅ 이미) → 스킬(10점) → 보스(5~10점) → 파티(10점) → 아이템(20)/퀘스트(25)
+
+### (선택) SQL Server 백엔드
+- 현재는 JSON 파일 stub. 채점 환경에 SQL Server 있으면 OdbcBackend 추가만 하면 교체 (IDbBackend 인터페이스 그대로)
 
 ### 2순위: **Stage 7 가산점 (게임성 40점 영역)**
 - 효율 순: 스크립트 NPC 배치(✅ 이미) → 스킬(10점) → 보스(5~10점) → 파티(10점)

@@ -29,6 +29,16 @@ constexpr int BASE_DAMAGE_PER_LEVEL = 10;    // 플레이어 데미지 = level *
 constexpr int NPC_ATTACK_INTERVAL_MS = 1000; // NPC 공격 쿨타임
 constexpr int NPC_BASE_DAMAGE = 5;           // NPC 데미지 = level * 5 (플레이어보다 약하게)
 
-// 사망 시 리스폰 위치 (월드 중앙 — NE 벽돌 지역의 시작 지점)
+// 사망 시 리스폰 위치 (Aetheria Village 분수 남쪽 — 분수 sprite 위에 안 겹치게)
 constexpr short PLAYER_SPAWN_X = 1000;
-constexpr short PLAYER_SPAWN_Y = 1000;
+constexpr short PLAYER_SPAWN_Y = 1010;
+
+// 시작 마을(Aetheria Village) 영역. 외벽은 obstacles.txt에 정의.
+// 신규 캐릭은 이 영역 안에서 walkable 좌표로 스폰.
+constexpr short VILLAGE_X1 = 960;
+constexpr short VILLAGE_Y1 = 960;
+constexpr short VILLAGE_X2 = 1040;
+constexpr short VILLAGE_Y2 = 1040;
+
+// Stage 6.3: DB 자동 저장 주기 (30초)
+constexpr int PLAYER_AUTO_SAVE_INTERVAL_MS = 30000;
