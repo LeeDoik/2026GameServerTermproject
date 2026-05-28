@@ -177,6 +177,8 @@ void ProcessPacket(int ci, unsigned char packet[])
 	case S2C_RESPAWN: break;
 	case S2C_LEVEL_UP: break;
 	case S2C_SKILL_EFFECT: break;  // Stage 7: 스킬 이펙트 — 더미 클라는 무시
+	case S2C_PARTY_INVITED: break;  // Stage 7 파티 — 더미 클라는 무시
+	case S2C_PARTY_UPDATE: break;
 	case S2C_AVATAR_INFO:
 	{
 		g_clients[ci].connected = true;

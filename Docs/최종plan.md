@@ -1,7 +1,7 @@
 # Aetheria Online MMO 서버 재설계 계획
 
 > 최종 업데이트: 2026-05-28
-> Stage 1~6 완료. Stage 7.1 스킬 / 7.2 보스 / 7.3 클라 이펙트 완성도 강화 완료. SQL Server 백엔드는 선택사항.
+> Stage 1~6 완료. Stage 7.1 스킬 / 7.2 보스 / 7.3 클라 이펙트 / 7.4 파티 시스템 완료. SQL Server 백엔드는 선택사항.
 
 ---
 
@@ -23,7 +23,8 @@
 | Stage 7.1 — 스킬 시스템 (AoE/Line/Heal) | ✅ 완료 | Q/W/E 3스킬, 서버 핸들러 + 클라 이펙트/HUD |
 | Stage 7.2 — 보스 패턴 (이동/채팅/AoE/2단계) | ✅ 완료 | 바이옴별 보스 4마리, Lua 2단계 분노 AI + 광역공격 |
 | Stage 7.3 — 클라 이펙트 완성도 강화 | ✅ 완료 | 공격 이펙트 분리(zap/sandblast), 데미지 popup, 화면흔들기, HP보간/저체력경고, Q스킬 5×5 폭발 |
-| Stage 7 — 가산점 (파티/아이템/퀘스트) | ⏳ 보류 | |
+| Stage 7.4 — 파티 시스템 (EXP 분배 + 미니맵 + HP 바) | ✅ 완료 | /invite·/accept·/reject·/leave 명령, EXP 균등분배, 미니맵 청록 표시, 파티원 HP 바 HUD |
+| Stage 7 — 가산점 (아이템/퀘스트) | ⏳ 보류 | |
 
 **현재 부하 테스트 결과** (Stage 6.1 완료 시점, 2026-05-24): Release x64 기준 30초간 약 580+ connect / 신규 stderr 에러 0건. 200K NPC 활성 + 64개 장애물 rect (5.18% 점유) + 충돌 체크 통합 상태에서 Stage 5 대비 성능 회귀 없음.
 
@@ -721,3 +722,40 @@ MMOSERVER_Termproject/MMOSERVER_Termproject/
 - `C:\한국공학대학교\4학년 1학기\게임서버 프로그래밍\텀프로젝트\2026GameServerTermproject\STRESS_TEST\STRESS_TEST\NetworkModule.cpp`
 - `C:\한국공학대학교\4학년 1학기\게임서버 프로그래밍\텀프로젝트\2026GameServerTermproject\CLIENT\client_sample\client.cpp`
 - `C:\한국공학대학교\4학년 1학기\게임서버 프로그래밍\텀프로젝트\2026GameServerTermproject\Docs\npc.cpp` (참고용, 직접 import 금지)
+
+---
+
+## Stage 7.5 — 클라 전투 메시지창 + EXP 바 렌더링 픽스 (2026-05-28)
+
+### 목표
+- 채팅 패널을 게임 메시지창으로 확장: 전투 이벤트(공격/피격/처치+경험치)를 한글로 로그 출력
+- 한글 메시지가 정상적으로 렌더링되도록 폰트/인코딩 경로 보강
+- 기존에 채워지지 않던 EXP 바 fill 렌더링 수정
+
+### 구현 내용
+
+**1) 전투 로그 3종 (`CLIENT/client_sample/client.cpp`)**
+- `S2C_DAMAGE` 핸들러에 두 메시지 추가:
+  - 내가 NPC를 때림 → `"용사가 {몬스터이름}를 때려서 {damage}의 데미지를 입혔습니다."`
+  - NPC가 나를 때림 → `"{몬스터이름}의 공격으로 {damage}의 데미지를 입었습니다."`
+  - 마지막 일격(`new_hp <= 0`)이면 NPC 이름을 `g_last_killed_npc_name`에 저장
+- `S2C_STATUS_CHANGE` 핸들러: 내 exp가 증가하고 직전 처치 이름이 남아 있으면 `"{이름}를 무찔러서 {gained}의 경험치를 얻었습니다."` 출력
+
+**2) 한글 렌더링 경로**
+- 폰트 로딩 순서: `C:/Windows/Fonts/malgun.ttf` → `malgun.ttf` → `cour.ttf` (fallback)
+- 채팅 로그 그리기에서 `sf::String::fromUtf8(...)`로 변환 — 기존 std::string 직패스는 Latin-1로 잘못 해석되던 문제 해결
+- `client_sample.vcxproj`의 4개 Configuration 모두에 `/utf-8` 컴파일 옵션 추가 — Korean Windows에서 UTF-8 소스를 CP949로 잘못 해석하던 문제 해결
+
+**3) EXP 바 fill 렌더링 픽스**
+- 기존: `sf::Sprite` + `setRepeated(true)` + 큰 `IntRect`로 16×32 fill 타일을 가로 반복 — 일부 GPU/드라이버에서 미렌더링
+- 변경: `sf::RectangleShape` 두 개로 단순화 (본체: 황금색 240,200,60 / 상단 하이라이트: 밝은 금색 255,235,140 α200)
+- 데이터(`g_my_exp`) 파싱과 LERP 보간은 그대로, fill의 시각 표현만 교체
+
+### 변경 파일
+- `CLIENT/client_sample/client.cpp` — 메시지 출력 로직(2곳), 폰트 fallback 로딩, UTF-8 채팅 렌더링, EXP 바 fill 재구현
+- `CLIENT/client_sample/client_sample.vcxproj` — 4 configuration에 `/utf-8` 옵션
+
+### 검증
+- 빨간 디버그 박스로 RectangleShape 렌더링 경로 확인 → 정상
+- 콘솔 디버그 로그로 `exp_ratio` / `g_my_exp` / `g_my_level` 값 확인 → 정상 갱신
+- 모든 디버그 코드는 사용자 확인 후 제거 완료

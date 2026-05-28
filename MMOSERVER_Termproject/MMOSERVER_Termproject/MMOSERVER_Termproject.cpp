@@ -161,6 +161,9 @@ struct Player : public Entity {
     atomic<long long> last_skill2_ms;  // Line 쿨타임
     atomic<long long> last_skill3_ms;  // Heal 쿨타임
 
+    // 파티 — Stage 7 파티
+    atomic<int> party_id{ -1 };  // -1 = 파티 없음
+
     Player() : Entity(), socket(INVALID_SOCKET), recv_overlapped(IO_RECV), is_active(false),
                hp(100), max_hp(100), exp(0), level(1), last_attack_ms(0),
                last_skill1_ms(0), last_skill2_ms(0), last_skill3_ms(0) {
@@ -190,6 +193,20 @@ struct Player : public Entity {
         WSASend(socket, &ov->wsa_buf, 1, NULL, 0, &ov->overlapped, NULL);
     }
 };
+
+// === 파티 시스템 ===
+constexpr int MAX_PARTY_SIZE = 4;
+
+struct Party {
+    int id;
+    int leader_id;
+    vector<int> members;  // g_party_mutex로 보호
+};
+
+unordered_map<int, shared_ptr<Party>> g_parties;
+unordered_map<int, int> g_pending_invites;  // invitee_id → inviter_id
+mutex g_party_mutex;
+atomic<int> g_next_party_id{ 1 };
 
 // --- 글로벌 변수 ---
 // TBB concurrent_hash_map: 버킷 단위 락. accessor 패턴으로 find/insert/erase 모두 동시 안전
@@ -346,6 +363,10 @@ void OnPlayerSpawn(int client_id, const PlayerSnapshot& snap, bool exists);
 void OnDbResponse(DbResponse& resp);
 void PlayerOnAutoSave();
 PlayerSnapshot SnapshotPlayer(const std::shared_ptr<Player>& session);
+void LevelUpPlayer(std::shared_ptr<Player> session, unsigned long long exp_gain);
+void GiveExpToKillerAndParty(std::shared_ptr<Player> killer, unsigned long long exp_gain);
+void PlayerLeaveParty(std::shared_ptr<Player> session);
+void SendSystemMessage(std::shared_ptr<Player> session, const std::string& msg);
 
 // 플레이어 시점에서 자기 시야 안의 NPC와 view_list를 동기화.
 // 새로 시야에 들어온 NPC: Add 전송 + 양방향 view 등록 + Lazy AI 활성
@@ -1211,6 +1232,176 @@ void PlayerOnAutoSave() {
     g_timer_manager.Schedule(0, TimerEventKind::PlayerAutoSave, PLAYER_AUTO_SAVE_INTERVAL_MS);
 }
 
+// 시스템 메시지를 S2C_CHAT_MESSAGE(object_id=0)로 특정 플레이어에게 전송
+void SendSystemMessage(std::shared_ptr<Player> session, const std::string& msg) {
+    S2C_ChatMessage cm;
+    cm.size = sizeof(cm);
+    cm.type = S2C_CHAT_MESSAGE;
+    cm.object_id = 0;
+    strncpy_s(cm.message, sizeof(cm.message), msg.c_str(), _TRUNCATE);
+    cm.message[MAX_CHAT_MSG_LEN - 1] = '\0';
+    session->do_send(cm.size, &cm);
+}
+
+// EXP 추가 + 레벨업 체크 + S2C_LEVEL_UP 브로드캐스트 + S2C_StatusChange 자신·파티원 전송
+void LevelUpPlayer(shared_ptr<Player> session, unsigned long long exp_gain) {
+    session->exp.fetch_add(exp_gain);
+
+    bool leveled_up = false;
+    while (true) {
+        unsigned char cur_lv = session->level.load();
+        unsigned long long need = 100ULL << (cur_lv - 1);
+        unsigned long long cur_exp = session->exp.load();
+        if (cur_exp < need) break;
+        if (session->exp.compare_exchange_weak(cur_exp, cur_exp - need)) {
+            session->level.fetch_add(1);
+            int new_max = session->max_hp.fetch_add(20) + 20;
+            session->hp.store(new_max);
+            leveled_up = true;
+        }
+    }
+
+    int pid = session->id;
+    if (leveled_up) {
+        S2C_LevelUp lvl;
+        lvl.size = sizeof(lvl);
+        lvl.type = S2C_LEVEL_UP;
+        lvl.object_id = pid;
+        lvl.new_level = session->level.load();
+        lvl.new_max_hp = session->max_hp.load();
+
+        unordered_set<int> lvl_viewers;
+        {
+            lock_guard<mutex> lk(session->view_lock);
+            for (int vid : session->view_list)
+                if (!IsNpcId(vid)) lvl_viewers.insert(vid);
+        }
+        for (int vid : lvl_viewers) {
+            ClientMap::const_accessor aa;
+            if (g_clients.find(aa, vid)) aa->second->do_send(lvl.size, &lvl);
+        }
+        session->do_send(lvl.size, &lvl);
+    }
+
+    S2C_StatusChange sc;
+    sc.size = sizeof(sc);
+    sc.type = S2C_STATUS_CHANGE;
+    sc.object_id = pid;
+    sc.hp = session->hp.load();
+    sc.max_hp = session->max_hp.load();
+    sc.exp = session->exp.load();
+    sc.level = session->level.load();
+    session->do_send(sc.size, &sc);
+
+    // 파티원에게도 StatusChange 전송 (파티 HP 바 갱신)
+    int party_id_val = session->party_id.load();
+    if (party_id_val >= 0) {
+        vector<int> members;
+        {
+            lock_guard<mutex> lk(g_party_mutex);
+            auto it = g_parties.find(party_id_val);
+            if (it != g_parties.end()) members = it->second->members;
+        }
+        for (int mid : members) {
+            if (mid == pid) continue;
+            ClientMap::const_accessor a;
+            if (g_clients.find(a, mid)) a->second->do_send(sc.size, &sc);
+        }
+    }
+}
+
+// NPC 처치 시 파티원 전체에 EXP 균등 분배. 파티 없으면 킬러 단독 획득.
+void GiveExpToKillerAndParty(shared_ptr<Player> killer, unsigned long long exp_gain) {
+    int party_id_val = killer->party_id.load();
+    if (party_id_val < 0) {
+        LevelUpPlayer(killer, exp_gain);
+        return;
+    }
+
+    vector<int> member_ids;
+    {
+        lock_guard<mutex> lk(g_party_mutex);
+        auto it = g_parties.find(party_id_val);
+        if (it != g_parties.end()) member_ids = it->second->members;
+    }
+
+    vector<shared_ptr<Player>> online_members;
+    for (int mid : member_ids) {
+        ClientMap::const_accessor a;
+        if (g_clients.find(a, mid)) online_members.push_back(a->second);
+    }
+    if (online_members.empty()) {
+        LevelUpPlayer(killer, exp_gain);
+        return;
+    }
+
+    unsigned long long share = std::max(1ULL, exp_gain / online_members.size());
+    for (auto& member : online_members) {
+        LevelUpPlayer(member, share);
+    }
+}
+
+// 파티 탈퇴 (disconnect 또는 C2S_PARTY_LEAVE 시 공통 경로).
+// 혼자 남거나 리더가 나가면 파티 해산.
+void PlayerLeaveParty(shared_ptr<Player> session) {
+    // 펜딩 초대 정리 (초대자 또는 초대받은 쪽)
+    {
+        lock_guard<mutex> lk(g_party_mutex);
+        g_pending_invites.erase(session->id);
+        for (auto it = g_pending_invites.begin(); it != g_pending_invites.end(); ) {
+            if (it->second == session->id) it = g_pending_invites.erase(it);
+            else ++it;
+        }
+    }
+
+    int party_id_val = session->party_id.exchange(-1);
+    if (party_id_val < 0) return;
+
+    int client_id = session->id;
+    auto my_name = atomic_load(&session->name);
+
+    vector<int> notify_list;
+    bool disband = false;
+
+    {
+        lock_guard<mutex> lk(g_party_mutex);
+        auto it = g_parties.find(party_id_val);
+        if (it == g_parties.end()) return;
+        Party* party = it->second.get();
+        bool was_leader = (party->leader_id == client_id);
+
+        party->members.erase(
+            std::remove(party->members.begin(), party->members.end(), client_id),
+            party->members.end());
+
+        if (party->members.size() < 2) {
+            // 혼자 남거나 비면 해산
+            disband = true;
+            notify_list = party->members;
+            for (int mid : notify_list) {
+                ClientMap::const_accessor a;
+                if (g_clients.find(a, mid)) a->second->party_id.store(-1);
+            }
+            g_parties.erase(it);
+        } else {
+            notify_list = party->members;
+            if (was_leader) party->leader_id = notify_list[0];
+        }
+    }
+
+    S2C_PartyUpdate upd;
+    upd.size = sizeof(upd);
+    upd.type = S2C_PARTY_UPDATE;
+    upd.event = disband ? 2 : 1;  // 2=disbanded, 1=left
+    upd.member_id = client_id;
+    strncpy_s(upd.member_name, sizeof(upd.member_name),
+              my_name ? my_name->c_str() : "", _TRUNCATE);
+    for (int mid : notify_list) {
+        ClientMap::const_accessor a;
+        if (g_clients.find(a, mid)) a->second->do_send(upd.size, &upd);
+    }
+}
+
 // --- 함수 선언 ---
 void worker_thread();
 void process_packet(int client_id, unsigned char* ptr);
@@ -1488,6 +1679,9 @@ void worker_thread() {
                         g_db_worker.EnqueueSave(client_id, SnapshotPlayer(disconnected));
                     }
                 }
+
+                // 파티 탈퇴 처리 (남은 파티원에게 알림 후 섹터/뷰 정리)
+                PlayerLeaveParty(disconnected);
 
                 RemoveObjectFromSector(client_id, disconnected->x, disconnected->y, true);
 
@@ -1902,8 +2096,7 @@ void process_packet(int client_id, unsigned char* ptr) {
                     int respawn_ms = (n.type == NpcType::Boss) ? BOSS_RESPAWN_MS : NPC_RESPAWN_MS;
                     g_timer_manager.Schedule(nid, TimerEventKind::NpcRespawn, respawn_ms);
 
-                    // EXP: 일반=2^(level-1) × (Agro×2) × (Roaming×2) → 레벨 무관 Agro+Roaming 25킬/레벨
-                    // 보스=2^30 × BOSS_EXP_MULTIPLIER (레벨30 기준 캡, 레벨25~30 플레이어 타겟)
+                    // EXP: 파티원 균등 분배 (파티 없으면 킬러 단독)
                     unsigned long long exp_gain;
                     if (n.type == NpcType::Boss) {
                         exp_gain = (1ULL << 30) * (unsigned long long)BOSS_EXP_MULTIPLIER;
@@ -1912,58 +2105,7 @@ void process_packet(int client_id, unsigned char* ptr) {
                         if (n.type == NpcType::Agro)             exp_gain *= 2;
                         if (n.move_mode == NpcMoveMode::Roaming) exp_gain *= 2;
                     }
-                    session->exp.fetch_add(exp_gain);
-
-                    // 레벨업 체크 (한 번에 여러 레벨 가능)
-                    bool leveled_up = false;
-                    while (true) {
-                        unsigned char cur_lv = session->level.load();
-                        unsigned long long need = 100ULL << (cur_lv - 1);  // 100 × 2^(level-1)
-                        unsigned long long cur_exp = session->exp.load();
-                        if (cur_exp < need) break;
-                        // exp -= need + level += 1 (atomic 2-step, level은 한 번만 증가)
-                        if (session->exp.compare_exchange_weak(cur_exp, cur_exp - need)) {
-                            session->level.fetch_add(1);
-                            // max_hp += 20 + HP 풀회복
-                            int new_max = session->max_hp.fetch_add(20) + 20;
-                            session->hp.store(new_max);
-                            leveled_up = true;
-                        }
-                    }
-
-                    // 레벨업 했으면 S2C_LEVEL_UP 브로드캐스트 (시야 + 자기)
-                    if (leveled_up) {
-                        S2C_LevelUp lvl;
-                        lvl.size = sizeof(lvl);
-                        lvl.type = S2C_LEVEL_UP;
-                        lvl.object_id = client_id;
-                        lvl.new_level = session->level.load();
-                        lvl.new_max_hp = session->max_hp.load();
-
-                        unordered_set<int> lvl_viewers;
-                        {
-                            lock_guard<mutex> lk(session->view_lock);
-                            for (int vid : session->view_list) {
-                                if (!IsNpcId(vid)) lvl_viewers.insert(vid);
-                            }
-                        }
-                        for (int vid : lvl_viewers) {
-                            ClientMap::const_accessor aa;
-                            if (g_clients.find(aa, vid)) aa->second->do_send(lvl.size, &lvl);
-                        }
-                        session->do_send(lvl.size, &lvl);
-                    }
-
-                    // 자기 자신에게 스탯 갱신 (HP/EXP/Level 모두 한 번에)
-                    S2C_StatusChange sc;
-                    sc.size = sizeof(sc);
-                    sc.type = S2C_STATUS_CHANGE;
-                    sc.object_id = client_id;
-                    sc.hp = session->hp.load();
-                    sc.max_hp = session->max_hp.load();
-                    sc.exp = session->exp.load();
-                    sc.level = session->level.load();
-                    session->do_send(sc.size, &sc);
+                    GiveExpToKillerAndParty(session, exp_gain);
                 }
             }
         }
@@ -2077,23 +2219,7 @@ void process_packet(int client_id, unsigned char* ptr) {
                             unsigned long long eg;
                             if (n.type == NpcType::Boss) { eg = (1ULL << 30) * (unsigned long long)BOSS_EXP_MULTIPLIER; }
                             else { eg = 1ULL << (n.level > 0 ? n.level - 1 : 0); if (n.type == NpcType::Agro) eg *= 2; if (n.move_mode == NpcMoveMode::Roaming) eg *= 2; }
-                            session->exp.fetch_add(eg);
-                            bool lup = false;
-                            while (true) {
-                                unsigned char cl = session->level.load();
-                                unsigned long long need = 100ULL << (cl - 1);
-                                unsigned long long ce = session->exp.load();
-                                if (ce < need) break;
-                                if (session->exp.compare_exchange_weak(ce, ce - need)) { session->level.fetch_add(1); int nm = session->max_hp.fetch_add(20) + 20; session->hp.store(nm); lup = true; }
-                            }
-                            if (lup) {
-                                S2C_LevelUp lvl; lvl.size = sizeof(lvl); lvl.type = S2C_LEVEL_UP; lvl.object_id = client_id; lvl.new_level = session->level.load(); lvl.new_max_hp = session->max_hp.load();
-                                unordered_set<int> lv_viewers; { lock_guard<mutex> lk2(session->view_lock); for (int v : session->view_list) if (!IsNpcId(v)) lv_viewers.insert(v); }
-                                for (int vid : lv_viewers) { ClientMap::const_accessor a; if (g_clients.find(a, vid)) a->second->do_send(lvl.size, &lvl); }
-                                session->do_send(lvl.size, &lvl);
-                            }
-                            S2C_StatusChange sc; sc.size = sizeof(sc); sc.type = S2C_STATUS_CHANGE; sc.object_id = client_id; sc.hp = session->hp.load(); sc.max_hp = session->max_hp.load(); sc.exp = session->exp.load(); sc.level = session->level.load();
-                            session->do_send(sc.size, &sc);
+                            GiveExpToKillerAndParty(session, eg);
                         }
                     }
                 }
@@ -2141,17 +2267,7 @@ void process_packet(int client_id, unsigned char* ptr) {
                         unsigned long long eg;
                         if (n.type == NpcType::Boss) { eg = (1ULL << 30) * (unsigned long long)BOSS_EXP_MULTIPLIER; }
                         else { eg = 1ULL << (n.level > 0 ? n.level - 1 : 0); if (n.type == NpcType::Agro) eg *= 2; if (n.move_mode == NpcMoveMode::Roaming) eg *= 2; }
-                        session->exp.fetch_add(eg);
-                        bool lup = false;
-                        while (true) { unsigned char cl = session->level.load(); unsigned long long need = 100ULL << (cl - 1); unsigned long long ce = session->exp.load(); if (ce < need) break; if (session->exp.compare_exchange_weak(ce, ce - need)) { session->level.fetch_add(1); int nm = session->max_hp.fetch_add(20) + 20; session->hp.store(nm); lup = true; } }
-                        if (lup) {
-                            S2C_LevelUp lvl; lvl.size = sizeof(lvl); lvl.type = S2C_LEVEL_UP; lvl.object_id = client_id; lvl.new_level = session->level.load(); lvl.new_max_hp = session->max_hp.load();
-                            unordered_set<int> lv_viewers; { lock_guard<mutex> lk2(session->view_lock); for (int v : session->view_list) if (!IsNpcId(v)) lv_viewers.insert(v); }
-                            for (int vid : lv_viewers) { ClientMap::const_accessor a; if (g_clients.find(a, vid)) a->second->do_send(lvl.size, &lvl); }
-                            session->do_send(lvl.size, &lvl);
-                        }
-                        S2C_StatusChange sc; sc.size = sizeof(sc); sc.type = S2C_STATUS_CHANGE; sc.object_id = client_id; sc.hp = session->hp.load(); sc.max_hp = session->max_hp.load(); sc.exp = session->exp.load(); sc.level = session->level.load();
-                        session->do_send(sc.size, &sc);
+                        GiveExpToKillerAndParty(session, eg);
                     }
                 }
             }
@@ -2196,6 +2312,155 @@ void process_packet(int client_id, unsigned char* ptr) {
             ClientMap::const_accessor a;
             if (g_clients.find(a, vid)) a->second->do_send(msg.size, &msg);
         }
+        break;
+    }
+    case C2S_PARTY_INVITE: {
+        C2S_PartyInvite* p = reinterpret_cast<C2S_PartyInvite*>(ptr);
+        string target_name(p->target_name);
+
+        // 내 파티가 꽉 찼으면 거부
+        int my_party = session->party_id.load();
+        if (my_party >= 0) {
+            lock_guard<mutex> lk(g_party_mutex);
+            auto it = g_parties.find(my_party);
+            if (it != g_parties.end() && (int)it->second->members.size() >= MAX_PARTY_SIZE) {
+                SendSystemMessage(session, "Party is full.");
+                break;
+            }
+        }
+
+        // 이름으로 대상 찾기
+        shared_ptr<Player> target;
+        for (auto it = g_clients.begin(); it != g_clients.end(); ++it) {
+            auto nptr = atomic_load(&it->second->name);
+            if (nptr && *nptr == target_name && it->second->id != client_id) {
+                target = it->second;
+                break;
+            }
+        }
+        if (!target) { SendSystemMessage(session, "Player not found."); break; }
+        if (target->party_id.load() >= 0) {
+            SendSystemMessage(session, target_name + " is already in a party.");
+            break;
+        }
+        {
+            lock_guard<mutex> lk(g_party_mutex);
+            if (g_pending_invites.count(target->id)) {
+                SendSystemMessage(session, target_name + " already has a pending invite.");
+                break;
+            }
+            g_pending_invites[target->id] = client_id;
+        }
+        auto my_name = atomic_load(&session->name);
+        S2C_PartyInvited inv;
+        inv.size = sizeof(inv);
+        inv.type = S2C_PARTY_INVITED;
+        inv.inviter_id = client_id;
+        strncpy_s(inv.inviter_name, sizeof(inv.inviter_name),
+                  my_name ? my_name->c_str() : "", _TRUNCATE);
+        target->do_send(inv.size, &inv);
+        SendSystemMessage(session, "Invited " + target_name + " to party.");
+        break;
+    }
+    case C2S_PARTY_ACCEPT: {
+        int inviter_id;
+        {
+            lock_guard<mutex> lk(g_party_mutex);
+            auto it = g_pending_invites.find(client_id);
+            if (it == g_pending_invites.end()) {
+                SendSystemMessage(session, "No pending party invite.");
+                break;
+            }
+            inviter_id = it->second;
+            g_pending_invites.erase(it);
+        }
+        shared_ptr<Player> inviter;
+        {
+            ClientMap::const_accessor a;
+            if (g_clients.find(a, inviter_id)) inviter = a->second;
+        }
+        if (!inviter) { SendSystemMessage(session, "Inviter has disconnected."); break; }
+
+        auto my_name   = atomic_load(&session->name);
+        int inviter_party = inviter->party_id.load();
+        int new_party_id;
+        vector<int> existing_members;
+
+        {
+            lock_guard<mutex> lk(g_party_mutex);
+            if (inviter_party >= 0) {
+                auto it = g_parties.find(inviter_party);
+                if (it == g_parties.end() || (int)it->second->members.size() >= MAX_PARTY_SIZE) {
+                    SendSystemMessage(session, "Party is full.");
+                    break;
+                }
+                new_party_id = inviter_party;
+                existing_members = it->second->members;
+                it->second->members.push_back(client_id);
+            } else {
+                new_party_id = g_next_party_id++;
+                auto party = make_shared<Party>();
+                party->id = new_party_id;
+                party->leader_id = inviter_id;
+                party->members.push_back(inviter_id);
+                party->members.push_back(client_id);
+                g_parties[new_party_id] = party;
+                existing_members.push_back(inviter_id);
+            }
+        }
+        session->party_id.store(new_party_id);
+        if (inviter_party < 0) inviter->party_id.store(new_party_id);
+
+        // 기존 멤버들에게 신입 알림
+        S2C_PartyUpdate upd;
+        upd.size = sizeof(upd);
+        upd.type = S2C_PARTY_UPDATE;
+        upd.event = 0;  // joined
+        upd.member_id = client_id;
+        strncpy_s(upd.member_name, sizeof(upd.member_name),
+                  my_name ? my_name->c_str() : "", _TRUNCATE);
+        for (int mid : existing_members) {
+            ClientMap::const_accessor a;
+            if (g_clients.find(a, mid)) a->second->do_send(upd.size, &upd);
+        }
+        // 신입에게 기존 멤버 목록 전송 (각 기존 멤버마다 JOINED 패킷 1개)
+        for (int mid : existing_members) {
+            ClientMap::const_accessor a;
+            if (!g_clients.find(a, mid)) continue;
+            S2C_PartyUpdate info;
+            info.size = sizeof(info);
+            info.type = S2C_PARTY_UPDATE;
+            info.event = 0;
+            info.member_id = mid;
+            auto mname = atomic_load(&a->second->name);
+            strncpy_s(info.member_name, sizeof(info.member_name),
+                      mname ? mname->c_str() : "", _TRUNCATE);
+            session->do_send(info.size, &info);
+        }
+        SendSystemMessage(session, "Joined party!");
+        break;
+    }
+    case C2S_PARTY_REJECT: {
+        int inviter_id;
+        {
+            lock_guard<mutex> lk(g_party_mutex);
+            auto it = g_pending_invites.find(client_id);
+            if (it == g_pending_invites.end()) break;
+            inviter_id = it->second;
+            g_pending_invites.erase(it);
+        }
+        auto my_name = atomic_load(&session->name);
+        ClientMap::const_accessor a;
+        if (g_clients.find(a, inviter_id)) {
+            SendSystemMessage(a->second,
+                string(my_name ? my_name->c_str() : "Unknown") + " rejected your invite.");
+        }
+        SendSystemMessage(session, "Rejected party invite.");
+        break;
+    }
+    case C2S_PARTY_LEAVE: {
+        PlayerLeaveParty(session);
+        SendSystemMessage(session, "You left the party.");
         break;
     }
     case C2S_LOGOUT: {

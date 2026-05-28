@@ -3,6 +3,7 @@
 #include <SFML/Network.hpp>
 #include <iostream>
 #include <unordered_map>
+#include <unordered_set>
 #include <chrono>
 #include <cstdio>
 #include <algorithm>
@@ -44,6 +45,19 @@ std::string g_chat_buffer;
 constexpr int CHAT_BUFFER_MAX = MAX_CHAT_MSG_LEN - 1;
 constexpr int CHAT_LOG_MAX = 6;  // 화면에 표시할 최근 메시지 수
 std::vector<std::string> g_chat_log;
+
+// 내가 마지막에 죽인 NPC 이름 — S2C_StatusChange로 exp가 늘었을 때 "X를 무찔러서 ..." 메시지에 사용
+std::string g_last_killed_npc_name;
+
+// 파티 상태
+struct PartyMemberInfo {
+    int id = 0;
+    std::string name;
+    int hp = 0;
+    int max_hp = 0;
+};
+std::vector<PartyMemberInfo> g_party_members;   // 자신 제외, 최대 3명
+std::unordered_set<int> g_party_member_ids;     // 미니맵 색상 분기용 빠른 조회
 
 static void add_chat_line(const std::string& s) {
     g_chat_log.push_back(s);
@@ -837,7 +851,17 @@ void client_initialize()
     exp_fill_tex->setRepeated(true);
 
     g_font = new sf::Font;
-    if (false == g_font->loadFromFile("cour.ttf")) {
+    // 한글 메시지를 표시할 수 있도록 Malgun Gothic(맑은 고딕)을 우선 시도. 없으면 기존 cour.ttf로 폴백.
+    const char* font_paths[] = {
+        "C:/Windows/Fonts/malgun.ttf",
+        "malgun.ttf",
+        "cour.ttf",
+    };
+    bool font_loaded = false;
+    for (const char* p : font_paths) {
+        if (g_font->loadFromFile(p)) { font_loaded = true; cout << "[Client] font loaded: " << p << "\n"; break; }
+    }
+    if (!font_loaded) {
         cout << "Font Loading Error!\n";
         exit(-1);
     }
@@ -1018,16 +1042,55 @@ void ProcessPacket(char* ptr)
             auto it = players.find(p->target_id);
             if (it != players.end()) it->second.m_hp = p->new_hp;
         }
+
+        // 메시지 창에 전투 로그 표시
+        // (1) 내가 몬스터를 때림: "용사가 몬스터 A를 때려서 10의 데미지를 입혔습니다."
+        if (p->attacker_id == g_myid && p->target_id >= NPC_ID_START) {
+            auto it = players.find(p->target_id);
+            const char* mname = (it != players.end() && it->second.name[0]) ? it->second.name : "몬스터";
+            char buf[256];
+            sprintf_s(buf, "용사가 %s를 때려서 %d의 데미지를 입혔습니다.", mname, p->damage);
+            add_chat_line(buf);
+            // 마지막 일격이면 다음 exp 증가 메시지를 위해 이름 기억
+            if (p->new_hp <= 0) g_last_killed_npc_name = mname;
+        }
+        // (2) 몬스터가 나를 때림: "몬스터A의 공격으로 15의 데미지를 입었습니다."
+        else if (p->target_id == g_myid && p->attacker_id >= NPC_ID_START) {
+            auto it = players.find(p->attacker_id);
+            const char* mname = (it != players.end() && it->second.name[0]) ? it->second.name : "몬스터";
+            char buf[256];
+            sprintf_s(buf, "%s의 공격으로 %d의 데미지를 입었습니다.", mname, p->damage);
+            add_chat_line(buf);
+        }
         break;
     }
     case S2C_STATUS_CHANGE:
     {
         S2C_StatusChange* p = reinterpret_cast<S2C_StatusChange*>(ptr);
         if (p->object_id == g_myid) {
+            // exp 증가 + 직전에 내가 죽인 몬스터가 있으면 메시지 출력
+            // (3) "몬스터 A를 무찔러서 250의 경험치를 얻었습니다."
+            if (p->exp > g_my_exp && !g_last_killed_npc_name.empty()) {
+                unsigned long long gained = p->exp - g_my_exp;
+                char buf[256];
+                sprintf_s(buf, "%s를 무찔러서 %llu의 경험치를 얻었습니다.",
+                          g_last_killed_npc_name.c_str(), gained);
+                add_chat_line(buf);
+                g_last_killed_npc_name.clear();
+            }
             g_my_hp = p->hp;
             g_my_max_hp = p->max_hp;
             g_my_exp = p->exp;
             g_my_level = p->level;
+        } else if (g_party_member_ids.count(p->object_id)) {
+            // 파티원 HP 바 갱신
+            for (auto& m : g_party_members) {
+                if (m.id == p->object_id) {
+                    m.hp = p->hp;
+                    m.max_hp = p->max_hp;
+                    break;
+                }
+            }
         }
         break;
     }
@@ -1082,7 +1145,9 @@ void ProcessPacket(char* ptr)
     {
         S2C_ChatMessage* p = reinterpret_cast<S2C_ChatMessage*>(ptr);
         std::string sender;
-        if (p->object_id == g_myid) {
+        if (p->object_id == 0) {
+            sender = "[System]";  // 서버 시스템 메시지 (파티 알림 등)
+        } else if (p->object_id == g_myid) {
             sender = avatar_name;
         }
         else {
@@ -1095,6 +1160,49 @@ void ProcessPacket(char* ptr)
             }
         }
         add_chat_line(sender + ": " + std::string(p->message));
+        break;
+    }
+    case S2C_PARTY_INVITED:
+    {
+        S2C_PartyInvited* p = reinterpret_cast<S2C_PartyInvited*>(ptr);
+        std::string msg = std::string(p->inviter_name) + " invited you. /accept or /reject";
+        add_chat_line("[Party] " + msg);
+        break;
+    }
+    case S2C_PARTY_UPDATE:
+    {
+        S2C_PartyUpdate* p = reinterpret_cast<S2C_PartyUpdate*>(ptr);
+        if (p->event == 0) {
+            // 파티원 입장 — 목록에 추가
+            if (!g_party_member_ids.count(p->member_id)) {
+                PartyMemberInfo m;
+                m.id = p->member_id;
+                m.name = p->member_name;
+                m.hp = 0; m.max_hp = 0;
+                // S2C_ADD_OBJECT로 이미 받은 HP 정보가 있으면 가져오기
+                auto it = players.find(p->member_id);
+                if (it != players.end()) {
+                    m.hp = it->second.m_hp;
+                    m.max_hp = it->second.m_max_hp;
+                }
+                g_party_members.push_back(m);
+                g_party_member_ids.insert(p->member_id);
+            }
+            add_chat_line("[Party] " + std::string(p->member_name) + " joined.");
+        } else if (p->event == 1) {
+            // 파티원 탈퇴
+            g_party_members.erase(
+                std::remove_if(g_party_members.begin(), g_party_members.end(),
+                    [&](const PartyMemberInfo& m){ return m.id == p->member_id; }),
+                g_party_members.end());
+            g_party_member_ids.erase(p->member_id);
+            add_chat_line("[Party] " + std::string(p->member_name) + " left the party.");
+        } else if (p->event == 2) {
+            // 파티 해산
+            g_party_members.clear();
+            g_party_member_ids.clear();
+            add_chat_line("[Party] Party disbanded.");
+        }
         break;
     }
     case S2C_SKILL_EFFECT:
@@ -1270,7 +1378,10 @@ static void draw_minimap() {
         if (p.m_x < wx_min || p.m_x > wx_max || p.m_y < wy_min || p.m_y > wy_max) continue;
         auto pos = w2m(p.m_x, p.m_y);
         bool is_npc = (kv.first >= NPC_ID_START);
-        sf::Color c = is_npc ? sf::Color(230, 70, 70) : sf::Color(70, 230, 90);
+        bool is_party = !is_npc && g_party_member_ids.count(kv.first);
+        sf::Color c = is_npc ? sf::Color(230, 70, 70)
+                    : is_party ? sf::Color(80, 210, 255)   // 파티원: 청록
+                    : sf::Color(70, 230, 90);               // 일반 플레이어: 녹색
         float size = MINIMAP_PX_PER_TILE * 2.0f;
         sf::RectangleShape dot(sf::Vector2f(size, size));
         dot.setPosition(pos.x - size * 0.25f, pos.y - size * 0.25f);
@@ -1389,7 +1500,8 @@ static void draw_hud()
         const float text_pad_x = 14.0f;
         const float text_pad_y = 8.0f;
         for (size_t i = 0; i < g_chat_log.size(); ++i) {
-            txt.setString(g_chat_log[i]);
+            // 한글(UTF-8) 메시지가 Latin-1로 잘못 해석되지 않도록 명시적 변환
+            txt.setString(sf::String::fromUtf8(g_chat_log[i].begin(), g_chat_log[i].end()));
             txt.setPosition(CHAT_X + text_pad_x, CHAT_Y + text_pad_y + i * line_h);
             g_window->draw(txt);
         }
@@ -1416,6 +1528,55 @@ static void draw_hud()
         inp.setString("> " + g_chat_buffer + (show_cursor ? "_" : " "));
         inp.setPosition(CHAT_X + 6.0f, input_y + 2.0f);
         g_window->draw(inp);
+    }
+
+    // ---- 파티 HP 바 패널 (채팅 패널 바로 아래, 파티원이 있을 때만) ----
+    if (!g_party_members.empty()) {
+        constexpr float PARTY_W  = 240.0f;
+        const float PARTY_X = CHAT_X;
+        const float PARTY_Y = CHAT_Y + CHAT_H + (g_chat_input_mode ? 30.0f : 6.0f);
+        constexpr float ROW_H = 22.0f;
+        float total_h = g_party_members.size() * ROW_H + 6.0f;
+
+        sf::RectangleShape pbg(sf::Vector2f(PARTY_W, total_h));
+        pbg.setFillColor(sf::Color(10, 8, 22, 200));
+        pbg.setOutlineColor(sf::Color(80, 160, 255, 180));
+        pbg.setOutlineThickness(1.0f);
+        pbg.setPosition(PARTY_X, PARTY_Y);
+        g_window->draw(pbg);
+
+        for (size_t i = 0; i < g_party_members.size(); ++i) {
+            const auto& m = g_party_members[i];
+            float row_y = PARTY_Y + 3.0f + i * ROW_H;
+
+            sf::Text ntxt;
+            ntxt.setFont(*g_font);
+            ntxt.setCharacterSize(11);
+            ntxt.setFillColor(sf::Color(160, 210, 255));
+            ntxt.setString(m.name.size() > 8 ? m.name.substr(0, 8) : m.name);
+            ntxt.setPosition(PARTY_X + 4.0f, row_y + 3.0f);
+            g_window->draw(ntxt);
+
+            float bar_x = PARTY_X + 72.0f;
+            float bar_w = PARTY_W - 76.0f;
+            float bar_h = 14.0f;
+
+            sf::RectangleShape bg_bar(sf::Vector2f(bar_w, bar_h));
+            bg_bar.setFillColor(sf::Color(30, 20, 20, 200));
+            bg_bar.setPosition(bar_x, row_y + 4.0f);
+            g_window->draw(bg_bar);
+
+            if (m.max_hp > 0) {
+                float ratio = std::max(0.0f, std::min(1.0f, (float)m.hp / (float)m.max_hp));
+                sf::Color hp_c = (ratio > 0.5f) ? sf::Color(50, 200, 50)
+                               : (ratio > 0.25f) ? sf::Color(200, 150, 50)
+                               : sf::Color(200, 50, 50);
+                sf::RectangleShape hp_bar(sf::Vector2f(bar_w * ratio, bar_h));
+                hp_bar.setFillColor(hp_c);
+                hp_bar.setPosition(bar_x, row_y + 4.0f);
+                g_window->draw(hp_bar);
+            }
+        }
     }
 
     // ---- HP/MP 구슬 (좌하단/우하단, 각 256x256 → 128x128) ----
@@ -1462,17 +1623,25 @@ static void draw_hud()
         hud_sprite.setPosition(bar_x, bar_y);
         g_window->draw(hud_sprite);
 
-        // 채움 (프레임 위에, 안쪽 영역만, 비율만큼 — fill tile을 가로 반복하며 늘림)
+        // 채움 (프레임 위에, 안쪽 영역만, 비율만큼)
+        // sf::Sprite + setRepeated(true) + 큰 IntRect 조합이 일부 GPU/드라이버에서
+        // 그려지지 않는 문제가 있어 단순한 RectangleShape(플랫 컬러)로 교체.
         if (exp_ratio > 0.0f) {
             float fill_pixel_w = (BAR_W - INNER_PAD_X * 2.0f) * exp_ratio;
             float fill_pixel_h = BAR_H - INNER_PAD_Y * 2.0f;
-            sf::Sprite fill;
-            fill.setTexture(*exp_fill_tex);
-            // setRepeated(true)와 함께 IntRect 너비를 늘리면 가로로 타일링
-            fill.setTextureRect(sf::IntRect(0, 0, (int)(fill_pixel_w / (fill_pixel_h / 32.0f)), 32));
-            fill.setScale(fill_pixel_h / 32.0f, fill_pixel_h / 32.0f);
+
+            // 본체: 황금색 그라데이션 느낌을 단색으로 근사
+            sf::RectangleShape fill(sf::Vector2f(fill_pixel_w, fill_pixel_h));
+            fill.setFillColor(sf::Color(240, 200, 60));
             fill.setPosition(bar_x + INNER_PAD_X, bar_y + INNER_PAD_Y);
             g_window->draw(fill);
+
+            // 상단 하이라이트(밝은 띠)로 입체감 부여
+            float hi_h = std::max(1.0f, fill_pixel_h * 0.35f);
+            sf::RectangleShape hi(sf::Vector2f(fill_pixel_w, hi_h));
+            hi.setFillColor(sf::Color(255, 235, 140, 200));
+            hi.setPosition(bar_x + INNER_PAD_X, bar_y + INNER_PAD_Y);
+            g_window->draw(hi);
         }
 
         // 레벨 + EXP 텍스트 (EXP 바 가운데에 오버레이)
@@ -1954,12 +2123,34 @@ int main()
                 // 키 down 엣지 — 한 번만 발화
                 if (g_chat_input_mode) {
                     if (!g_chat_buffer.empty()) {
-                        C2S_Chat cp;
-                        cp.size = sizeof(cp);
-                        cp.type = C2S_CHAT;
-                        strncpy_s(cp.message, sizeof(cp.message), g_chat_buffer.c_str(), _TRUNCATE);
-                        cp.message[MAX_CHAT_MSG_LEN - 1] = '\0';
-                        send_packet(&cp);
+                        const std::string& msg = g_chat_buffer;
+
+                        // 파티 명령어 처리: /invite <name>, /accept, /reject, /leave
+                        if (msg.rfind("/invite ", 0) == 0 && msg.size() > 8) {
+                            std::string target = msg.substr(8);
+                            C2S_PartyInvite pk;
+                            pk.size = sizeof(pk);
+                            pk.type = C2S_PARTY_INVITE;
+                            strncpy_s(pk.target_name, sizeof(pk.target_name), target.c_str(), _TRUNCATE);
+                            send_packet(&pk);
+                        } else if (msg == "/accept") {
+                            C2S_PartyAccept pk; pk.size = sizeof(pk); pk.type = C2S_PARTY_ACCEPT;
+                            send_packet(&pk);
+                        } else if (msg == "/reject") {
+                            C2S_PartyReject pk; pk.size = sizeof(pk); pk.type = C2S_PARTY_REJECT;
+                            send_packet(&pk);
+                        } else if (msg == "/leave") {
+                            C2S_PartyLeave pk; pk.size = sizeof(pk); pk.type = C2S_PARTY_LEAVE;
+                            send_packet(&pk);
+                        } else {
+                            // 일반 채팅
+                            C2S_Chat cp;
+                            cp.size = sizeof(cp);
+                            cp.type = C2S_CHAT;
+                            strncpy_s(cp.message, sizeof(cp.message), msg.c_str(), _TRUNCATE);
+                            cp.message[MAX_CHAT_MSG_LEN - 1] = '\0';
+                            send_packet(&cp);
+                        }
                     }
                     g_chat_buffer.clear();
                     g_chat_input_mode = false;

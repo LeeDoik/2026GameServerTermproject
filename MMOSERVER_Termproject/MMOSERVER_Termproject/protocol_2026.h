@@ -24,6 +24,10 @@ enum PACKET_TYPE {
 	// STRESS TEST������ �߰��� ��Ŷ�Դϴ�. ���� ������ ������ ���� ����.
 	C2S_LOGOUT,			// Client to Server: Logout request
 	C2S_USE_SKILL,		// Client to Server: Skill use request (skill_id: 1=AoE, 2=Line, 3=Heal)
+	C2S_PARTY_INVITE,	// Client to Server: 파티 초대 (target_name)
+	C2S_PARTY_ACCEPT,	// Client to Server: 파티 초대 수락
+	C2S_PARTY_REJECT,	// Client to Server: 파티 초대 거절
+	C2S_PARTY_LEAVE,	// Client to Server: 파티 탈퇴
 
 	S2C_LOGIN_RESULT,	//	Server to Client: Login result
 	// �α��� ��� ��Ŷ (���� ���ο� �޽��� ����)
@@ -39,6 +43,8 @@ enum PACKET_TYPE {
 	S2C_RESPAWN,		//	Server to Client: 엔티티 리스폰 (브로드캐스트)
 	S2C_LEVEL_UP,		//	Server to Client: 레벨업 알림 (브로드캐스트) — 클라가 burst 이펙트
 	S2C_SKILL_EFFECT,	//	Server to Client: 스킬 발동 통지 (브로드캐스트) — 클라가 스킬 이펙트 재생
+	S2C_PARTY_INVITED,	//	Server to Client: 파티 초대 수신 알림
+	S2C_PARTY_UPDATE,	//	Server to Client: 파티 상태 변경 (0=joined, 1=left, 2=disbanded)
 };
 
 #pragma pack(push, 1) // Ensure no padding between struct members
@@ -211,6 +217,34 @@ struct S2C_SkillEffect {
 	unsigned char direction; // 시전자 방향 (Line 빔 진행 방향)
 	short x;             // 시전 위치
 	short y;
+};
+
+// 파티 초대 발송: target 플레이어 이름 포함
+struct C2S_PartyInvite {
+	unsigned char size;
+	PACKET_TYPE   type;
+	char target_name[MAX_NAME_LEN];
+};
+
+struct C2S_PartyAccept { unsigned char size; PACKET_TYPE type; };
+struct C2S_PartyReject { unsigned char size; PACKET_TYPE type; };
+struct C2S_PartyLeave  { unsigned char size; PACKET_TYPE type; };
+
+// 초대 수신 알림: 누가 초대했는지 표시
+struct S2C_PartyInvited {
+	unsigned char size;
+	PACKET_TYPE   type;
+	int inviter_id;
+	char inviter_name[MAX_NAME_LEN];
+};
+
+// 파티 상태 변경. event: 0=joined, 1=left, 2=disbanded
+struct S2C_PartyUpdate {
+	unsigned char size;
+	PACKET_TYPE   type;
+	unsigned char event;
+	int member_id;
+	char member_name[MAX_NAME_LEN];
 };
 
 #pragma pack(pop) // Restore default packing
