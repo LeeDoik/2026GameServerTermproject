@@ -33,6 +33,11 @@
 #pragma comment(lib, "ws2_32.lib")
 #pragma comment(lib, "mswsock.lib")
 
+// 핫패스 로깅 토글 — 1400 CCU 한계는 stdout 직렬화가 주 원인.
+// 디버그/시연 시 1로 변경하면 매 connect/login/disconnect/logout 콘솔 출력.
+// 운영/부하 테스트 시에는 0 권장 (5000 CCU 목표).
+#define VERBOSE_CLIENT_EVENTS 0
+
 using namespace std;
 
 // 링 버퍼 클래스 전방 선언
@@ -151,8 +156,14 @@ struct Player : public Entity {
     atomic<unsigned char> level;
     atomic<long long> last_attack_ms;  // 쿨타임 검증용
 
+    // 스킬 쿨타임 — Stage 7
+    atomic<long long> last_skill1_ms;  // AoE 쿨타임
+    atomic<long long> last_skill2_ms;  // Line 쿨타임
+    atomic<long long> last_skill3_ms;  // Heal 쿨타임
+
     Player() : Entity(), socket(INVALID_SOCKET), recv_overlapped(IO_RECV), is_active(false),
-               hp(100), max_hp(100), exp(0), level(1), last_attack_ms(0) {
+               hp(100), max_hp(100), exp(0), level(1), last_attack_ms(0),
+               last_skill1_ms(0), last_skill2_ms(0), last_skill3_ms(0) {
         name = make_shared<string>("Guest");
     }
 
@@ -461,9 +472,18 @@ void NpcOnMove(int npc_id) {
     ctx.nearest_x = nearest_x;
     ctx.nearest_y = nearest_y;
     ctx.nearest_dist = nearest_dist;
+    ctx.hp = npc.hp;
+    ctx.max_hp = npc.max_hp;
+    ctx.boss_tick_count = npc.boss_tick_count.load();
 
     NpcTickResult result;
-    g_lua.NpcTick(ctx, result);  // 실패해도 result는 안전 디폴트(정지 + target 유지)
+    if (npc.type == NpcType::Boss) {
+        g_lua.BossTick(ctx, result);
+        npc.boss_tick_count.fetch_add(1);
+    }
+    else {
+        g_lua.NpcTick(ctx, result);  // 실패해도 result는 안전 디폴트(정지 + target 유지)
+    }
 
     // 3) 결과 적용: target_id 갱신 + state 전환
     int new_target = result.target_id;
@@ -582,7 +602,7 @@ void NpcOnMove(int npc_id) {
     if (new_x >= WORLD_WIDTH)  new_x = WORLD_WIDTH - 1;
     if (new_y >= WORLD_HEIGHT) new_y = WORLD_HEIGHT - 1;
 
-    // Stage 6.2: 막힌 타일로 향하면 추적 중일 때 A*로 우회, 아니면 stay
+    // 막힌 타일로 향하면 A*로 우회. 추격 중: 타겟 방향. 로밍 중: 스폰 방향.
     if (Map::IsBlocked(new_x, new_y)) {
         bool detoured = false;
         if (new_target != -1) {
@@ -601,7 +621,6 @@ void NpcOnMove(int npc_id) {
                     && (dx_alt != 0 || dy_alt != 0)) {
                     int alt_x = static_cast<int>(old_x) + dx_alt;
                     int alt_y = static_cast<int>(old_y) + dy_alt;
-                    // 스폰 박스(Lua와 동일한 ±ROAM_AREA_RANGE) 일관성 + 장애물 재확인
                     if (std::abs(alt_x - static_cast<int>(npc.spawn_x)) <= ROAM_AREA_RANGE
                         && std::abs(alt_y - static_cast<int>(npc.spawn_y)) <= ROAM_AREA_RANGE
                         && !Map::IsBlocked(alt_x, alt_y)) {
@@ -609,6 +628,22 @@ void NpcOnMove(int npc_id) {
                         new_y = static_cast<short>(alt_y);
                         detoured = true;
                     }
+                }
+            }
+        }
+        // 로밍 NPC가 장애물에 막혔을 때 A*로 스폰 방향 우회
+        if (!detoured && npc.move_mode == NpcMoveMode::Roaming) {
+            int dx_alt = 0, dy_alt = 0;
+            if (AStar::AStarStep(old_x, old_y, npc.spawn_x, npc.spawn_y, dx_alt, dy_alt)
+                && (dx_alt != 0 || dy_alt != 0)) {
+                int alt_x = static_cast<int>(old_x) + dx_alt;
+                int alt_y = static_cast<int>(old_y) + dy_alt;
+                if (std::abs(alt_x - static_cast<int>(npc.spawn_x)) <= ROAM_AREA_RANGE
+                    && std::abs(alt_y - static_cast<int>(npc.spawn_y)) <= ROAM_AREA_RANGE
+                    && !Map::IsBlocked(alt_x, alt_y)) {
+                    new_x = static_cast<short>(alt_x);
+                    new_y = static_cast<short>(alt_y);
+                    detoured = true;
                 }
             }
         }
@@ -701,6 +736,75 @@ void NpcOnMove(int npc_id) {
         }
     }
 
+    // ==== 보스 전용 처리: 채팅 + AoE ====
+    if (npc.type == NpcType::Boss) {
+        // 보스 채팅 (chat_id > 0이면 시야 내 모든 플레이어에게 S2C_CHAT_MESSAGE)
+        if (result.chat_id > 0) {
+            const char* boss_msgs[] = {
+                "",
+                "You dare enter my domain?!",
+                "I will crush you!",
+                "None shall pass!",
+                "ROARRR!!"
+            };
+            int mid = result.chat_id;
+            if (mid >= 1 && mid <= 4) {
+                const char* msg = boss_msgs[mid];
+                S2C_ChatMessage cpkt;
+                cpkt.size = static_cast<unsigned char>(sizeof(cpkt));
+                cpkt.type = S2C_CHAT_MESSAGE;
+                cpkt.object_id = npc_id;
+                strncpy_s(cpkt.message, msg, _TRUNCATE);
+                for (auto& [pid, psess] : id_to_session) {
+                    psess->do_send(cpkt.size, &cpkt);
+                }
+            }
+        }
+
+        // 보스 AoE (do_boss_aoe == 1이면 BOSS_AOE_RANGE 반경 내 모든 플레이어에 데미지)
+        if (result.do_boss_aoe != 0) {
+            for (auto& [pid, psess] : id_to_session) {
+                int ddx = std::abs(static_cast<int>(psess->x) - static_cast<int>(new_x));
+                int ddy = std::abs(static_cast<int>(psess->y) - static_cast<int>(new_y));
+                if (std::max(ddx, ddy) > BOSS_AOE_RANGE) continue;
+
+                int damage = BOSS_BASE_DAMAGE;
+                int old_hp = psess->hp.load();
+                int new_hp_v = 0;
+                bool dealt = false;
+                while (old_hp > 0) {
+                    int next = (old_hp > damage) ? (old_hp - damage) : 0;
+                    if (psess->hp.compare_exchange_weak(old_hp, next)) {
+                        new_hp_v = next;
+                        dealt = true;
+                        break;
+                    }
+                }
+                if (dealt) {
+                    // 피격 패킷 (시야 내 전원 + 피격자)
+                    S2C_Damage dpkt;
+                    dpkt.size = sizeof(dpkt);
+                    dpkt.type = S2C_DAMAGE;
+                    dpkt.attacker_id = npc_id;
+                    dpkt.target_id = pid;
+                    dpkt.damage = damage;
+                    dpkt.new_hp = new_hp_v;
+                    dpkt.target_x = psess->x;
+                    dpkt.target_y = psess->y;
+                    for (auto& [vid, vsess] : id_to_session) {
+                        vsess->do_send(dpkt.size, &dpkt);
+                    }
+                    psess->do_send(dpkt.size, &dpkt);
+
+                    // 플레이어 사망 처리
+                    if (new_hp_v == 0) {
+                        PlayerOnDeath(psess);
+                    }
+                }
+            }
+        }
+    }
+
     // 시야가 비었으면 비활성화, 아니면 재스케줄
     bool has_viewer;
     {
@@ -730,6 +834,7 @@ void NpcOnRespawn(int npc_id) {
         rx = npc.x;
         ry = npc.y;
     }
+    npc.boss_tick_count.store(0);  // 보스 리스폰 시 틱/페이즈 초기화
     npc.active.store(false);
 
     // 2) 섹터 재등록 (이전엔 RemoveObjectFromSector로 빠져있음)
@@ -1061,11 +1166,13 @@ void OnPlayerSpawn(int client_id, const PlayerSnapshot& snap, bool exists) {
     SyncPlayerNpcView(session);
     g_timer_manager.Schedule(client_id, TimerEventKind::HpRegen, HP_REGEN_INTERVAL_MS);
 
+#if VERBOSE_CLIENT_EVENTS
     auto name_ptr = atomic_load(&session->name);
     cout << "[Login] Client " << client_id << " (" << (exists ? "loaded" : "new")
          << ") as " << (name_ptr ? *name_ptr : std::string{}) << " at ("
          << session->x << ", " << session->y << ") hp=" << session->hp.load()
          << " lv=" << static_cast<int>(session->level.load()) << endl;
+#endif
 }
 
 // DB 응답 디스패치 (worker_thread의 IO_DB_DONE 분기에서 호출).
@@ -1186,12 +1293,16 @@ int main(int argc, char* argv[]) {
     // --- Lua AI 초기화: 스펙 상수 노출 → 스크립트 로드 ---
     g_lua.OpenStdLibs();
     // PDF 스펙 상수를 Lua 글로벌로 노출 (스크립트 가독성 + 추후 튜닝 용이)
-    g_lua.SetGlobalInt("TYPE_PEACE",   static_cast<long long>(NpcType::Peace));
-    g_lua.SetGlobalInt("TYPE_AGRO",    static_cast<long long>(NpcType::Agro));
-    g_lua.SetGlobalInt("MOVE_FIXED",   static_cast<long long>(NpcMoveMode::Fixed));
-    g_lua.SetGlobalInt("MOVE_ROAMING", static_cast<long long>(NpcMoveMode::Roaming));
-    g_lua.SetGlobalInt("AGRO_RANGE",   AGRO_DETECT_RANGE);
-    g_lua.SetGlobalInt("ROAM_RANGE",   ROAM_AREA_RANGE);
+    g_lua.SetGlobalInt("TYPE_PEACE",        static_cast<long long>(NpcType::Peace));
+    g_lua.SetGlobalInt("TYPE_AGRO",         static_cast<long long>(NpcType::Agro));
+    g_lua.SetGlobalInt("TYPE_BOSS",         static_cast<long long>(NpcType::Boss));
+    g_lua.SetGlobalInt("MOVE_FIXED",        static_cast<long long>(NpcMoveMode::Fixed));
+    g_lua.SetGlobalInt("MOVE_ROAMING",      static_cast<long long>(NpcMoveMode::Roaming));
+    g_lua.SetGlobalInt("AGRO_RANGE",        AGRO_DETECT_RANGE);
+    g_lua.SetGlobalInt("ROAM_RANGE",        ROAM_AREA_RANGE);
+    g_lua.SetGlobalInt("BOSS_AGRO_RANGE",   BOSS_AGRO_RANGE);
+    g_lua.SetGlobalInt("BOSS_AOE_INTERVAL", BOSS_AOE_INTERVAL_TICKS);
+    g_lua.SetGlobalInt("BOSS_CHAT_INTERVAL",BOSS_CHAT_INTERVAL_TICKS);
 
     const char* lua_paths[] = {
         "data/npc_ai.lua",
@@ -1300,7 +1411,9 @@ void worker_thread() {
                 }
                 CreateIoCompletionPort(reinterpret_cast<HANDLE>(c_socket), g_h_iocp, new_id, 0);
 
+#if VERBOSE_CLIENT_EVENTS
                 cout << "[Connect] Client Connected. ID: " << new_id << " (Total: " << g_clients.size() << ")" << endl;
+#endif
 
                 S2C_LoginResult res;
                 res.size = sizeof(res);
@@ -1364,7 +1477,9 @@ void worker_thread() {
                 if (g_clients.find(a, client_id)) disconnected = a->second;
             }
             if (disconnected) {
+#if VERBOSE_CLIENT_EVENTS
                 cout << "[Disconnect] Client Disconnected. ID: " << client_id << endl;
+#endif
 
                 // Stage 6.3: 최종 상태를 DB에 저장 (이름이 비어있으면 LOGIN 전이므로 skip)
                 {
@@ -1783,20 +1898,27 @@ void process_packet(int client_id, unsigned char* ptr) {
                         if (g_clients.find(a, vid)) a->second->do_send(dpkt.size, &dpkt);
                     }
 
-                    // 30초 뒤 리스폰 예약
-                    g_timer_manager.Schedule(nid, TimerEventKind::NpcRespawn, NPC_RESPAWN_MS);
+                    // 보스는 5분 리스폰, 일반 NPC는 30초
+                    int respawn_ms = (n.type == NpcType::Boss) ? BOSS_RESPAWN_MS : NPC_RESPAWN_MS;
+                    g_timer_manager.Schedule(nid, TimerEventKind::NpcRespawn, respawn_ms);
 
-                    // EXP 부여: npc.level² × 2 × (Agro? ×2) × (Roaming? ×2)
-                    unsigned long long exp_gain = (unsigned long long)n.level * n.level * BASE_EXP_MULTIPLIER;
-                    if (n.type == NpcType::Agro)            exp_gain *= 2;
-                    if (n.move_mode == NpcMoveMode::Roaming) exp_gain *= 2;
+                    // EXP: 일반=2^(level-1) × (Agro×2) × (Roaming×2) → 레벨 무관 Agro+Roaming 25킬/레벨
+                    // 보스=2^30 × BOSS_EXP_MULTIPLIER (레벨30 기준 캡, 레벨25~30 플레이어 타겟)
+                    unsigned long long exp_gain;
+                    if (n.type == NpcType::Boss) {
+                        exp_gain = (1ULL << 30) * (unsigned long long)BOSS_EXP_MULTIPLIER;
+                    } else {
+                        exp_gain = 1ULL << (n.level > 0 ? n.level - 1 : 0);
+                        if (n.type == NpcType::Agro)             exp_gain *= 2;
+                        if (n.move_mode == NpcMoveMode::Roaming) exp_gain *= 2;
+                    }
                     session->exp.fetch_add(exp_gain);
 
                     // 레벨업 체크 (한 번에 여러 레벨 가능)
                     bool leveled_up = false;
                     while (true) {
                         unsigned char cur_lv = session->level.load();
-                        unsigned long long need = (unsigned long long)cur_lv * cur_lv * BASE_EXP_MULTIPLIER;
+                        unsigned long long need = 100ULL << (cur_lv - 1);  // 100 × 2^(level-1)
                         unsigned long long cur_exp = session->exp.load();
                         if (cur_exp < need) break;
                         // exp -= need + level += 1 (atomic 2-step, level은 한 번만 증가)
@@ -1847,6 +1969,208 @@ void process_packet(int client_id, unsigned char* ptr) {
         }
         break;
     }
+    case C2S_USE_SKILL: {
+        C2S_UseSkill* sp = reinterpret_cast<C2S_UseSkill*>(ptr);
+        unsigned char skill_id = sp->skill_id;
+
+        auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+
+        // 스킬별 쿨타임 검증
+        if (skill_id == 1) {
+            long long last = session->last_skill1_ms.load();
+            if (last != 0 && now_ms - last < SKILL_AOE_COOLDOWN_MS) break;
+            session->last_skill1_ms.store(now_ms);
+        } else if (skill_id == 2) {
+            long long last = session->last_skill2_ms.load();
+            if (last != 0 && now_ms - last < SKILL_LINE_COOLDOWN_MS) break;
+            session->last_skill2_ms.store(now_ms);
+        } else if (skill_id == 3) {
+            long long last = session->last_skill3_ms.load();
+            if (last != 0 && now_ms - last < SKILL_HEAL_COOLDOWN_MS) break;
+            session->last_skill3_ms.store(now_ms);
+        } else {
+            break; // 알 수 없는 스킬 ID
+        }
+
+        short cx = session->x, cy = session->y;
+        int lv = session->level.load();
+
+        // S2C_SKILL_EFFECT 브로드캐스트 (시야 내 플레이어 전원 + 자기 자신)
+        S2C_SkillEffect sfx;
+        sfx.size = sizeof(sfx);
+        sfx.type = S2C_SKILL_EFFECT;
+        sfx.object_id = client_id;
+        sfx.skill_id  = skill_id;
+        sfx.direction = session->direction.load();
+        sfx.x = cx; sfx.y = cy;
+
+        vector<int> sfx_viewers;
+        {
+            lock_guard<mutex> lk(session->view_lock);
+            for (int vid : session->view_list)
+                if (!IsNpcId(vid)) sfx_viewers.push_back(vid);
+        }
+        for (int vid : sfx_viewers) {
+            ClientMap::const_accessor a;
+            if (g_clients.find(a, vid)) a->second->do_send(sfx.size, &sfx);
+        }
+        session->do_send(sfx.size, &sfx);
+
+        // --- 스킬 1: AoE — 반경 SKILL_AOE_RANGE 이내 모든 NPC에 데미지 ---
+        if (skill_id == 1) {
+            int damage = lv * SKILL_AOE_DAMAGE_PER_LEVEL;
+            int r = SKILL_AOE_RANGE;
+
+            // 영향권 섹터 열거
+            int sx0 = max(0, (cx - r) / SECTOR_SIZE);
+            int sy0 = max(0, (cy - r) / SECTOR_SIZE);
+            int sx1 = min(NUM_SECTORS_X - 1, (cx + r) / SECTOR_SIZE);
+            int sy1 = min(NUM_SECTORS_Y - 1, (cy + r) / SECTOR_SIZE);
+
+            for (int sy = sy0; sy <= sy1; ++sy) {
+                for (int sxx = sx0; sxx <= sx1; ++sxx) {
+                    vector<int> npc_ids;
+                    {
+                        lock_guard<mutex> slk(g_sectors[sy][sxx].m_lock);
+                        for (int nid : g_sectors[sy][sxx].npcs) npc_ids.push_back(nid);
+                    }
+                    for (int nid : npc_ids) {
+                        NPC& n = GetNpc(nid);
+                        // chebyshev 거리 체크
+                        if (abs(n.x - cx) > r || abs(n.y - cy) > r) continue;
+
+                        int new_hp = 0; short nx = 0, ny = 0; bool dealt = false;
+                        {
+                            lock_guard<mutex> nlk(n.view_lock);
+                            if (n.hp > 0) {
+                                n.hp -= damage; if (n.hp < 0) n.hp = 0;
+                                new_hp = n.hp; nx = n.x; ny = n.y; dealt = true;
+                            }
+                        }
+                        if (!dealt) continue;
+
+                        S2C_Damage dmg; dmg.size = sizeof(dmg); dmg.type = S2C_DAMAGE;
+                        dmg.attacker_id = client_id; dmg.target_id = nid;
+                        dmg.damage = damage; dmg.new_hp = new_hp;
+                        dmg.target_x = nx; dmg.target_y = ny;
+
+                        unordered_set<int> dviewers;
+                        { lock_guard<mutex> nlk(n.view_lock); for (int v : n.view_list) dviewers.insert(v); }
+                        dviewers.insert(client_id);
+                        for (int vid : dviewers) {
+                            ClientMap::const_accessor a;
+                            if (g_clients.find(a, vid)) a->second->do_send(dmg.size, &dmg);
+                        }
+
+                        if (new_hp == 0) {
+                            unordered_set<int> dv;
+                            { lock_guard<mutex> nlk(n.view_lock); for (int v : n.view_list) dv.insert(v); n.view_list.clear(); n.state = NpcFsmState::Dead; n.target_id = -1; }
+                            dv.insert(client_id);
+                            for (int vid : dv) { ClientMap::const_accessor a; if (g_clients.find(a, vid)) { lock_guard<mutex> vl(a->second->view_lock); a->second->view_list.erase(nid); } }
+                            n.active.store(false);
+                            RemoveObjectFromSector(nid, nx, ny, false);
+                            S2C_Death dpkt; dpkt.size = sizeof(dpkt); dpkt.type = S2C_DEATH; dpkt.object_id = nid; dpkt.death_x = nx; dpkt.death_y = ny;
+                            for (int vid : dv) { ClientMap::const_accessor a; if (g_clients.find(a, vid)) a->second->do_send(dpkt.size, &dpkt); }
+                            { int rm = (n.type == NpcType::Boss) ? BOSS_RESPAWN_MS : NPC_RESPAWN_MS; g_timer_manager.Schedule(nid, TimerEventKind::NpcRespawn, rm); }
+
+                            unsigned long long eg;
+                            if (n.type == NpcType::Boss) { eg = (1ULL << 30) * (unsigned long long)BOSS_EXP_MULTIPLIER; }
+                            else { eg = 1ULL << (n.level > 0 ? n.level - 1 : 0); if (n.type == NpcType::Agro) eg *= 2; if (n.move_mode == NpcMoveMode::Roaming) eg *= 2; }
+                            session->exp.fetch_add(eg);
+                            bool lup = false;
+                            while (true) {
+                                unsigned char cl = session->level.load();
+                                unsigned long long need = 100ULL << (cl - 1);
+                                unsigned long long ce = session->exp.load();
+                                if (ce < need) break;
+                                if (session->exp.compare_exchange_weak(ce, ce - need)) { session->level.fetch_add(1); int nm = session->max_hp.fetch_add(20) + 20; session->hp.store(nm); lup = true; }
+                            }
+                            if (lup) {
+                                S2C_LevelUp lvl; lvl.size = sizeof(lvl); lvl.type = S2C_LEVEL_UP; lvl.object_id = client_id; lvl.new_level = session->level.load(); lvl.new_max_hp = session->max_hp.load();
+                                unordered_set<int> lv_viewers; { lock_guard<mutex> lk2(session->view_lock); for (int v : session->view_list) if (!IsNpcId(v)) lv_viewers.insert(v); }
+                                for (int vid : lv_viewers) { ClientMap::const_accessor a; if (g_clients.find(a, vid)) a->second->do_send(lvl.size, &lvl); }
+                                session->do_send(lvl.size, &lvl);
+                            }
+                            S2C_StatusChange sc; sc.size = sizeof(sc); sc.type = S2C_STATUS_CHANGE; sc.object_id = client_id; sc.hp = session->hp.load(); sc.max_hp = session->max_hp.load(); sc.exp = session->exp.load(); sc.level = session->level.load();
+                            session->do_send(sc.size, &sc);
+                        }
+                    }
+                }
+            }
+        }
+        // --- 스킬 2: Line — 현재 방향 직선 SKILL_LINE_RANGE칸의 모든 NPC에 데미지 ---
+        else if (skill_id == 2) {
+            int damage = lv * SKILL_LINE_DAMAGE_PER_LEVEL;
+            unsigned char dir = session->direction.load();
+            // dir: 0=Down(y+1), 1=Left(x-1), 2=Right(x+1), 3=Up(y-1)
+            int ddx = 0, ddy = 0;
+            switch (dir) { case 0: ddy = 1; break; case 1: ddx = -1; break; case 2: ddx = 1; break; case 3: ddy = -1; break; }
+
+            for (int step = 1; step <= SKILL_LINE_RANGE; ++step) {
+                int tx = cx + ddx * step;
+                int ty = cy + ddy * step;
+                if (tx < 0 || tx >= WORLD_WIDTH || ty < 0 || ty >= WORLD_HEIGHT) break;
+                int sxx = tx / SECTOR_SIZE, sy = ty / SECTOR_SIZE;
+
+                vector<int> npc_ids;
+                { lock_guard<mutex> slk(g_sectors[sy][sxx].m_lock); for (int nid : g_sectors[sy][sxx].npcs) { NPC& n = GetNpc(nid); if (n.x == tx && n.y == ty) npc_ids.push_back(nid); } }
+
+                for (int nid : npc_ids) {
+                    NPC& n = GetNpc(nid);
+                    int new_hp = 0; short nx = 0, ny = 0; bool dealt = false;
+                    { lock_guard<mutex> nlk(n.view_lock); if (n.hp > 0) { n.hp -= damage; if (n.hp < 0) n.hp = 0; new_hp = n.hp; nx = n.x; ny = n.y; dealt = true; } }
+                    if (!dealt) continue;
+
+                    S2C_Damage dmg; dmg.size = sizeof(dmg); dmg.type = S2C_DAMAGE;
+                    dmg.attacker_id = client_id; dmg.target_id = nid; dmg.damage = damage; dmg.new_hp = new_hp; dmg.target_x = nx; dmg.target_y = ny;
+                    unordered_set<int> dv; { lock_guard<mutex> nlk(n.view_lock); for (int v : n.view_list) dv.insert(v); } dv.insert(client_id);
+                    for (int vid : dv) { ClientMap::const_accessor a; if (g_clients.find(a, vid)) a->second->do_send(dmg.size, &dmg); }
+
+                    if (new_hp == 0) {
+                        unordered_set<int> dv2;
+                        { lock_guard<mutex> nlk(n.view_lock); for (int v : n.view_list) dv2.insert(v); n.view_list.clear(); n.state = NpcFsmState::Dead; n.target_id = -1; }
+                        dv2.insert(client_id);
+                        for (int vid : dv2) { ClientMap::const_accessor a; if (g_clients.find(a, vid)) { lock_guard<mutex> vl(a->second->view_lock); a->second->view_list.erase(nid); } }
+                        n.active.store(false);
+                        RemoveObjectFromSector(nid, nx, ny, false);
+                        S2C_Death dpkt; dpkt.size = sizeof(dpkt); dpkt.type = S2C_DEATH; dpkt.object_id = nid; dpkt.death_x = nx; dpkt.death_y = ny;
+                        for (int vid : dv2) { ClientMap::const_accessor a; if (g_clients.find(a, vid)) a->second->do_send(dpkt.size, &dpkt); }
+                        { int rm2 = (n.type == NpcType::Boss) ? BOSS_RESPAWN_MS : NPC_RESPAWN_MS; g_timer_manager.Schedule(nid, TimerEventKind::NpcRespawn, rm2); }
+
+                        unsigned long long eg;
+                        if (n.type == NpcType::Boss) { eg = (1ULL << 30) * (unsigned long long)BOSS_EXP_MULTIPLIER; }
+                        else { eg = 1ULL << (n.level > 0 ? n.level - 1 : 0); if (n.type == NpcType::Agro) eg *= 2; if (n.move_mode == NpcMoveMode::Roaming) eg *= 2; }
+                        session->exp.fetch_add(eg);
+                        bool lup = false;
+                        while (true) { unsigned char cl = session->level.load(); unsigned long long need = 100ULL << (cl - 1); unsigned long long ce = session->exp.load(); if (ce < need) break; if (session->exp.compare_exchange_weak(ce, ce - need)) { session->level.fetch_add(1); int nm = session->max_hp.fetch_add(20) + 20; session->hp.store(nm); lup = true; } }
+                        if (lup) {
+                            S2C_LevelUp lvl; lvl.size = sizeof(lvl); lvl.type = S2C_LEVEL_UP; lvl.object_id = client_id; lvl.new_level = session->level.load(); lvl.new_max_hp = session->max_hp.load();
+                            unordered_set<int> lv_viewers; { lock_guard<mutex> lk2(session->view_lock); for (int v : session->view_list) if (!IsNpcId(v)) lv_viewers.insert(v); }
+                            for (int vid : lv_viewers) { ClientMap::const_accessor a; if (g_clients.find(a, vid)) a->second->do_send(lvl.size, &lvl); }
+                            session->do_send(lvl.size, &lvl);
+                        }
+                        S2C_StatusChange sc; sc.size = sizeof(sc); sc.type = S2C_STATUS_CHANGE; sc.object_id = client_id; sc.hp = session->hp.load(); sc.max_hp = session->max_hp.load(); sc.exp = session->exp.load(); sc.level = session->level.load();
+                        session->do_send(sc.size, &sc);
+                    }
+                }
+            }
+        }
+        // --- 스킬 3: Heal — 자신 HP를 max_hp의 30% 회복 ---
+        else if (skill_id == 3) {
+            int max_hp = session->max_hp.load();
+            int heal = max_hp * SKILL_HEAL_PERCENT / 100;
+            int cur_hp = session->hp.load();
+            int new_hp = min(max_hp, cur_hp + heal);
+            session->hp.store(new_hp);
+
+            S2C_StatusChange sc; sc.size = sizeof(sc); sc.type = S2C_STATUS_CHANGE;
+            sc.object_id = client_id; sc.hp = new_hp; sc.max_hp = max_hp;
+            sc.exp = session->exp.load(); sc.level = session->level.load();
+            session->do_send(sc.size, &sc);
+        }
+        break;
+    }
     case C2S_CHAT: {
         C2S_Chat* p = reinterpret_cast<C2S_Chat*>(ptr);
 
@@ -1875,7 +2199,9 @@ void process_packet(int client_id, unsigned char* ptr) {
         break;
     }
     case C2S_LOGOUT: {
+#if VERBOSE_CLIENT_EVENTS
         cout << "[Logout] Client " << client_id << " requested logout." << endl;
+#endif
         // closesocket → IO 실패 → disconnect 경로가 view_list 정리/Remove 전송 담당
         closesocket(session->socket);
         break;

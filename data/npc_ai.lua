@@ -9,7 +9,7 @@
 --   target_id, target_x, target_y,
 --   nearest_id, nearest_x, nearest_y, nearest_dist
 
-print("[lua] npc_ai.lua loaded (Lua " .. _VERSION .. ")")
+print("[lua] npc_ai.lua loaded (Lua " .. _VERSION .. " — Boss AI included)")
 
 math.randomseed(os.time())
 
@@ -110,4 +110,90 @@ function OnTick(ctx)
 
     -- Fixed (또는 Peace + 대기): 가만히
     return 0, 0, -1
+end
+
+-- ============================================================
+-- Stage 7.2: 보스 AI
+-- OnBossTick(ctx) → dx, dy, target_id, chat_id, do_boss_aoe
+--   chat_id: 0=없음, 1=도발1, 2=도발2, 3=분노선언, 4=포효
+--   do_boss_aoe: 0=없음, 1=이번 틱 AoE 발동
+-- ============================================================
+
+local BOSS_TAUNT = {
+    "You dare enter my domain?!",
+    "I will crush you!",
+    "None shall pass!",
+    "Your courage is admirable... and foolish.",
+}
+local BOSS_ENRAGE = "ENRAGED!! Witness my true power!!"
+local BOSS_ROAR   = "ROARRR!!"
+
+local function boss_step_toward(ctx)
+    if ctx.target_x == -1 then return 0, 0 end
+    local dx, dy = step_toward(ctx.x, ctx.y, ctx.target_x, ctx.target_y)
+    if would_step_onto(ctx, dx, dy, ctx.target_x, ctx.target_y) then
+        return 0, 0
+    end
+    return dx, dy
+end
+
+function OnBossTick(ctx)
+    local tick       = ctx.boss_tick_count
+    local hp_pct     = (ctx.max_hp > 0) and (ctx.hp / ctx.max_hp) or 0
+    local phase2     = (hp_pct <= 0.5)
+
+    local do_aoe  = 0
+    local chat_id = 0
+
+    -- AoE 발동 주기: BOSS_AOE_INTERVAL 틱마다 1회 (C++에서 BOSS_AOE_INTERVAL_TICKS 노출)
+    if ctx.target_id ~= -1 and tick > 0 and (tick % BOSS_AOE_INTERVAL) == 0 then
+        do_aoe = 1
+    end
+
+    -- 분노 2단계 진입 선언 (체력이 딱 50% 이하가 됐을 때, tick 1회만)
+    if phase2 then
+        if tick > 0 and (tick % BOSS_CHAT_INTERVAL) == 0 then
+            -- 분노 채팅 교대로 출력
+            local idx = math.floor(tick / BOSS_CHAT_INTERVAL) % 4
+            if idx == 0 then chat_id = 4   -- ROAR
+            elseif idx == 1 then chat_id = 1
+            elseif idx == 2 then chat_id = 2
+            else chat_id = 3 end
+        end
+        -- 분노 2단계 진입 첫 틱 선언
+        if tick == 0 then chat_id = 3 end
+    else
+        -- 1단계: 전투 시작 시 도발 (target 첫 설정 틱 = target_id 설정되고 tick==1일 때)
+        if ctx.target_id ~= -1 and tick % 20 == 1 then
+            chat_id = (tick % 4) + 1
+        end
+    end
+
+    -- 이동: 항상 현재 target 또는 가장 가까운 플레이어 추적
+    if ctx.target_id ~= -1 then
+        if ctx.target_x == -1 then
+            return 0, 0, -1, 0, 0
+        end
+        local dx, dy = boss_step_toward(ctx)
+        return dx, dy, ctx.target_id, chat_id, do_aoe
+    end
+
+    -- Agro 트리거: 보스는 더 넓은 범위(BOSS_AGRO_RANGE)
+    if ctx.nearest_id ~= -1 and ctx.nearest_dist >= 0
+       and ctx.nearest_dist <= BOSS_AGRO_RANGE then
+        local dx, dy = step_toward(ctx.x, ctx.y, ctx.nearest_x, ctx.nearest_y)
+        if would_step_onto(ctx, dx, dy, ctx.nearest_x, ctx.nearest_y) then
+            dx, dy = 0, 0
+        end
+        -- 보스는 고정 위치지만 주변 이동 허용 (spawn ±BOSS_AGRO_RANGE)
+        if math.abs(ctx.x + dx - ctx.spawn_x) > BOSS_AGRO_RANGE then dx = 0 end
+        if math.abs(ctx.y + dy - ctx.spawn_y) > BOSS_AGRO_RANGE then dy = 0 end
+        chat_id = 1  -- 첫 타겟 잡을 때 도발
+        return dx, dy, ctx.nearest_id, chat_id, do_aoe
+    end
+
+    -- 비전투: 스폰 위치로 복귀
+    local dx, dy = step_toward(ctx.x, ctx.y, ctx.spawn_x, ctx.spawn_y)
+    if ctx.x == ctx.spawn_x and ctx.y == ctx.spawn_y then dx, dy = 0, 0 end
+    return dx, dy, -1, 0, 0
 end

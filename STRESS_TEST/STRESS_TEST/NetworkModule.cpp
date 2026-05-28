@@ -91,9 +91,8 @@ void error_display(const char* msg, int err_no)
 	std::cout << msg;
 	std::wcout << L"����" << lpMsgBuf << std::endl;
 
-	MessageBox(hWnd, lpMsgBuf, L"ERROR", 0);
+	// MessageBox 팝업은 스트레스 테스트를 블로킹하므로 제거 — 콘솔 출력만 유지
 	LocalFree(lpMsgBuf);
-	// while (true);
 }
 
 void DisconnectClient(int ci)
@@ -177,6 +176,7 @@ void ProcessPacket(int ci, unsigned char packet[])
 	case S2C_DEATH: break;
 	case S2C_RESPAWN: break;
 	case S2C_LEVEL_UP: break;
+	case S2C_SKILL_EFFECT: break;  // Stage 7: 스킬 이펙트 — 더미 클라는 무시
 	case S2C_AVATAR_INFO:
 	{
 		g_clients[ci].connected = true;
@@ -327,7 +327,7 @@ void Adjust_Number_Of_Client()
 
 	int Result = WSAConnect(g_clients[num_connections].client_socket, (sockaddr*)&ServerAddr, sizeof(ServerAddr), NULL, NULL, NULL, NULL);
 	if (0 != Result) {
-		error_display("WSAConnect : ", GetLastError());
+		error_display("WSAConnect : ", WSAGetLastError());
 	}
 
 	g_clients[num_connections].curr_packet_size = 0;

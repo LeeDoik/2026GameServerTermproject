@@ -31,7 +31,7 @@ constexpr int NPC_BASE_DAMAGE = 5;           // NPC 데미지 = level * 5 (플�
 
 // 사망 시 리스폰 위치 (Aetheria Village 분수 남쪽 — 분수 sprite 위에 안 겹치게)
 constexpr short PLAYER_SPAWN_X = 1000;
-constexpr short PLAYER_SPAWN_Y = 1010;
+constexpr short PLAYER_SPAWN_Y = 1002;
 
 // 시작 마을(Aetheria Village) 영역. 외벽은 obstacles.txt에 정의.
 // 신규 캐릭은 이 영역 안에서 walkable 좌표로 스폰.
@@ -42,3 +42,28 @@ constexpr short VILLAGE_Y2 = 1040;
 
 // Stage 6.3: DB 자동 저장 주기 (30초)
 constexpr int PLAYER_AUTO_SAVE_INTERVAL_MS = 30000;
+
+// Stage 7.2: 보스 시스템
+constexpr int BOSS_COUNT              = 4;        // 바이옴 당 1마리, 총 4마리
+constexpr int BOSS_RESPAWN_MS         = 300000;   // 5분 리스폰 (일반 NPC는 30초)
+constexpr int BOSS_AGRO_RANGE         = 10;       // Agro 감지 반경 (일반: 5)
+constexpr int BOSS_AOE_RANGE          = 3;        // AoE 타격 반경 (chebyshev)
+constexpr int BOSS_AOE_INTERVAL_TICKS = 5;        // AoE는 5틱마다 1회
+constexpr int BOSS_CHAT_INTERVAL_TICKS= 3;        // 분노 상태 채팅 주기 (틱)
+constexpr int BOSS_MAX_HP             = 5000;
+constexpr int BOSS_LEVEL              = 50;
+constexpr int BOSS_BASE_DAMAGE        = 30;       // 보스 기본 타격 데미지
+constexpr int BOSS_EXP_MULTIPLIER     = 20;       // 일반 EXP 공식에 추가로 20배
+
+// Stage 7: 스킬 시스템
+// skill_id=1: AoE — 시전자 중심 반경 3칸 이내 모든 NPC에 level*15 데미지 (쿨 3초)
+// skill_id=2: Line — 현재 방향 직선 5칸 경로의 모든 NPC에 level*20 데미지 (쿨 3초)
+// skill_id=3: Heal — 자신 HP를 max_hp의 30% 즉시 회복 (쿨 10초)
+constexpr int SKILL_AOE_COOLDOWN_MS  = 3000;
+constexpr int SKILL_LINE_COOLDOWN_MS = 3000;
+constexpr int SKILL_HEAL_COOLDOWN_MS = 10000;
+constexpr int SKILL_AOE_RANGE        = 2;    // 반경 (chebyshev) — 5x5 정사각형
+constexpr int SKILL_LINE_RANGE       = 5;    // 직선 타일 수
+constexpr int SKILL_AOE_DAMAGE_PER_LEVEL  = 15;
+constexpr int SKILL_LINE_DAMAGE_PER_LEVEL = 20;
+constexpr int SKILL_HEAL_PERCENT          = 30; // max_hp의 30%

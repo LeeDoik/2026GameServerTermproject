@@ -12,7 +12,7 @@ constexpr int MAX_CHAT_MSG_LEN = 200;
 
 enum PACKET_TYPE {
 	C2S_LOGIN,			// Client to Server: Login request
-	// ����� �̸��� ������ �α��� ��û ��Ŷ	
+	// ����� �̸��� ������ �α��� ��û ��Ŷ
 	C2S_MOVE,			// Client to Server: Move request
 	// �̵� ����� �̵� �ð��� ������ �̵� ��û ��Ŷ
 	C2S_CHAT,			// Client to Server: Chat message
@@ -23,11 +23,12 @@ enum PACKET_TYPE {
 	// �ڷ���Ʈ ��û ��Ŷ (������ ��ǥ ����)
 	// STRESS TEST������ �߰��� ��Ŷ�Դϴ�. ���� ������ ������ ���� ����.
 	C2S_LOGOUT,			// Client to Server: Logout request
+	C2S_USE_SKILL,		// Client to Server: Skill use request (skill_id: 1=AoE, 2=Line, 3=Heal)
 
 	S2C_LOGIN_RESULT,	//	Server to Client: Login result
 	// �α��� ��� ��Ŷ (���� ���ο� �޽��� ����)
 	S2C_AVATAR_INFO,	//	Server to Client: Avatar information
-	S2C_ADD_OBJECT,		//	Server to Client: Add player or NPC		
+	S2C_ADD_OBJECT,		//	Server to Client: Add player or NPC
 	S2C_REMOVE_OBJECT,	//	Server to Client: Remove player or NPC
 	S2C_MOVE_OBJECT,	//	Server to Client: Move player or NPC
 	S2C_CHAT_MESSAGE,	//	Server to Client: Chat message
@@ -37,6 +38,7 @@ enum PACKET_TYPE {
 	S2C_DEATH,			//	Server to Client: 엔티티 사망 (브로드캐스트)
 	S2C_RESPAWN,		//	Server to Client: 엔티티 리스폰 (브로드캐스트)
 	S2C_LEVEL_UP,		//	Server to Client: 레벨업 알림 (브로드캐스트) — 클라가 burst 이펙트
+	S2C_SKILL_EFFECT,	//	Server to Client: 스킬 발동 통지 (브로드캐스트) — 클라가 스킬 이펙트 재생
 };
 
 #pragma pack(push, 1) // Ensure no padding between struct members
@@ -75,6 +77,12 @@ struct C2S_Teleport {
 struct C2S_Logout {
 	unsigned char size;
 	PACKET_TYPE   type;
+};
+
+struct C2S_UseSkill {
+	unsigned char size;
+	PACKET_TYPE   type;
+	unsigned char skill_id; // 1=AoE(3칸반경), 2=Line(방향5칸), 3=Heal(자신HP30%회복)
 };
 
 struct S2C_LoginResult {
@@ -190,6 +198,19 @@ struct S2C_LevelUp {
 	int object_id;
 	unsigned char new_level;
 	int new_max_hp;
+};
+
+// 스킬 발동 통지. 클라가 skill_id에 따라 이펙트 재생.
+// skill_id: 1=AoE(화염원형), 2=Line(관통빔), 3=Heal(골드오라)
+// direction: 0=Down 1=Left 2=Right 3=Up (Line 스킬 경로 표시에 사용)
+struct S2C_SkillEffect {
+	unsigned char size;
+	PACKET_TYPE   type;
+	int object_id;       // 시전자 ID
+	unsigned char skill_id;
+	unsigned char direction; // 시전자 방향 (Line 빔 진행 방향)
+	short x;             // 시전 위치
+	short y;
 };
 
 #pragma pack(pop) // Restore default packing

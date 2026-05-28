@@ -2,6 +2,7 @@
 #include "NpcSpawner.h"
 #include "World.h"
 #include "Map.h"
+#include "GameConfig.h"
 #include "../protocol_2026.h"
 
 #include <cstdio>
@@ -17,6 +18,7 @@ namespace {
 bool ParseType(const char* s, NpcType& out) {
     if (_stricmp(s, "Peace") == 0) { out = NpcType::Peace; return true; }
     if (_stricmp(s, "Agro")  == 0) { out = NpcType::Agro;  return true; }
+    if (_stricmp(s, "Boss")  == 0) { out = NpcType::Boss;  return true; }
     return false;
 }
 bool ParseMoveMode(const char* s, NpcMoveMode& out) {
@@ -51,10 +53,12 @@ int LoadNpcSpawnScript(const char* path) {
         int count = 0;
         char type_s[32], move_s[32], name_s[32];
         int visual_id = 0;
+        int script_level = 1, script_hp = 100;
         int ax1 = 0, ay1 = 0, ax2 = 0, ay2 = 0;
-        int matched = std::sscanf(p, "%d %31s %31s %d %31s %d %d %d %d",
-            &count, type_s, move_s, &visual_id, name_s, &ax1, &ay1, &ax2, &ay2);
-        if (matched != 9) {
+        int matched = std::sscanf(p, "%d %31s %31s %d %31s %d %d %d %d %d %d",
+            &count, type_s, move_s, &visual_id, name_s,
+            &script_level, &script_hp, &ax1, &ay1, &ax2, &ay2);
+        if (matched != 11) {
             std::cerr << "[NpcSpawner] Line " << line_no << " parse error: " << line;
             continue;
         }
@@ -85,16 +89,36 @@ int LoadNpcSpawnScript(const char* path) {
                 return spawn_index;
             }
 
-            // Stage 6: 장애물 회피 — 무작위 추첨 후 IsBlocked면 재시도
+            // Fixed 모드: area 중심에 스폰 (위치가 예측 가능해야 보스 텔레포트가 정확함)
+            // Roaming 모드: 무작위 추첨 후 IsBlocked면 재시도
             short sx = 0, sy = 0;
             bool placed = false;
-            for (int attempt = 0; attempt < 32; ++attempt) {
-                short tx = static_cast<short>(dist_x(rng));
-                short ty = static_cast<short>(dist_y(rng));
-                if (!Map::IsBlocked(tx, ty)) {
-                    sx = tx; sy = ty;
-                    placed = true;
-                    break;
+            if (mode == NpcMoveMode::Fixed) {
+                short cx = static_cast<short>((ax1 + ax2) / 2);
+                short cy = static_cast<short>((ay1 + ay2) / 2);
+                if (!Map::IsBlocked(cx, cy)) {
+                    sx = cx; sy = cy; placed = true;
+                } else {
+                    // 중심이 막혀 있으면 주변 탐색
+                    for (int r = 1; r <= 5 && !placed; ++r) {
+                        for (int dy2 = -r; dy2 <= r && !placed; ++dy2) {
+                            for (int dx2 = -r; dx2 <= r && !placed; ++dx2) {
+                                short tx = cx + static_cast<short>(dx2);
+                                short ty = cy + static_cast<short>(dy2);
+                                if (!Map::IsBlocked(tx, ty)) { sx=tx; sy=ty; placed=true; }
+                            }
+                        }
+                    }
+                }
+            } else {
+                for (int attempt = 0; attempt < 32; ++attempt) {
+                    short tx = static_cast<short>(dist_x(rng));
+                    short ty = static_cast<short>(dist_y(rng));
+                    if (!Map::IsBlocked(tx, ty)) {
+                        sx = tx; sy = ty;
+                        placed = true;
+                        break;
+                    }
                 }
             }
             if (!placed) {
@@ -130,11 +154,20 @@ int LoadNpcSpawnScript(const char* path) {
             n.spawn_y = sy;
             n.x = sx;
             n.y = sy;
-            n.hp = 100;
-            n.max_hp = 100;
-            n.level = 1;
             n.target_id = -1;
             n.active.store(false);
+            n.boss_tick_count.store(0);
+
+            // 보스는 GameConfig 전용 스탯, 일반 NPC는 스크립트 값 사용
+            if (type == NpcType::Boss) {
+                n.hp = BOSS_MAX_HP;
+                n.max_hp = BOSS_MAX_HP;
+                n.level = static_cast<unsigned char>(BOSS_LEVEL);
+            } else {
+                n.hp = script_hp;
+                n.max_hp = script_hp;
+                n.level = static_cast<unsigned char>(script_level);
+            }
 
             // name: "<prefix>_<id마지막 5자리>" 형태로 구별 가능하게
             std::snprintf(n.name, sizeof(n.name), "%s_%05d", name_s, spawn_index % 100000);

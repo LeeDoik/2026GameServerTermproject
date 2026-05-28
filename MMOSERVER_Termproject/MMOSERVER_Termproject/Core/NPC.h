@@ -5,7 +5,8 @@
 
 enum class NpcType : unsigned char {
     Peace,  // 피격 전까지 비공격 (Stage 5에서 Agro 전환 구현)
-    Agro    // 11x11 시야에 플레이어 진입 시 추적
+    Agro,   // 11x11 시야에 플레이어 진입 시 추적
+    Boss    // 특수 패턴: 광역 공격 + 2단계 분노 + 채팅, 5분 리스폰
 };
 
 enum class NpcMoveMode : unsigned char {
@@ -48,6 +49,9 @@ struct NPC : public Entity {
     char name[20];  // protocol MAX_NAME_LEN
     std::atomic<long long> last_attack_ms;  // NPC 공격 쿨타임용 (Stage 5)
 
+    // Stage 7.2 보스 전용: 분노 2단계 진입 여부 + 틱 카운터
+    std::atomic<int> boss_tick_count;       // 보스가 몇 번째 tick인지 (AoE/채팅 주기용)
+
     NPC()
         : Entity()
         , type(NpcType::Peace)
@@ -66,6 +70,7 @@ struct NPC : public Entity {
         , max_hp(100)
         , level(1)
         , last_attack_ms(0)
+        , boss_tick_count(0)
     {
         name[0] = '\0';
     }

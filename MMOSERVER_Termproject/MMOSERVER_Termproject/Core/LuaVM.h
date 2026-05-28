@@ -12,7 +12,7 @@
 // NPC AI tick 입력: C++가 Lua로 넘기는 정보
 struct NpcTickContext {
     int id;
-    int npc_type;        // 0=Peace, 1=Agro
+    int npc_type;        // 0=Peace, 1=Agro, 2=Boss
     int move_mode;       // 0=Fixed, 1=Roaming
     int x, y;
     int spawn_x, spawn_y;
@@ -21,12 +21,19 @@ struct NpcTickContext {
     int nearest_id;      // 가장 가까운 viewer (Agro 트리거 판정용, -1 = view 비어있음)
     int nearest_x, nearest_y;
     int nearest_dist;    // chebyshev distance
+    // 보스 전용 필드 (Boss 외 타입에서는 기본값 전달)
+    int hp;
+    int max_hp;
+    int boss_tick_count;
 };
 
 // NPC AI tick 결과: Lua가 C++로 돌려주는 결정
 struct NpcTickResult {
     int dx, dy;          // 한 칸 이동량 (-1, 0, +1)
     int target_id;       // 새 target_id (-1이면 추적 해제)
+    // 보스 전용 결과 (일반 NPC는 0)
+    int chat_id;         // 0=없음, 1~4 = 보스 대사 인덱스
+    int do_boss_aoe;     // 0=없음, 1=이번 틱 AoE 발동
 };
 
 class LuaVM {
@@ -45,6 +52,9 @@ public:
 
     // NPC AI tick: Lua의 OnTick(ctx) 호출. 실패 시 결과는 정지(dx=dy=0, target_id 유지)
     bool NpcTick(const NpcTickContext& ctx, NpcTickResult& out);
+
+    // 보스 AI tick: Lua의 OnBossTick(ctx) 호출. 5개 반환값 (dx,dy,target_id,chat_id,do_boss_aoe)
+    bool BossTick(const NpcTickContext& ctx, NpcTickResult& out);
 
     const std::string& GetLastError() const { return last_error_; }
 

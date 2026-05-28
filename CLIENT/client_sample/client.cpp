@@ -87,8 +87,12 @@ private:
     int m_attack_dir = HERO_DIR_DOWN;
     sf::Clock m_attack_clock;
 
+    float m_boss_scale = 1.0f;  // 보스는 5.0f (일반 크기의 5배)
+    bool m_is_npc = false;
+
 public:
     int m_x, m_y;
+    int m_hp = 0, m_max_hp = 0;
     int m_direction = HERO_DIR_DOWN;   // 미니맵 방향 화살표용 — public 노출
     char name[MAX_NAME_LEN];
     OBJECT(sf::Texture& t, int x, int y, int x2, int y2) {
@@ -122,11 +126,25 @@ public:
     // Stage 6.4: DCSS NPC sprite (32x32 단일 셀, 방향/애니메이션 없음). sheet의 col로 선택.
     void set_npc(sf::Texture& sheet, int col) {
         m_is_hero = false;
+        m_boss_scale = 1.0f;
+        m_is_npc = true;
         m_walk_tex = nullptr;
         m_attack_tex = nullptr;
         m_sprite.setTexture(sheet);
         m_sprite.setTextureRect(sf::IntRect(col * 32, 0, 32, 32));
         m_sprite.setScale((float)TILE_WIDTH / 32.0f, (float)TILE_WIDTH / 32.0f);
+    }
+
+    // 보스 전용: 오크 텍스처를 5배 크기로 렌더링
+    void set_boss(sf::Texture& orc_t) {
+        m_is_hero = true;
+        m_boss_scale = 5.0f;
+        m_is_npc = true;
+        m_walk_tex = &orc_t;
+        m_attack_tex = nullptr;
+        m_sprite.setTexture(orc_t);
+        m_sprite.setTextureRect(sf::IntRect(0, 0, HERO_TILE, HERO_TILE));
+        m_sprite.setScale(m_boss_scale, m_boss_scale);  // 64px × 5 = 320px
     }
 
     // 공격 모션 트리거. direction은 0~3 (Down/Left/Right/Up).
@@ -197,11 +215,62 @@ public:
 
         float rx = (m_x - g_left_x) * (float)TILE_WIDTH;
         float ry = (m_y - g_top_y) * (float)TILE_WIDTH;
+
+        // 보스는 스케일 유지 + 타일 중앙 정렬 (320px 스프라이트를 64px 타일 기준 중앙에 배치)
+        if (m_boss_scale > 1.0f) {
+            m_sprite.setScale(m_boss_scale, m_boss_scale);
+            float sprite_px = HERO_TILE * m_boss_scale;
+            float offset = (sprite_px - (float)TILE_WIDTH) * 0.5f;
+            rx -= offset;
+            ry -= offset;
+        }
+
         m_sprite.setPosition(rx, ry);
         g_window->draw(m_sprite);
         auto size = m_name.getGlobalBounds();
-        m_name.setPosition(rx + 32 - size.width / 2, ry - 10);
+        // 보스 이름은 스프라이트 상단 중앙
+        float name_cx = rx + (m_boss_scale > 1.0f ? HERO_TILE * m_boss_scale * 0.5f : 32.0f);
+        m_name.setPosition(name_cx - size.width / 2, ry - 14);
         g_window->draw(m_name);
+
+        // NPC/보스 HP 바
+        if (m_is_npc && m_max_hp > 0) {
+            float ratio = std::max(0.0f, std::min(1.0f, (float)m_hp / (float)m_max_hp));
+            float bar_w = (m_boss_scale > 1.0f) ? HERO_TILE * m_boss_scale : 48.0f;
+            float bar_h = (m_boss_scale > 1.0f) ? 8.0f : 5.0f;
+            float bar_x = rx + (m_boss_scale > 1.0f ? 0.0f : ((float)TILE_WIDTH - bar_w) / 2.0f);
+            float bar_y = ry - 22.0f;
+
+            sf::RectangleShape bg(sf::Vector2f(bar_w, bar_h));
+            bg.setFillColor(sf::Color(30, 30, 30, 200));
+            bg.setPosition(bar_x, bar_y);
+            g_window->draw(bg);
+
+            sf::Color hp_col = (ratio > 0.6f) ? sf::Color(50, 200, 50)
+                             : (ratio > 0.3f) ? sf::Color(220, 180, 30)
+                                              : sf::Color(220, 50, 50);
+            sf::RectangleShape fill(sf::Vector2f(bar_w * ratio, bar_h));
+            fill.setFillColor(hp_col);
+            fill.setPosition(bar_x, bar_y);
+            g_window->draw(fill);
+
+            // 보스만 수치 텍스트 표시
+            if (m_boss_scale > 1.0f) {
+                sf::Text hp_txt;
+                hp_txt.setFont(*g_font);
+                char buf[32];
+                sprintf_s(buf, "%d / %d", m_hp, m_max_hp);
+                hp_txt.setString(buf);
+                hp_txt.setCharacterSize(14);
+                hp_txt.setFillColor(sf::Color::White);
+                hp_txt.setOutlineColor(sf::Color::Black);
+                hp_txt.setOutlineThickness(1.5f);
+                sf::FloatRect b = hp_txt.getLocalBounds();
+                hp_txt.setOrigin(b.left + b.width / 2.0f, b.top + b.height / 2.0f);
+                hp_txt.setPosition(bar_x + bar_w / 2.0f, bar_y - 12.0f);
+                g_window->draw(hp_txt);
+            }
+        }
     }
 
     void set_name(const char str[]) {
@@ -225,7 +294,7 @@ sf::Sprite tile_sprite;
 constexpr int TILE_SRC_SIZE = 32;          // DCSS 원본 32x32, 화면에선 setScale 2.0으로 64px 출력
 constexpr int REGION_HALF   = WORLD_WIDTH / 2;  // 2000/2 = 1000 (지역 경계)
 
-// 장애물 sprite 시트 (Stage 6.4): 160x32 PNG, 5열 (NW crystal / SW boulder / NE sandstone / SE tree / Village brick), 각 32x32
+// 장애물 sprite 시트 (Stage 6.4): 160x32 PNG, 5열 (NW crystal / SW tree_1_yellow / NE sandstone / SE tree / Village brick), 각 32x32
 sf::Texture* obstacle_tex;
 sf::Sprite obstacle_sprite;
 
@@ -307,11 +376,26 @@ const WorldDeco g_decorations[] = {
     {  400,  500,  8, "", false }, {  800,  700,  8, "", false },
 };
 
-static bool client_is_blocked(int x, int y) {
+// obstacles.txt에 정의된 명시적 장애물 (rect 기반)
+static bool client_is_obstacle_bit(int x, int y) {
     if (g_obstacle_bits.empty()) return false;
     if (x < 0 || y < 0 || x >= WORLD_WIDTH || y >= WORLD_HEIGHT) return false;
     size_t idx = size_t(y) * WORLD_WIDTH + size_t(x);
     return ((g_obstacle_bits[idx >> 3] >> (idx & 7)) & 1u) != 0;
+}
+
+// Stage 6.4: 절차적 장식 (서버 Map::IsProceduralDeco와 동일 해시).
+// 마을 영역 제외, 하위 8비트 < 12면 deco. deco도 실제 장애물로 취급.
+static bool client_is_procedural_deco(int x, int y) {
+    if (x < 0 || y < 0 || x >= WORLD_WIDTH || y >= WORLD_HEIGHT) return false;
+    if (x >= VILLAGE_X1 && x < VILLAGE_X2 && y >= VILLAGE_Y1 && y < VILLAGE_Y2) return false;
+    unsigned int dh = (unsigned int)(x * 0x9E3779B1u) ^ (unsigned int)(y * 0x85EBCA77u);
+    return (dh & 0xFFu) < 12u;
+}
+
+// 종합 장애물 (obstacle bits OR 절차적 deco)
+static bool client_is_blocked(int x, int y) {
+    return client_is_obstacle_bit(x, y) || client_is_procedural_deco(x, y);
 }
 
 static bool load_obstacles_file(const char* path) {
@@ -367,9 +451,20 @@ sf::Texture* respawn_tex;    // 576x160, 6 프레임 96x160 (리스폰 빛기둥
 sf::Texture* levelup_tex;    // 896x128, 7 프레임 128x128 (레벨업 버스트)
 sf::Texture* slash_tex;      // 576x96,  6 프레임 96x96  (검 슬래시)
 
+// 스킬 이펙트 시트 (DCSS 32x32, scale=2.0으로 64px 출력)
+sf::Texture* skill_aoe_tex;     // 96x32,  3 프레임 — cloud_fire (AoE 화염)
+sf::Texture* skill_line_tex;    // 192x32, 6 프레임 — searing_ray (Line 관통빔)
+sf::Texture* skill_heal_tex;    // 96x32,  3 프레임 — goldaura (Heal 오라)
+sf::Texture* skill_sparkle_tex; // 96x32,  3 프레임 — gold_sparkles (Heal 스파클)
+
+// 기본 공격 이펙트 (DCSS 32x32, scale=2.0)
+sf::Texture* attack_player_tex; // 128x32, 4 프레임 — zap (플레이어 4방향 1칸 광역)
+sf::Texture* attack_npc_tex;    // 96x32,  3 프레임 — sandblast (NPC 정면 1칸)
+
 sf::Sprite hud_sprite;       // HUD 그리기용 재사용 sprite
 
 // 화면에 떠 있는 이펙트 1개. 시트 한 행을 프레임 순서대로 재생 후 자동 소멸.
+// start_delay_ms로 spawn 시점부터 일정 시간 대기 후 시작 가능 (폭발 퍼짐 효과용).
 struct Effect {
     sf::Sprite sprite;
     int frame_count;
@@ -377,13 +472,18 @@ struct Effect {
     int duration_ms;
     int world_x, world_y;     // 월드 타일 좌표
     int offset_x, offset_y;    // 그릴 때 타일 좌상단 기준 픽셀 보정
+    float scale = 1.0f;        // 렌더 배율 (DCSS 32x32 → 2.0f로 64x64)
+    int start_delay_ms = 0;    // 이 시간 지나기 전엔 보이지 않음
     sf::Clock clock;
 
+    long long active_ms() const {
+        return clock.getElapsedTime().asMilliseconds() - start_delay_ms;
+    }
     bool is_done() const {
-        return clock.getElapsedTime().asMilliseconds() >= duration_ms;
+        return active_ms() >= duration_ms;
     }
     int current_frame() {
-        long long ms = clock.getElapsedTime().asMilliseconds();
+        long long ms = active_ms();
         int f = (int)(ms * frame_count / duration_ms);
         if (f < 0) f = 0;
         if (f >= frame_count) f = frame_count - 1;
@@ -393,8 +493,11 @@ struct Effect {
         // 시야 밖이면 스킵 (이펙트는 진행하되 화면에는 안 그림)
         if (world_x < g_left_x || world_x >= g_left_x + SCREEN_WIDTH ||
             world_y < g_top_y || world_y >= g_top_y + SCREEN_HEIGHT) return;
+        // 시작 지연 중이면 안 그림 (delay queue 없이 spawn 큐를 통합)
+        if (active_ms() < 0) return;
         int f = current_frame();
         sprite.setTextureRect(sf::IntRect(f * frame_w, 0, frame_w, frame_h));
+        sprite.setScale(scale, scale);
         float rx = (world_x - g_left_x) * (float)TILE_WIDTH + offset_x;
         float ry = (world_y - g_top_y) * (float)TILE_WIDTH + offset_y;
         sprite.setPosition(rx, ry);
@@ -467,6 +570,160 @@ static void spawn_effect_slash(int wx, int wy) {
     g_effects.push_back(std::move(e));
 }
 
+// DCSS 32x32 시트를 scale=2.0으로 64px 출력하는 헬퍼 (offset은 자동 중앙 정렬)
+static Effect make_dcss_effect(sf::Texture* tex, int frame_count, int duration_ms, int wx, int wy) {
+    Effect e;
+    e.sprite.setTexture(*tex);
+    e.frame_count = frame_count;
+    e.frame_w = 32; e.frame_h = 32;
+    e.duration_ms = duration_ms;
+    e.world_x = wx; e.world_y = wy;
+    e.scale = 2.0f;  // 32x32 × 2 = 64x64 (TILE_WIDTH와 일치)
+    e.offset_x = 0;  // 64px 타일에 64px 이펙트 → offset 0
+    e.offset_y = 0;
+    return e;
+}
+
+// 스킬 1 AoE: cloud_fire로 시전자 중심 5x5 정사각형 25타일 전체 화염 이펙트
+// 서버 SKILL_AOE_RANGE=2 (chebyshev) → dx,dy ∈ [-2,2] 모두 데미지 → 이펙트도 동일 영역
+// 중심에서 거리(chebyshev)에 비례한 시작 지연으로 폭발이 외곽으로 퍼지는 느낌
+static void spawn_effect_skill_aoe(int wx, int wy) {
+    for (int dy = -2; dy <= 2; ++dy) {
+        for (int dx = -2; dx <= 2; ++dx) {
+            int cheb = std::max(std::abs(dx), std::abs(dy));
+            // 중심=800ms, 외곽으로 갈수록 짧고 늦게 — 코어가 가장 진하고 가장자리는 잔불 느낌
+            int dur   = 700 - cheb * 100;   // 700 / 600 / 500ms
+            int delay = cheb * 100;          // 0 / 100 / 200ms 지연
+            Effect e = make_dcss_effect(skill_aoe_tex, 3, dur, wx + dx, wy + dy);
+            e.start_delay_ms = delay;
+            g_effects.push_back(std::move(e));
+        }
+    }
+}
+
+// 스킬 2 Line: searing_ray를 방향 5칸에 연속 spawn
+static void spawn_effect_skill_line(int wx, int wy, int dir) {
+    // dir: 0=Down(dy+1), 1=Left(dx-1), 2=Right(dx+1), 3=Up(dy-1)
+    int ddx = 0, ddy = 0;
+    switch (dir) { case 0: ddy=1; break; case 1: ddx=-1; break; case 2: ddx=1; break; case 3: ddy=-1; break; }
+    for (int step = 1; step <= 5; ++step) {
+        int tx = wx + ddx * step;
+        int ty = wy + ddy * step;
+        g_effects.push_back(make_dcss_effect(skill_line_tex, 6, 600, tx, ty));
+    }
+    // 시전자 발사 지점에도 짧은 이펙트
+    g_effects.push_back(make_dcss_effect(skill_line_tex, 6, 300, wx, wy));
+}
+
+// 스킬 3 Heal: goldaura + sparkle 겹쳐서 황금빛 치유 표현
+static void spawn_effect_skill_heal(int wx, int wy) {
+    g_effects.push_back(make_dcss_effect(skill_heal_tex,    3, 900, wx, wy));
+    g_effects.push_back(make_dcss_effect(skill_sparkle_tex, 3, 700, wx, wy));
+}
+
+// 플레이어 기본 공격: zap 이펙트를 시전자 4방향 인접 1칸에 동시 spawn (광역 공격 표시)
+static void spawn_effect_attack_player(int wx, int wy) {
+    int offsets[4][2] = {{0,-1},{0,1},{-1,0},{1,0}};
+    for (auto& o : offsets)
+        g_effects.push_back(make_dcss_effect(attack_player_tex, 4, 350, wx + o[0], wy + o[1]));
+}
+
+// NPC 기본 공격: sandblast 이펙트를 공격 방향 1칸에만 spawn
+// dir: 0=Down(dy+1), 1=Left(dx-1), 2=Right(dx+1), 3=Up(dy-1)
+static void spawn_effect_attack_npc(int wx, int wy, int dir) {
+    int ddx = 0, ddy = 0;
+    switch (dir) { case 0: ddy=1; break; case 1: ddx=-1; break; case 2: ddx=1; break; case 3: ddy=-1; break; }
+    g_effects.push_back(make_dcss_effect(attack_npc_tex, 3, 350, wx + ddx, wy + ddy));
+}
+
+// ============================================================================
+// 화면 흔들기 (피격/사망/보스 AoE 시각화)
+// ============================================================================
+static sf::Clock g_shake_clock;
+static float g_shake_strength_px = 0.0f;
+static int g_shake_duration_ms = 0;
+
+static void trigger_shake(float strength, int duration_ms) {
+    // 더 강한 흔들기로 덮어씀. 약한 건 무시 (큰 흔들기 중 잔흔들기로 약해지지 않게).
+    if (strength > g_shake_strength_px) {
+        g_shake_strength_px = strength;
+        g_shake_duration_ms = duration_ms;
+        g_shake_clock.restart();
+    }
+}
+static sf::Vector2f get_shake_offset() {
+    if (g_shake_strength_px <= 0.0f) return { 0.f, 0.f };
+    int ms = g_shake_clock.getElapsedTime().asMilliseconds();
+    if (ms >= g_shake_duration_ms) { g_shake_strength_px = 0.0f; return { 0.f, 0.f }; }
+    float t = (float)ms / (float)g_shake_duration_ms;     // 0..1
+    float amp = g_shake_strength_px * (1.0f - t);          // 선형 감쇠
+    float fx = std::sin(ms * 0.071f) + 0.5f * std::sin(ms * 0.137f);
+    float fy = std::cos(ms * 0.083f) + 0.5f * std::cos(ms * 0.151f);
+    return { amp * fx, amp * fy };
+}
+
+// ============================================================================
+// 데미지 숫자 popup (S2C_DAMAGE 수신 시 떠오르는 텍스트)
+// ============================================================================
+struct FloatingDamage {
+    int wx, wy;
+    int value;
+    sf::Color color;
+    sf::Clock clock;
+    int duration_ms = 900;
+    float jitter_x = 0.0f;
+
+    bool is_done() const { return clock.getElapsedTime().asMilliseconds() >= duration_ms; }
+    void draw() {
+        if (wx < g_left_x - 1 || wx >= g_left_x + SCREEN_WIDTH + 1 ||
+            wy < g_top_y  - 1 || wy >= g_top_y  + SCREEN_HEIGHT + 1) return;
+        int ms = clock.getElapsedTime().asMilliseconds();
+        float t = std::min(1.0f, (float)ms / (float)duration_ms);
+        float rise = -48.0f * t;
+        float alpha = 1.0f;
+        if (t > 0.6f) alpha = 1.0f - (t - 0.6f) / 0.4f;
+        sf::Color c = color;
+        float a255 = alpha * 255.0f;
+        if (a255 < 0.0f) a255 = 0.0f; else if (a255 > 255.0f) a255 = 255.0f;
+        c.a = (sf::Uint8)a255;
+        sf::Text txt;
+        txt.setFont(*g_font);
+        txt.setString(std::to_string(value));
+        txt.setCharacterSize(22);
+        txt.setStyle(sf::Text::Bold);
+        txt.setFillColor(c);
+        txt.setOutlineColor(sf::Color(0, 0, 0, c.a));
+        txt.setOutlineThickness(2.0f);
+        sf::FloatRect b = txt.getLocalBounds();
+        txt.setOrigin(b.left + b.width / 2.0f, b.top + b.height / 2.0f);
+        float px = (wx - g_left_x + 0.5f) * (float)TILE_WIDTH + jitter_x;
+        float py = (wy - g_top_y)  * (float)TILE_WIDTH + rise;
+        txt.setPosition(px, py);
+        g_window->draw(txt);
+    }
+};
+std::vector<FloatingDamage> g_dmg_popups;
+
+static void spawn_damage_popup(int wx, int wy, int dmg, sf::Color c) {
+    FloatingDamage d;
+    d.wx = wx; d.wy = wy;
+    d.value = dmg;
+    d.color = c;
+    d.jitter_x = (float)((std::rand() % 33) - 16);
+    g_dmg_popups.push_back(std::move(d));
+}
+
+// 스킬 클라이언트 쿨타임 (HUD 표시용)
+static sf::Clock g_skill1_clock;   // AoE (Q)
+static sf::Clock g_skill2_clock;   // Line (W)
+static sf::Clock g_skill3_clock;   // Heal (E)
+static bool g_skill1_used = false;
+static bool g_skill2_used = false;
+static bool g_skill3_used = false;
+constexpr int SKILL1_CD_MS = 3000;
+constexpr int SKILL2_CD_MS = 3000;
+constexpr int SKILL3_CD_MS = 10000;
+
 // 텍스처 로드 헬퍼: 경로 후보를 순서대로 시도해서 처음 성공한 것을 사용
 static bool LoadTextureWithFallback(sf::Texture* tex, const char* name,
                                     const char* subfolder)
@@ -505,7 +762,13 @@ void client_initialize()
     death_tex     = new sf::Texture;
     respawn_tex   = new sf::Texture;
     levelup_tex   = new sf::Texture;
-    slash_tex     = new sf::Texture;
+    slash_tex        = new sf::Texture;
+    skill_aoe_tex    = new sf::Texture;
+    skill_line_tex   = new sf::Texture;
+    skill_heal_tex   = new sf::Texture;
+    skill_sparkle_tex= new sf::Texture;
+    attack_player_tex= new sf::Texture;
+    attack_npc_tex   = new sf::Texture;
 
     if (!LoadTextureWithFallback(dungeon_tiles,  "dungeon-tiles-dcss.png",           "tiles"))     exit(-1);
     if (!LoadTextureWithFallback(obstacle_tex,     "obstacles-dcss.png",             "tiles"))     exit(-1);
@@ -527,7 +790,13 @@ void client_initialize()
     if (!LoadTextureWithFallback(death_tex,      "soul-death-effect-768x128.png",    "effects"))   exit(-1);
     if (!LoadTextureWithFallback(respawn_tex,    "respawn-pillar-576x160.png",       "effects"))   exit(-1);
     if (!LoadTextureWithFallback(levelup_tex,    "level-up-burst-896x128.png",       "effects"))   exit(-1);
-    if (!LoadTextureWithFallback(slash_tex,      "slash-effect-576x96.png",          "effects"))   exit(-1);
+    if (!LoadTextureWithFallback(slash_tex,       "slash-effect-576x96.png",          "effects"))   exit(-1);
+    if (!LoadTextureWithFallback(skill_aoe_tex,   "skill-aoe-fire-96x32.png",         "effects"))   exit(-1);
+    if (!LoadTextureWithFallback(skill_line_tex,  "skill-line-ray-192x32.png",        "effects"))   exit(-1);
+    if (!LoadTextureWithFallback(skill_heal_tex,  "skill-heal-gold-96x32.png",        "effects"))   exit(-1);
+    if (!LoadTextureWithFallback(skill_sparkle_tex,"skill-heal-sparkle-96x32.png",    "effects"))   exit(-1);
+    if (!LoadTextureWithFallback(attack_player_tex,"attack-player-zap-128x32.png",    "effects"))   exit(-1);
+    if (!LoadTextureWithFallback(attack_npc_tex,   "attack-npc-sandblast-96x32.png",  "effects"))   exit(-1);
 
     tile_sprite.setTexture(*dungeon_tiles);
     // DCSS 32x32 원본을 64px 칸에 정수배(2x) 업스케일. setSmooth(false)로 픽셀아트 보존.
@@ -600,6 +869,10 @@ void client_finish()
     delete respawn_tex;
     delete levelup_tex;
     delete slash_tex;
+    delete skill_aoe_tex;
+    delete skill_line_tex;
+    delete skill_heal_tex;
+    delete skill_sparkle_tex;
 }
 
 void send_packet(void* packet)
@@ -655,9 +928,12 @@ void ProcessPacket(char* ptr)
         // 다른 플레이어는 attack 시트도 전달 (공격 시 모션 재생됨)
         players[id] = OBJECT{};
         if (id >= NPC_ID_START) {
-            // Stage 6.4: visual_id (1~16) → DCSS 시트 column (0~15). 범위 밖이면 fallback orc.
+            // Stage 6.4: visual_id (1~16) → DCSS 시트 column (0~15).
+            // visual_id == 17: 보스 → 오크 텍스처 5배 크기
             int col = my_packet->visual_id - 1;
-            if (col >= 0 && col < 16) {
+            if (my_packet->visual_id == 17) {
+                players[id].set_boss(*orc_tex);  // 보스: 일반 몬스터의 5배
+            } else if (col >= 0 && col < 16) {
                 players[id].set_npc(*npcs_tex, col);
             } else {
                 players[id].set_hero(*orc_tex);  // unknown visual_id → 기존 orc
@@ -668,6 +944,10 @@ void ProcessPacket(char* ptr)
         }
         players[id].move(my_packet->x, my_packet->y);
         players[id].set_name(my_packet->obj_name);
+        if (id >= NPC_ID_START) {
+            players[id].m_hp = my_packet->hp;
+            players[id].m_max_hp = my_packet->max_hp;
+        }
         players[id].show();
         break;
     }
@@ -701,28 +981,42 @@ void ProcessPacket(char* ptr)
         S2C_AttackAnim* p = reinterpret_cast<S2C_AttackAnim*>(ptr);
         int aid = p->object_id;
         int dir = p->direction;
-        // 공격 위치(자기 자리)에 슬래시 이펙트도 같이 그림
+        bool is_npc = (aid >= NPC_ID_START);
+        int ax, ay;
         if (aid == g_myid) {
             avatar.on_attack(dir);
-            spawn_effect_slash(avatar.m_x, avatar.m_y);
-        }
-        else {
+            ax = avatar.m_x; ay = avatar.m_y;
+        } else {
             auto it = players.find(aid);
-            if (it != players.end()) {
-                it->second.on_attack(dir);
-                spawn_effect_slash(it->second.m_x, it->second.m_y);
-            }
+            if (it == players.end()) break;
+            it->second.on_attack(dir);
+            ax = it->second.m_x; ay = it->second.m_y;
         }
+        if (is_npc) spawn_effect_attack_npc(ax, ay, dir);
+        else        spawn_effect_attack_player(ax, ay);
         break;
     }
     case S2C_DAMAGE:
     {
         S2C_Damage* p = reinterpret_cast<S2C_Damage*>(ptr);
-        // 혈흔 이펙트는 target 위치에 (공격자가 아닌 맞은 쪽)
         spawn_effect_blood(p->target_x, p->target_y);
-        // HP는 자기가 맞은 경우만 갱신 (NPC HP는 클라가 직접 추적 안 함)
+
+        // 데미지 숫자 popup: 내가 입은 건 빨강, 내가 준 건 노랑, 그 외는 회색
+        sf::Color dmg_color;
+        if (p->target_id == g_myid)         dmg_color = sf::Color(255,  80,  80);
+        else if (p->attacker_id == g_myid)  dmg_color = sf::Color(255, 220,  80);
+        else                                dmg_color = sf::Color(220, 220, 220);
+        spawn_damage_popup(p->target_x, p->target_y, p->damage, dmg_color);
+
         if (p->target_id == g_myid) {
             g_my_hp = p->new_hp;
+            // 받은 데미지 크기에 비례한 화면 흔들기 (보스 AoE는 자연스럽게 큰 흔들기)
+            float strength = std::min(20.0f, 2.0f + p->damage * 0.4f);
+            int duration = std::min(500, 150 + p->damage * 5);
+            trigger_shake(strength, duration);
+        } else if (p->target_id >= NPC_ID_START) {
+            auto it = players.find(p->target_id);
+            if (it != players.end()) it->second.m_hp = p->new_hp;
         }
         break;
     }
@@ -743,6 +1037,7 @@ void ProcessPacket(char* ptr)
         spawn_effect_death(p->death_x, p->death_y);
         if (p->object_id == g_myid) {
             avatar.hide();  // Phase 3b에서 플레이어 사망/리스폰 처리 추가 예정
+            trigger_shake(18.0f, 600);  // 내가 죽으면 강한 임팩트
         }
         else {
             // 다른 엔티티(주로 NPC)는 화면에서 제거. 리스폰 시 S2C_ADD_OBJECT로 다시 생김
@@ -800,6 +1095,14 @@ void ProcessPacket(char* ptr)
             }
         }
         add_chat_line(sender + ": " + std::string(p->message));
+        break;
+    }
+    case S2C_SKILL_EFFECT:
+    {
+        S2C_SkillEffect* p = reinterpret_cast<S2C_SkillEffect*>(ptr);
+        if (p->skill_id == 1)      spawn_effect_skill_aoe(p->x, p->y);
+        else if (p->skill_id == 2) spawn_effect_skill_line(p->x, p->y, p->direction);
+        else if (p->skill_id == 3) spawn_effect_skill_heal(p->x, p->y);
         break;
     }
     }
@@ -1034,11 +1337,33 @@ static void draw_minimap() {
 static void draw_hud()
 {
     // 비율 계산 (max 0 가드)
-    float hp_ratio  = (g_my_max_hp > 0) ? std::min(1.0f, (float)g_my_hp / (float)g_my_max_hp) : 0.0f;
+    float hp_ratio_target  = (g_my_max_hp > 0) ? std::min(1.0f, (float)g_my_hp / (float)g_my_max_hp) : 0.0f;
     float mp_ratio  = 1.0f;  // MP 시스템은 아직 없음 — 일단 가득
-    unsigned long long max_exp = (unsigned long long)g_my_level * g_my_level * 2ull;
-    if (max_exp == 0) max_exp = 1;
-    float exp_ratio = std::min(1.0f, (float)g_my_exp / (float)max_exp);
+    unsigned long long max_exp = 100ULL << (g_my_level - 1);  // 100 × 2^(level-1)
+    float exp_ratio_target = std::min(1.0f, (float)g_my_exp / (float)max_exp);
+
+    // HP/EXP 보간: 매 프레임 target 쪽으로 lerp. 60fps 기준 약 150ms에 90% 도달.
+    static float displayed_hp_ratio  = 1.0f;
+    static float displayed_exp_ratio = 0.0f;
+    const float LERP = 0.18f;
+    displayed_hp_ratio  += (hp_ratio_target  - displayed_hp_ratio)  * LERP;
+    displayed_exp_ratio += (exp_ratio_target - displayed_exp_ratio) * LERP;
+    // 차이가 충분히 작으면 target에 스냅 (오래된 0.001 잔류 방지)
+    if (std::abs(hp_ratio_target  - displayed_hp_ratio)  < 0.002f) displayed_hp_ratio  = hp_ratio_target;
+    if (std::abs(exp_ratio_target - displayed_exp_ratio) < 0.002f) displayed_exp_ratio = exp_ratio_target;
+    float hp_ratio  = displayed_hp_ratio;
+    float exp_ratio = displayed_exp_ratio;
+
+    // 저체력(30% 미만) 경고: 빨강이 밝게 깜빡임 (sin 기반 ~0.5초 주기)
+    sf::Color hp_color(180, 30, 30);
+    if (hp_ratio_target < 0.30f && g_my_hp > 0) {
+        static sf::Clock pulse_clock;
+        float pulse_ms = (float)pulse_clock.getElapsedTime().asMilliseconds();
+        float pulse = 0.5f + 0.5f * std::sin(pulse_ms * 0.012f);
+        sf::Uint8 r  = (sf::Uint8)(180 + (255 - 180) * pulse);
+        sf::Uint8 gb = (sf::Uint8)(30  + (90  - 30 ) * pulse);
+        hp_color = sf::Color(r, gb, gb);
+    }
 
     // ---- 채팅 패널 (우상단, 512x192 → 320x120) ----
     constexpr float CHAT_W = 320.0f, CHAT_H = 120.0f;
@@ -1103,9 +1428,9 @@ static void draw_hud()
 
     sf::Color empty_bg(20, 10, 10, 240);  // 매우 어두운 적자색 (액체 비어있을 때 보임)
 
-    // HP 게이지 (빨강) — 좌측 구슬
+    // HP 게이지 (빨강) — 좌측 구슬. 저체력 시 hp_color가 sin 깜빡임.
     draw_circular_gauge(hp_x + ORB_SIZE * 0.5f, orb_y + ORB_SIZE * 0.5f, ORB_INNER_R,
-                        hp_ratio, sf::Color(180, 30, 30), empty_bg);
+                        hp_ratio, hp_color, empty_bg);
     hud_sprite.setTexture(*orb_tex, true);
     hud_sprite.setTextureRect(sf::IntRect(0, 0, 256, 256));  // HP는 좌측
     hud_sprite.setScale(0.5f, 0.5f);
@@ -1130,7 +1455,14 @@ static void draw_hud()
         float bar_x = (WINDOW_WIDTH - BAR_W) * 0.5f;
         float bar_y = WINDOW_HEIGHT - BAR_H - 8.0f;
 
-        // 채움 (안쪽 영역만, 비율만큼 — fill tile을 가로 반복하며 늘림)
+        // 프레임 먼저 (어두운 배경이 바닥에 깔림)
+        hud_sprite.setTexture(*exp_frame_tex, true);
+        hud_sprite.setTextureRect(sf::IntRect(0, 0, 1024, 48));
+        hud_sprite.setScale(BAR_W / 1024.0f, BAR_H / 48.0f);
+        hud_sprite.setPosition(bar_x, bar_y);
+        g_window->draw(hud_sprite);
+
+        // 채움 (프레임 위에, 안쪽 영역만, 비율만큼 — fill tile을 가로 반복하며 늘림)
         if (exp_ratio > 0.0f) {
             float fill_pixel_w = (BAR_W - INNER_PAD_X * 2.0f) * exp_ratio;
             float fill_pixel_h = BAR_H - INNER_PAD_Y * 2.0f;
@@ -1142,13 +1474,6 @@ static void draw_hud()
             fill.setPosition(bar_x + INNER_PAD_X, bar_y + INNER_PAD_Y);
             g_window->draw(fill);
         }
-
-        // 프레임
-        hud_sprite.setTexture(*exp_frame_tex, true);
-        hud_sprite.setTextureRect(sf::IntRect(0, 0, 1024, 48));
-        hud_sprite.setScale(BAR_W / 1024.0f, BAR_H / 48.0f);
-        hud_sprite.setPosition(bar_x, bar_y);
-        g_window->draw(hud_sprite);
 
         // 레벨 + EXP 텍스트 (EXP 바 가운데에 오버레이)
         {
@@ -1190,6 +1515,87 @@ static void draw_hud()
         lv.setPosition(center_hp, orb_y - 18.0f);
         g_window->draw(lv);
     }
+
+    // ---- 스킬 슬롯 HUD (하단 중앙 EXP 바 위쪽) ----
+    // Q/W/E 3칸. 쿨타임 중이면 어두운 오버레이 + 남은 초 표시
+    {
+        constexpr float SLOT_SIZE = 48.0f;
+        constexpr float SLOT_GAP  = 8.0f;
+        float total_w = SLOT_SIZE * 3 + SLOT_GAP * 2;
+        float slot_x0 = (WINDOW_WIDTH - total_w) * 0.5f;
+        float slot_y  = WINDOW_HEIGHT - 32.0f - SLOT_SIZE - 12.0f;  // EXP 바 바로 위
+
+        const char* labels[3]   = { "Q", "W", "E" };
+        sf::Clock*  clocks[3]   = { &g_skill1_clock, &g_skill2_clock, &g_skill3_clock };
+        bool*       used[3]     = { &g_skill1_used,  &g_skill2_used,  &g_skill3_used };
+        int         cds[3]      = { SKILL1_CD_MS, SKILL2_CD_MS, SKILL3_CD_MS };
+        sf::Color   slot_colors[3] = {
+            sf::Color(200, 60, 60),    // Q AoE — 빨강
+            sf::Color(60, 120, 220),   // W Line — 파랑
+            sf::Color(60, 180, 80)     // E Heal — 초록
+        };
+
+        sf::Text sk_txt;
+        sk_txt.setFont(*g_font);
+        sk_txt.setCharacterSize(16);
+        sk_txt.setStyle(sf::Text::Bold);
+        sk_txt.setOutlineColor(sf::Color::Black);
+        sk_txt.setOutlineThickness(2.0f);
+
+        for (int i = 0; i < 3; ++i) {
+            float sx = slot_x0 + i * (SLOT_SIZE + SLOT_GAP);
+
+            // 배경 슬롯
+            sf::RectangleShape slot(sf::Vector2f(SLOT_SIZE, SLOT_SIZE));
+            slot.setFillColor(sf::Color(30, 30, 30, 200));
+            slot.setOutlineColor(slot_colors[i]);
+            slot.setOutlineThickness(2.0f);
+            slot.setPosition(sx, slot_y);
+            g_window->draw(slot);
+
+            long long elapsed = clocks[i]->getElapsedTime().asMilliseconds();
+            bool on_cd = *used[i] && (elapsed < cds[i]);
+
+            // 쿨타임 오버레이
+            if (on_cd) {
+                float cd_ratio = 1.0f - (float)elapsed / cds[i];
+                sf::RectangleShape overlay(sf::Vector2f(SLOT_SIZE, SLOT_SIZE * cd_ratio));
+                overlay.setFillColor(sf::Color(0, 0, 0, 160));
+                overlay.setPosition(sx, slot_y);
+                g_window->draw(overlay);
+
+                // 남은 초
+                char rem[8];
+                int rem_s = (cds[i] - (int)elapsed + 999) / 1000;
+                sprintf_s(rem, "%ds", rem_s);
+                sk_txt.setString(rem);
+                sk_txt.setFillColor(sf::Color(220, 220, 220));
+            } else {
+                sk_txt.setFillColor(sf::Color::White);
+            }
+
+            // 키 레이블
+            sk_txt.setString(labels[i]);
+            sf::FloatRect b2 = sk_txt.getLocalBounds();
+            sk_txt.setOrigin(b2.left + b2.width / 2.0f, b2.top + b2.height / 2.0f);
+            sk_txt.setPosition(sx + SLOT_SIZE / 2.0f, slot_y + SLOT_SIZE - 14.0f);
+            g_window->draw(sk_txt);
+
+            // 쿨타임 중이면 숫자도 중앙에 표시
+            if (on_cd) {
+                int rem_s = (cds[i] - (int)elapsed + 999) / 1000;
+                char rem[8]; sprintf_s(rem, "%d", rem_s);
+                sk_txt.setString(rem);
+                sk_txt.setCharacterSize(22);
+                sf::FloatRect b3 = sk_txt.getLocalBounds();
+                sk_txt.setOrigin(b3.left + b3.width / 2.0f, b3.top + b3.height / 2.0f);
+                sk_txt.setPosition(sx + SLOT_SIZE / 2.0f, slot_y + SLOT_SIZE / 2.0f - 6.0f);
+                sk_txt.setFillColor(sf::Color(255, 200, 100));
+                g_window->draw(sk_txt);
+                sk_txt.setCharacterSize(16);  // 복원
+            }
+        }
+    }
 }
 
 void client_main()
@@ -1202,6 +1608,13 @@ void client_main()
 
     if (recv_result != sf::Socket::NotReady)
         if (received > 0) process_data(net_buf, received);
+
+    // 화면 흔들기 적용: 게임 월드/캐릭터/이펙트는 흔들리는 view로, HUD는 기본 view로
+    sf::View default_view = g_window->getDefaultView();
+    sf::View shake_view = default_view;
+    sf::Vector2f shake_off = get_shake_offset();
+    shake_view.move(shake_off.x, shake_off.y);
+    g_window->setView(shake_view);
 
     for (int i = 0; i < SCREEN_WIDTH; ++i) {
         for (int j = 0; j < SCREEN_HEIGHT; ++j)
@@ -1240,20 +1653,30 @@ void client_main()
                 g_window->draw(g_village_floor);
             }
 
-            // 장애물 sprite (Stage 6.4 DCSS) — 지역/마을 외벽에 따라 column 선택
-            if (client_is_blocked(tile_x, tile_y)) {
+            // 명시적 장애물 (obstacles.txt rect) — 지역/마을 외벽에 따라 column 선택
+            if (client_is_obstacle_bit(tile_x, tile_y)) {
                 int obs_col;
                 bool in_village = (tile_x >= VILLAGE_X1 && tile_x < VILLAGE_X2 &&
                                    tile_y >= VILLAGE_Y1 && tile_y < VILLAGE_Y2);
                 if (in_village) {
                     obs_col = 4;  // brick (마을 외벽)
                 } else {
-                    // 0=NW설원(crystal) / 1=SW초원(boulder) / 2=NE사막(sandstone) / 3=SE숲(tree)
+                    // 0=NW설원(crystal) / 1=SW초원(tree_1_yellow) / 2=NE사막(sandstone) / 3=SE숲(tree)
                     obs_col = (tile_x >= REGION_HALF ? 2 : 0) + (tile_y >= REGION_HALF ? 1 : 0);
                 }
                 obstacle_sprite.setTextureRect(sf::IntRect(obs_col * 32, 0, 32, 32));
                 obstacle_sprite.setPosition((float)(TILE_WIDTH * i), (float)(TILE_WIDTH * j));
                 g_window->draw(obstacle_sprite);
+            }
+            // Stage 6.4: 절차적 장식 (장애물로 취급 — 서버/클라 동일 해시)
+            else if (client_is_procedural_deco(tile_x, tile_y)) {
+                // region 0=NW(crystal) / 1=SW(flowers) / 2=NE(column) / 3=SE(tree)
+                int rr = (tile_x >= REGION_HALF ? 2 : 0) + (tile_y >= REGION_HALF ? 1 : 0);
+                static const int kRegionDecoCol[4] = { 8, 10, 9, 11 };
+                int deco_col = kRegionDecoCol[rr];
+                landmark_sprite.setTextureRect(sf::IntRect(deco_col * 32, 0, 32, 32));
+                landmark_sprite.setPosition((float)(TILE_WIDTH * i), (float)(TILE_WIDTH * j));
+                g_window->draw(landmark_sprite);
             }
         }
     }
@@ -1369,6 +1792,16 @@ void client_main()
         }
     }
 
+    // 데미지 숫자 popup 그리기 (흔들리는 view 상태에서 — 라벨과 함께 흔들림)
+    for (auto& d : g_dmg_popups) d.draw();
+    g_dmg_popups.erase(
+        std::remove_if(g_dmg_popups.begin(), g_dmg_popups.end(),
+                       [](const FloatingDamage& d) { return d.is_done(); }),
+        g_dmg_popups.end());
+
+    // HUD는 흔들리지 않게 기본 view로 복원
+    g_window->setView(default_view);
+
     // 좌표 텍스트는 미니맵 하단 헤더로 이동 — 별도 그리기 제거
     draw_minimap();
     draw_hud();
@@ -1441,18 +1874,38 @@ int main()
                 case sf::Keyboard::Num2:  target_y += 10; teleported = true; break;
                 case sf::Keyboard::Num3:  target_x -= 10; teleported = true; break;
                 case sf::Keyboard::Num4:  target_x += 10; teleported = true; break;
-                // 디버그용 이펙트 트리거: 5=혈흔 / 6=사망 / 7=리스폰 / 8=레벨업 / 9=슬래시
+                // 디버그용 이펙트 트리거: 5=혈흔
                 case sf::Keyboard::Num5:  spawn_effect_blood(avatar.m_x, avatar.m_y);   break;
-                case sf::Keyboard::Num6:  spawn_effect_death(avatar.m_x, avatar.m_y);   break;
-                case sf::Keyboard::Num7:  spawn_effect_respawn(avatar.m_x, avatar.m_y); break;
-                case sf::Keyboard::Num8:  spawn_effect_levelup(avatar.m_x, avatar.m_y); break;
-                case sf::Keyboard::Num9:  spawn_effect_slash(avatar.m_x, avatar.m_y);   break;
+                // 보스 텔레포트: 6=SW초원 GrassBoss / 7=SE숲 ForestBoss / 8=NE사막 DesertBoss / 9=NW설원 IceBoss
+                case sf::Keyboard::Num6:  target_x = 500;  target_y = 1402; teleported = true; break;
+                case sf::Keyboard::Num7:  target_x = 1500; target_y = 1402; teleported = true; break;
+                case sf::Keyboard::Num8:  target_x = 1500; target_y = 402;  teleported = true; break;
+                case sf::Keyboard::Num9:  target_x = 500;  target_y = 402;  teleported = true; break;
                 // A키 = 공격 (인접 4타일 NPC 동시 데미지). 서버가 쿨타임 검증.
                 case sf::Keyboard::A: {
                     C2S_Attack ap;
                     ap.size = sizeof(ap);
                     ap.type = C2S_ATTACK;
                     send_packet(&ap);
+                    break;
+                }
+                // Q = 스킬 1 (AoE 3칸 반경), W = 스킬 2 (방향 직선 5칸), E = 스킬 3 (Heal 30%)
+                case sf::Keyboard::Q: {
+                    C2S_UseSkill sk; sk.size = sizeof(sk); sk.type = C2S_USE_SKILL; sk.skill_id = 1;
+                    send_packet(&sk);
+                    g_skill1_clock.restart(); g_skill1_used = true;
+                    break;
+                }
+                case sf::Keyboard::W: {
+                    C2S_UseSkill sk; sk.size = sizeof(sk); sk.type = C2S_USE_SKILL; sk.skill_id = 2;
+                    send_packet(&sk);
+                    g_skill2_clock.restart(); g_skill2_used = true;
+                    break;
+                }
+                case sf::Keyboard::E: {
+                    C2S_UseSkill sk; sk.size = sizeof(sk); sk.type = C2S_USE_SKILL; sk.skill_id = 3;
+                    send_packet(&sk);
+                    g_skill3_clock.restart(); g_skill3_used = true;
                     break;
                 }
                 case sf::Keyboard::Escape: window.close(); break;

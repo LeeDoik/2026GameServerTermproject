@@ -1,7 +1,7 @@
 # Aetheria Online MMO 서버 재설계 계획
 
-> 최종 업데이트: 2026-05-24
-> Stage 1~5 완료. Stage 6 (Map + A* + DB JSON stub) 완료. SQL Server 백엔드는 선택사항.
+> 최종 업데이트: 2026-05-28
+> Stage 1~6 완료. Stage 7.1 스킬 / 7.2 보스 / 7.3 클라 이펙트 완성도 강화 완료. SQL Server 백엔드는 선택사항.
 
 ---
 
@@ -20,7 +20,10 @@
 | Stage 6.1 — 장애물 맵 (Map.h/.cpp + obstacles.txt) | ✅ 완료 | 64 rect / 5.18% 점유, 200K NPC 회피 스폰, 30초 stress 0 신규 에러 |
 | Stage 6.2 — A* 길찾기 (4방향 격자, bbox+8 / 256 노드 한도) | ✅ 완료 | NPC Agro 추적 시 막힌 경로 자동 우회. 1767줄 / 0 신규 에러 |
 | Stage 6.3 — DB 영속성 (JSON 파일 stub + IDbBackend 추상화) | ✅ 완료 | LOGIN 비동기화, 30초간 586개 JSON 저장, 1765줄 / 0 신규 에러 |
-| Stage 7 — 가산점 (스킬/보스/파티/아이템/퀘스트) | ⏳ 보류 | |
+| Stage 7.1 — 스킬 시스템 (AoE/Line/Heal) | ✅ 완료 | Q/W/E 3스킬, 서버 핸들러 + 클라 이펙트/HUD |
+| Stage 7.2 — 보스 패턴 (이동/채팅/AoE/2단계) | ✅ 완료 | 바이옴별 보스 4마리, Lua 2단계 분노 AI + 광역공격 |
+| Stage 7.3 — 클라 이펙트 완성도 강화 | ✅ 완료 | 공격 이펙트 분리(zap/sandblast), 데미지 popup, 화면흔들기, HP보간/저체력경고, Q스킬 5×5 폭발 |
+| Stage 7 — 가산점 (파티/아이템/퀘스트) | ⏳ 보류 | |
 
 **현재 부하 테스트 결과** (Stage 6.1 완료 시점, 2026-05-24): Release x64 기준 30초간 약 580+ connect / 신규 stderr 에러 0건. 200K NPC 활성 + 64개 장애물 rect (5.18% 점유) + 충돌 체크 통합 상태에서 Stage 5 대비 성능 회귀 없음.
 
@@ -430,7 +433,33 @@ PDF 기본 스펙을 코드/스크립트로 모두 반영. AI 결정 로직은 C
 
 ---
 
-### ⏳ Stage 7 — 가산점 추가 요소 — *게임성 40점이 최종 점수 가른다*
+### ✅ Stage 7.1 — 스킬 시스템 (완료, 2026-05-25)
+
+**신규 패킷 2종** (`protocol_2026.h`):
+- `C2S_UseSkill` (skill_id: 1=AoE, 2=Line, 3=Heal)
+- `S2C_SkillEffect` (object_id, skill_id, x, y)
+
+**서버 (`MMOSERVER_Termproject.cpp` + `Core/GameConfig.h`)**:
+- `Player`: `last_skill1_ms / last_skill2_ms / last_skill3_ms` atomic 쿨타임 필드 추가
+- `C2S_USE_SKILL` 핸들러:
+  - 스킬 1 AoE: 시전자 중심 반경 3칸(chebyshev) 내 모든 NPC에 `level*15` 데미지. 사망/EXP/레벨업까지 C2S_ATTACK와 동일 플로우. 쿨 3초.
+  - 스킬 2 Line: 현재 방향 직선 5칸의 모든 NPC에 `level*20` 데미지. 쿨 3초.
+  - 스킬 3 Heal: 자신 HP를 `max_hp*30%` 회복 후 StatusChange 전송. 쿨 10초.
+  - 성공 시 시야 내 플레이어 전원에게 `S2C_SkillEffect` 브로드캐스트
+- `GameConfig.h`: `SKILL_AOE_COOLDOWN_MS`, `SKILL_LINE_COOLDOWN_MS`, `SKILL_HEAL_COOLDOWN_MS`, `SKILL_AOE_RANGE=3`, `SKILL_LINE_RANGE=5`, `SKILL_AOE_DAMAGE_PER_LEVEL=15`, `SKILL_LINE_DAMAGE_PER_LEVEL=20`, `SKILL_HEAL_PERCENT=30`
+
+**클라이언트 (`client.cpp`)**:
+- Q=AoE / W=Line / E=Heal 키 입력 → `C2S_UseSkill` 전송 + 클라 쿨타임 시계 시작
+- `S2C_SkillEffect` 수신 시 스킬별 이펙트 재생 (AoE=levelup_tex, Line=slash_tex, Heal=respawn_tex 재활용)
+- 스킬 슬롯 HUD 3칸 (화면 하단 EXP 바 위에): 쿨타임 오버레이 + 남은 초 표시
+
+**STRESS_TEST**: `S2C_SKILL_EFFECT` no-op 케이스 추가
+
+**검증**: 서버/클라/스트레스 모두 Release x64 0 에러 빌드 성공
+
+---
+
+### ⏳ Stage 7 — 나머지 가산점 추가 요소 — *게임성 40점이 최종 점수 가른다*
 
 | 우선순위 | 항목 | 점수 | 권장 이유 |
 |---|---|---|---|
@@ -442,6 +471,97 @@ PDF 기본 스펙을 코드/스크립트로 모두 반영. AI 결정 로직은 C
 | F | 퀘스트 풀세트 | 25점 | 슬레이/대화/연쇄 — 시간 많이 필요 |
 
 **전략**: A→B→C→D 순으로 안전 30점 확보 후 시간 남으면 E/F.
+
+---
+
+### ✅ Stage 7.2 — 보스 패턴 (완료, 2026-05-25)
+
+**설계**:
+- 바이옴별 보스 1마리씩 총 4마리 (GrassBoss/ForestBoss/DesertBoss/IceBoss)
+- Level 50, HP 5000. 스폰 위치 Fixed (죽어도 제자리 부활)
+- Agro 감지 반경 10칸 (일반 NPC의 2배)
+
+**보스 AI (Lua `OnBossTick`)**:
+- Phase 1 (HP > 50%): 광범위 Agro 추적 + 20틱마다 도발 채팅
+- Phase 2 (HP ≤ 50%): 분노 선언 + 3틱마다 채팅 교대 출력
+- 5틱마다 반경 3칸 AoE 데미지 (BOSS_BASE_DAMAGE=30)
+- 비전투 시 스폰 위치로 복귀 이동
+
+**서버 처리**:
+- `NpcOnMove`에서 Boss 타입 분기 → `BossTick` 호출
+- `chat_id` 결과 → `S2C_CHAT_MESSAGE` 시야 내 전원 브로드캐스트
+- `do_boss_aoe` 결과 → 반경 내 플레이어에 데미지 + `S2C_DAMAGE`
+- 사망 리스폰: 5분 (`BOSS_RESPAWN_MS=300000`)
+- EXP: 일반 공식 × 20배 (`BOSS_EXP_MULTIPLIER=20`)
+
+**변경 파일**:
+- `Core/NPC.h` — `NpcType::Boss` 추가, `boss_tick_count` atomic 필드
+- `Core/GameConfig.h` — BOSS_* 상수 9종
+- `Core/LuaVM.h/.cpp` — ctx 확장(hp/max_hp/boss_tick_count), result 확장(chat_id/do_boss_aoe), `BossTick()` 메서드
+- `Core/NpcSpawner.cpp` — Boss 파싱, 보스 스탯 초기화
+- `data/npc_spawn.txt` — 4마리 보스 추가 (총 200000 유지)
+- `data/npc_ai.lua` — `OnBossTick()` 함수 (2단계 AI)
+- `MMOSERVER_Termproject.cpp` — NpcOnMove 보스 분기, AoE/채팅, 사망 리스폰/EXP
+
+---
+
+### ✅ Stage 7.3 — 클라이언트 이펙트 완성도 강화 (완료, 2026-05-28)
+
+게임성 점수 + 시각적 임팩트 강화를 위해 클라 이펙트 시스템을 다음 5가지 축으로 보강. 모든 변경은 `CLIENT/client_sample/client.cpp`에 집중되며, 서버는 `GameConfig.h`의 SKILL_AOE_RANGE 1개만 변경.
+
+**1) 공격 이펙트 분리 (플레이어 vs NPC)**:
+- 기존: `spawn_effect_slash(wx, wy)`가 플레이어/NPC 구분 없이 같은 슬래시 시트로 시전자 자기 자리에 그림
+- 신규 텍스처 (DCSS effect/에서 추출 후 PowerShell System.Drawing으로 시트 생성):
+  - `Resource/effects/attack-player-zap-128x32.png` — zap_0~3 (4프레임 32×32) 가로 합본
+  - `Resource/effects/attack-npc-sandblast-96x32.png` — sandblast_0~2 (3프레임 32×32) 가로 합본
+- `spawn_effect_attack_player(wx, wy)`: 시전자 4방향 인접 1칸(상/하/좌/우) **동시 spawn** — 광역 공격 시각화
+- `spawn_effect_attack_npc(wx, wy, dir)`: 공격 방향 1칸**에만** spawn (dir 0=Down/1=Left/2=Right/3=Up)
+- `S2C_ATTACK_ANIM` 핸들러에서 `aid >= NPC_ID_START`로 분기. NPC도 ATTACK_ANIM에 direction 동봉되어 있음 (`protocol_2026.h:155`)
+
+**2) 데미지 숫자 floating popup**:
+- `FloatingDamage` 구조체 + `g_dmg_popups` 벡터. duration 900ms
+- 색상: 내가 입은 데미지 = 빨강 `(255,80,80)`, 내가 준 = 노랑 `(255,220,80)`, 제3자 = 회색 `(220,220,220)`
+- 위로 떠오름(최대 -48px) + 60% 이후 알파 페이드아웃
+- 동시 데미지 겹침 방지: `jitter_x = rand() % 33 - 16`
+- `S2C_DAMAGE` 핸들러에서 `spawn_damage_popup(target_x, target_y, damage, color)` 호출
+
+**3) 화면 흔들기 (Screen Shake)**:
+- `g_shake_strength_px`, `g_shake_duration_ms`, `g_shake_clock` + `trigger_shake(strength, dur)` API
+- 감쇠: 선형(1.0 → 0.0) × 다중 sin/cos 진동 (주파수 0.071/0.137/0.083/0.151)
+- 더 강한 흔들기로 덮어쓰기 (약한 잔흔들기로 약화되지 않음)
+- 트리거 지점:
+  - 내가 데미지 받음: `strength = min(20, 2 + dmg*0.4)`, `dur = min(500, 150 + dmg*5)` — 보스 30데미지는 자연스럽게 강한 흔들림
+  - 내가 죽음: `trigger_shake(18.0f, 600)` (S2C_DEATH)
+- 통합 방식: `sf::View`로 게임 월드만 흔들고 HUD 직전에 `setView(default_view)`로 복원 — HUD/미니맵은 흔들리지 않음
+
+**4) HP/EXP 게이지 보간 + 저체력 경고**:
+- `draw_hud()` 내 `static displayed_hp_ratio / displayed_exp_ratio` 보간 상태
+- 매 프레임 `displayed += (target - displayed) * 0.18` lerp (60fps 기준 ~150ms에 90% 도달)
+- 잔류 0.002 미만이면 target에 스냅 (떠다니는 오래된 잔류 방지)
+- HP < 30% 시: 빨강 게이지가 sin 기반 0.5초 주기로 `(180,30,30) ↔ (255,90,90)` 밝게 깜빡임. 사망 상태(`hp == 0`)는 제외
+
+**5) Effect start_delay_ms + Q스킬 폭발 퍼짐**:
+- `Effect` 구조체에 `start_delay_ms` 필드 추가. `active_ms() = clock.ms - start_delay_ms`로 통합 계산. 음수면 draw skip + is_done 미만으로 처리 — 별도 pending queue 없이 1개 큐로 spawn 시점부터 지연 가능
+- 서버 `SKILL_AOE_RANGE` 3 → 2 (chebyshev 2 = 시전자 중심 5×5 = 25타일). 데미지/쿨타임은 그대로 (`level*15` / 3초)
+- `spawn_effect_skill_aoe`를 십자형 17타일 → 5×5 전체 25타일 채움으로 재작성
+- 폭발 퍼짐: 중심부터 외곽으로 단계별 spawn
+  - cheb 0 (1타일): delay 0ms, duration 700ms
+  - cheb 1 (8타일): delay 100ms, duration 600ms
+  - cheb 2 (16타일): delay 200ms, duration 500ms
+- 결과: 시전 시점에 중심부터 ka-pow 하고 0.2초에 걸쳐 가장자리로 퍼지며 잔불 사라짐
+
+**검증**:
+- Release x64 서버/클라 모두 빌드 성공 (C4819 워닝만 — 한글 주석 인코딩)
+- 30초 stress 회귀는 별도 수행 안 함 — 클라 전용 변경이라 서버 부하 영향 없음
+- 수동 검증 권장: 워리어로 A공격 시 4방향 zap, NPC가 공격 시 방향 1칸 sandblast, 데미지 숫자 색 구분, 보스 만나서 강한 흔들기 + HP 30%에서 깜빡임, Q 스킬 5×5 폭발 퍼짐
+
+**변경 파일**:
+- `MMOSERVER_Termproject/.../Core/GameConfig.h` — `SKILL_AOE_RANGE 3 → 2`
+- `CLIENT/client_sample/client.cpp` — Effect 구조체 확장, 신규 함수 7개 (`trigger_shake / get_shake_offset / spawn_damage_popup / spawn_effect_attack_player / spawn_effect_attack_npc + FloatingDamage`), HUD 보간 + sin 깜빡임 로직, S2C_ATTACK_ANIM/DAMAGE/DEATH 핸들러 갱신
+- `Resource/effects/attack-player-zap-128x32.png`, `attack-npc-sandblast-96x32.png` — 신규 시트 (PowerShell로 합본)
+
+**잔존 자산 (안 쓰지만 보존)**:
+- `slash_tex` / `spawn_effect_slash` — 호출처 없어졌지만 텍스처/함수는 남겨둠. 추후 크리티컬 히트나 보스 처치 연출에 재활용 가능
 
 ---
 
@@ -529,22 +649,29 @@ MMOSERVER_Termproject/MMOSERVER_Termproject/
 
 ---
 
-## 우선순위 TOP 3 (남은 작업 기준, 2026-05-24 업데이트)
+## 우선순위 TOP 3 (남은 작업 기준, 2026-05-28 업데이트)
 
-### 1순위: **Stage 7 가산점 (게임성 40점) — Stage 6 완료, 이제 추가 점수 확보 단계**
-- PDF 명시 항목 (IOCP/타이머/스크립트/시야/AI/A\*/DB) 전부 충족
-- 다음 우선순위: 스크립트 NPC 배치(✅ 이미) → 스킬(10점) → 보스(5~10점) → 파티(10점) → 아이템(20)/퀘스트(25)
+**현재 상태**: PDF 명시 항목(IOCP/타이머/스크립트/시야/AI/A\*/DB) 전부 충족 + 스킬·보스·시각 완성도 강화 완료. 다음 작업은 모두 게임성 가산점 영역.
+
+### 1순위: **파티 시스템 (10점)** — 가장 빠른 점수 확보
+- 새 패킷: C2S_PartyInvite / S2C_PartyJoin / S2C_PartyLeave / C2S_PartyLeave
+- 파티 EXP 분배(시야 내 파티원 균등 분배 or 기여도 기반), 파티원 위치를 미니맵에 다른 색으로 표시
+- NPC/맵 추가 작업 없이 패킷 + 로직만으로 점수 확보 가능
+
+### 2순위: **아이템 시스템 (20점)**
+- DB 스키마 확장: PlayerSnapshot에 inventory[] / equipped[] 추가 (JSON 백엔드는 배열 직렬화 추가만 하면 됨)
+- 신규 패킷: S2C_ItemDrop / C2S_PickUp / S2C_ItemAdd / C2S_UseItem / C2S_EquipItem
+- 소모(포션) → 누적(스택) → 인벤 UI → 장착 UI 단계적 진행
+
+### 3순위: **퀘스트 시스템 (25점)** — 최대 점수지만 가장 시간 소요
+- 슬레이/대화/연쇄 등 풀세트 필요
+- 마을 NPC와 대화 — 이미 g_village_npcs 4명 있으니 그 위에 쌓을 수 있음
 
 ### (선택) SQL Server 백엔드
 - 현재는 JSON 파일 stub. 채점 환경에 SQL Server 있으면 OdbcBackend 추가만 하면 교체 (IDbBackend 인터페이스 그대로)
 
-### 2순위: **Stage 7 가산점 (게임성 40점 영역)**
-- 효율 순: 스크립트 NPC 배치(✅ 이미) → 스킬(10점) → 보스(5~10점) → 파티(10점)
-- 안전 확보 30점 후 시간 남으면 아이템(20)·퀘스트(25)
-
-### 3순위 (보조): **STRESS_TEST 강화**
-- 현재 더미는 이동/로그인만. 채팅/공격/사망 발화 추가하면 Stage 5 시스템 부하 측정 가능
-- 멀티 클라 시각 회귀 검증 도구로도 활용
+### (보조) STRESS_TEST 강화
+- 현재 더미는 이동/로그인만. 채팅/공격/스킬 발화 추가하면 Stage 5+/7.1 시스템 부하 측정 가능
 
 ---
 
