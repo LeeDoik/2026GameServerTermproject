@@ -9,6 +9,7 @@ constexpr int NPC_ID_START = 1000000;
 constexpr int NPC_MOVE_INTERVAL = 1000; // in milliseconds
 constexpr int MAX_NAME_LEN = 20;
 constexpr int MAX_CHAT_MSG_LEN = 200;
+constexpr int MAX_INVENTORY_SLOTS = 20; // Stage 8: 인벤토리 슬롯 수 (S2C_Inventory 패킷 크기 < 256 보장)
 
 enum PACKET_TYPE {
 	C2S_LOGIN,			// Client to Server: Login request
@@ -45,6 +46,15 @@ enum PACKET_TYPE {
 	S2C_SKILL_EFFECT,	//	Server to Client: 스킬 발동 통지 (브로드캐스트) — 클라가 스킬 이펙트 재생
 	S2C_PARTY_INVITED,	//	Server to Client: 파티 초대 수신 알림
 	S2C_PARTY_UPDATE,	//	Server to Client: 파티 상태 변경 (0=joined, 1=left, 2=disbanded)
+
+	// Stage 8: 아이템 시스템
+	C2S_PICKUP,			// Client to Server: 근처 바닥 아이템 줍기
+	C2S_USE_ITEM,		// Client to Server: 인벤 슬롯 아이템 사용 (slot)
+	C2S_EQUIP_ITEM,		// Client to Server: 인벤 슬롯 아이템 장착 (slot)
+	C2S_UNEQUIP_ITEM,	// Client to Server: 장착 해제 (which: 0=weapon, 1=armor)
+	S2C_ITEM_DROP,		// Server to Client: 바닥 아이템 생성 (drop_id/item_id/x/y)
+	S2C_ITEM_REMOVE,	// Server to Client: 바닥 아이템 제거 (줍힘/만료)
+	S2C_INVENTORY,		// Server to Client: 인벤토리 + 장착 전체 스냅샷 (본인 전용)
 };
 
 #pragma pack(push, 1) // Ensure no padding between struct members
@@ -245,6 +255,62 @@ struct S2C_PartyUpdate {
 	unsigned char event;
 	int member_id;
 	char member_name[MAX_NAME_LEN];
+};
+
+// === Stage 8: 아이템 패킷 ===
+struct C2S_PickUp {
+	unsigned char size;
+	PACKET_TYPE   type;
+};
+
+struct C2S_UseItem {
+	unsigned char size;
+	PACKET_TYPE   type;
+	unsigned char slot; // 인벤토리 슬롯 인덱스
+};
+
+struct C2S_EquipItem {
+	unsigned char size;
+	PACKET_TYPE   type;
+	unsigned char slot; // 인벤토리 슬롯 인덱스
+};
+
+struct C2S_UnequipItem {
+	unsigned char size;
+	PACKET_TYPE   type;
+	unsigned char which; // 0=weapon, 1=armor
+};
+
+// 바닥 아이템 생성. 클라가 (x,y)에 아이템 스프라이트를 그림.
+struct S2C_ItemDrop {
+	unsigned char size;
+	PACKET_TYPE   type;
+	int   drop_id;   // 바닥 아이템 고유 ID
+	int   item_id;   // 카탈로그 아이템 ID
+	short x;
+	short y;
+};
+
+// 바닥 아이템 제거 (줍힘/만료).
+struct S2C_ItemRemove {
+	unsigned char size;
+	PACKET_TYPE   type;
+	int drop_id;
+};
+
+struct InvSlotNet {
+	int item_id;
+	int qty;
+};
+
+// 인벤토리 + 장착 전체 스냅샷 (본인에게만). 변경 시마다 전체 재전송.
+struct S2C_Inventory {
+	unsigned char size;
+	PACKET_TYPE   type;
+	unsigned char count;                    // 사용 중인 슬롯 수 (0..MAX_INVENTORY_SLOTS)
+	InvSlotNet    slots[MAX_INVENTORY_SLOTS];
+	int           equipped_weapon_id;       // -1 = 없음
+	int           equipped_armor_id;        // -1 = 없음
 };
 
 #pragma pack(pop) // Restore default packing

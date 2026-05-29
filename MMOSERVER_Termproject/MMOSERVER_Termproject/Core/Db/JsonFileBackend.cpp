@@ -66,6 +66,31 @@ bool ReadInt(const char* p, long long& out) {
     return end != p;
 }
 
+// "inventory":[[id,qty],[id,qty],...] 형태의 정수쌍 배열을 파싱.
+void ReadIntPairArray(const char* p, std::vector<std::pair<int, int>>& out) {
+    out.clear();
+    if (*p != '[') return;
+    ++p;
+    while (*p && *p != ']') {
+        while (*p == ' ' || *p == ',' || *p == '\t') ++p;
+        if (*p == ']' || *p == '\0') break;
+        if (*p != '[') break;  // 형식 오류 — 중단
+        ++p;
+        char* end = nullptr;
+        long a = std::strtol(p, &end, 10);
+        if (end == p) break;
+        p = end;
+        while (*p == ' ' || *p == ',' || *p == '\t') ++p;
+        long b = std::strtol(p, &end, 10);
+        if (end == p) break;
+        p = end;
+        while (*p && *p != ']') ++p;  // inner ']'까지 스킵
+        if (*p == ']') ++p;           // inner ']' 소비
+        out.emplace_back(static_cast<int>(a), static_cast<int>(b));
+        if (out.size() > 64) break;   // 안전 상한
+    }
+}
+
 } // anon
 
 JsonFileBackend::JsonFileBackend(std::string root_dir) : root_dir_(std::move(root_dir)) {
@@ -126,6 +151,11 @@ IDbBackend::LoadResult JsonFileBackend::Load(const std::string& username, Player
     if (const char* p = FindKey(json, "x"))       { if (ReadInt(p, v)) out.x = static_cast<short>(v); }
     if (const char* p = FindKey(json, "y"))       { if (ReadInt(p, v)) out.y = static_cast<short>(v); }
 
+    // Stage 8: 아이템 (키 없으면 기본값 — 구버전 JSON 호환)
+    if (const char* p = FindKey(json, "weapon"))    { if (ReadInt(p, v)) out.equipped_weapon_id = static_cast<int>(v); }
+    if (const char* p = FindKey(json, "armor"))     { if (ReadInt(p, v)) out.equipped_armor_id  = static_cast<int>(v); }
+    if (const char* p = FindKey(json, "inventory")) { ReadIntPairArray(p, out.inventory); }
+
     res.ok = true;
     res.exists = true;
     return res;
@@ -139,17 +169,31 @@ bool JsonFileBackend::Save(const PlayerSnapshot& snap) {
     FILE* fp = std::fopen(tmp.c_str(), "wb");
     if (!fp) return false;
 
-    // 외부 라이브러리 없이 6개 필드 one-liner JSON. username은 안전화된 키 그대로 사용.
+    // Stage 8: inventory 배열 직렬화 → [[id,qty],...]
+    std::string inv = "[";
+    for (size_t i = 0; i < snap.inventory.size(); ++i) {
+        char tmp[48];
+        std::snprintf(tmp, sizeof(tmp), "%s[%d,%d]",
+            (i ? "," : ""), snap.inventory[i].first, snap.inventory[i].second);
+        inv += tmp;
+    }
+    inv += "]";
+
+    // 외부 라이브러리 없이 one-liner JSON. username은 안전화된 키 그대로 사용.
     int n = std::fprintf(
         fp,
-        "{\"username\":\"%s\",\"hp\":%d,\"max_hp\":%d,\"exp\":%llu,\"level\":%u,\"x\":%d,\"y\":%d}\n",
+        "{\"username\":\"%s\",\"hp\":%d,\"max_hp\":%d,\"exp\":%llu,\"level\":%u,\"x\":%d,\"y\":%d,"
+        "\"inventory\":%s,\"weapon\":%d,\"armor\":%d}\n",
         SafeUsername(snap.username).c_str(),
         snap.hp,
         snap.max_hp,
         static_cast<unsigned long long>(snap.exp),
         static_cast<unsigned int>(snap.level),
         static_cast<int>(snap.x),
-        static_cast<int>(snap.y));
+        static_cast<int>(snap.y),
+        inv.c_str(),
+        snap.equipped_weapon_id,
+        snap.equipped_armor_id);
     std::fclose(fp);
 
     if (n <= 0) {

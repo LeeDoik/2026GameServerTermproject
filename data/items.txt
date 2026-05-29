@@ -1,0 +1,22 @@
+# Aetheria Online — 아이템 카탈로그 (Stage 8)
+# 형식: id  name  type  value  stack_max  drop_weight
+#   type        : 0=Consumable(소모), 1=Weapon(무기), 2=Armor(방어구)
+#   value       : Consumable=회복 HP / Weapon=공격력 보너스 / Armor=최대 HP 보너스
+#   stack_max   : 한 슬롯에 누적 가능한 최대 개수 (소모품만 >1)
+#   drop_weight : 랜덤 드롭 가중치 (0=랜덤 드롭 안 함). 낮은 티어일수록 큰 값.
+#
+# id 규약: 1~9 소모품 / 10~19 무기 / 20~29 방어구
+
+# --- 소모품 (Consumable) ---
+1   HealthPotion       0   50    99   40
+2   GreatHealthPotion  0   150   99   15
+
+# --- 무기 (Weapon) : value = 공격력 보너스 ---
+10  RustySword         1   5     1    20
+11  IronSword          1   15    1    8
+12  MythrilBlade       1   30    1    2
+
+# --- 방어구 (Armor) : value = 최대 HP 보너스 ---
+20  LeatherArmor       2   30    1    20
+21  ChainMail          2   80    1    8
+22  PlateArmor         2   150   1    2

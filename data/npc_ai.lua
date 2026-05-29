@@ -11,7 +11,9 @@
 
 print("[lua] npc_ai.lua loaded (Lua " .. _VERSION .. " — Boss AI included)")
 
-math.randomseed(os.time())
+-- [perf] 워커별 VM마다 C++가 주입한 고유 시드 사용. 모든 워커가 같은 로밍 시퀀스를
+-- 도는 것을 방지(없으면 os.time fallback — 단일 VM/구버전 호환).
+math.randomseed(WORKER_SEED or os.time())
 
 local function clamp_step(diff)
     if diff > 0 then return 1

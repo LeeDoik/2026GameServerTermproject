@@ -67,3 +67,8 @@ constexpr int SKILL_LINE_RANGE       = 5;    // 직선 타일 수
 constexpr int SKILL_AOE_DAMAGE_PER_LEVEL  = 15;
 constexpr int SKILL_LINE_DAMAGE_PER_LEVEL = 20;
 constexpr int SKILL_HEAL_PERCENT          = 30; // max_hp의 30%
+
+// Stage 8: 아이템 시스템
+constexpr int GROUND_ITEM_EXPIRE_MS = 60000;   // 바닥 아이템 60초 후 자동 소멸
+constexpr int ITEM_PICKUP_RANGE     = 1;       // 줍기 가능 거리 (manhattan)
+constexpr int DROP_ID_START         = 2000000; // 바닥 아이템 ID 시작 (player<1e6, npc<1.2e6과 분리)

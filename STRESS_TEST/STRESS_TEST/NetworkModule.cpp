@@ -20,7 +20,7 @@ using namespace chrono;
 
 extern HWND		hWnd;
 
-const static int MAX_TEST = 1000000;
+const static int MAX_TEST = 5000;   // 목표 동접 (채점 기준 5000 CCU. 도달 시 추가 접속 중단, 측정 지연이 높으면 자동 백오프)
 const static int MAX_CLIENTS = MAX_TEST * 2;
 const static int INVALID_ID = -1;
 const static int MAX_PACKET_SIZE = 255;
@@ -179,6 +179,9 @@ void ProcessPacket(int ci, unsigned char packet[])
 	case S2C_SKILL_EFFECT: break;  // Stage 7: 스킬 이펙트 — 더미 클라는 무시
 	case S2C_PARTY_INVITED: break;  // Stage 7 파티 — 더미 클라는 무시
 	case S2C_PARTY_UPDATE: break;
+	case S2C_ITEM_DROP: break;     // Stage 8 아이템 — 더미 클라는 무시
+	case S2C_ITEM_REMOVE: break;
+	case S2C_INVENTORY: break;
 	case S2C_AVATAR_INFO:
 	{
 		g_clients[ci].connected = true;
@@ -190,10 +193,17 @@ void ProcessPacket(int ci, unsigned char packet[])
 		g_clients[my_id].x = login_packet->x;
 		g_clients[my_id].y = login_packet->y;
 
-		//cs_packet_teleport t_packet;
-		//t_packet.size = sizeof(t_packet);
-		//t_packet.type = CS_TELEPORT;
-		//SendPacket(my_id, &t_packet);
+		// 5000 CCU 대표성: 접속 직후 더미를 맵 전역 랜덤 좌표로 분산.
+		// (서버는 신규 캐릭을 80x80 마을에 스폰 → 수천 더미가 한곳에 몰리면 시야 겹침으로 O(n^2)
+		//  이동 브로드캐스트가 폭주. 실제 5000 동접은 2000x2000 전역에 흩어져 있으므로 텔레포트로 분산)
+		C2S_Teleport t_packet;
+		t_packet.size = sizeof(t_packet);
+		t_packet.type = C2S_TELEPORT;
+		t_packet.x = static_cast<short>(rand() % WORLD_WIDTH);
+		t_packet.y = static_cast<short>(rand() % WORLD_HEIGHT);
+		SendPacket(my_id, &t_packet);
+		g_clients[my_id].x = t_packet.x;
+		g_clients[my_id].y = t_packet.y;
 	}
 	break;
 	default: break;  // 알 수 없는 패킷은 조용히 무시 (기존: MessageBox+무한루프 → 테스트 전체 정지)
@@ -363,6 +373,18 @@ void Test_Thread()
 	while (true) {
 		//Sleep(max(20, global_delay));
 		Adjust_Number_Of_Client();
+
+		// 헤드리스 측정용: 초당 1회 동접/지연 stdout 출력
+		{
+			static high_resolution_clock::time_point last_log = high_resolution_clock::now();
+			auto now = high_resolution_clock::now();
+			if (duration_cast<milliseconds>(now - last_log).count() >= 1000) {
+				last_log = now;
+				std::cout << "[Stress] active=" << active_clients
+				          << " conns=" << num_connections
+				          << " delay=" << global_delay << "ms" << std::endl;
+			}
+		}
 
 		for (int i = 0; i < num_connections; ++i) {
 			if (false == g_clients[i].connected) continue;

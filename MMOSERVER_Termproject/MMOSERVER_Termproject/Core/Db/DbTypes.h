@@ -4,16 +4,22 @@
 // 백엔드 추상화(IDbBackend)와 워커(DbWorker)가 이 타입들을 공유.
 
 #include <string>
+#include <vector>
+#include <utility>
 
 // 저장 대상 핵심 필드 (PDF 명세 6장 수준 — 사용자 합의)
 struct PlayerSnapshot {
     std::string username;
     int hp = 100;
-    int max_hp = 100;          // 레벨업으로 변경되므로 같이 저장
+    int max_hp = 100;          // Stage 8: base max_hp (장착 방어구 보너스 제외). 재장착 시 중복 합산 방지
     unsigned long long exp = 0;
     unsigned char level = 1;
     short x = 0;
     short y = 0;
+    // Stage 8: 아이템
+    std::vector<std::pair<int, int>> inventory;  // (item_id, qty)
+    int equipped_weapon_id = -1;
+    int equipped_armor_id = -1;
 };
 
 enum class DbReqKind {

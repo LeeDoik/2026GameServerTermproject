@@ -87,7 +87,7 @@ bool LuaVM::NpcTick(const NpcTickContext& ctx, NpcTickResult& out) {
     out.dy = 0;
     out.target_id = ctx.target_id;
 
-    std::lock_guard<std::mutex> lock(mu_);
+    // [perf] 락 없음: 이 인스턴스는 워커 스레드 전용(thread_local)이라 동시 호출이 없다.
     if (!L_) {
         last_error_ = "lua_State not initialized";
         return false;
@@ -151,7 +151,7 @@ bool LuaVM::BossTick(const NpcTickContext& ctx, NpcTickResult& out) {
     out.dx = 0; out.dy = 0; out.target_id = ctx.target_id;
     out.chat_id = 0; out.do_boss_aoe = 0;
 
-    std::lock_guard<std::mutex> lock(mu_);
+    // [perf] 락 없음: 워커 스레드 전용(thread_local) 인스턴스.
     if (!L_) { last_error_ = "lua_State not initialized"; return false; }
     lua_State* L = static_cast<lua_State*>(L_);
 

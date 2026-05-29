@@ -1,7 +1,7 @@
 # Aetheria Online MMO 서버 재설계 계획
 
-> 최종 업데이트: 2026-05-28
-> Stage 1~6 완료. Stage 7.1 스킬 / 7.2 보스 / 7.3 클라 이펙트 / 7.4 파티 시스템 완료. SQL Server 백엔드는 선택사항.
+> 최종 업데이트: 2026-05-29
+> Stage 1~6 완료. Stage 7.1 스킬 / 7.2 보스 / 7.3 클라 이펙트 / 7.4 파티 / 7.5 클라 메시지·EXP바 완료. Stage 8 아이템 시스템(소모·누적·인벤·장착) 완료. SQL Server 백엔드는 선택사항.
 
 ---
 
@@ -24,7 +24,8 @@
 | Stage 7.2 — 보스 패턴 (이동/채팅/AoE/2단계) | ✅ 완료 | 바이옴별 보스 4마리, Lua 2단계 분노 AI + 광역공격 |
 | Stage 7.3 — 클라 이펙트 완성도 강화 | ✅ 완료 | 공격 이펙트 분리(zap/sandblast), 데미지 popup, 화면흔들기, HP보간/저체력경고, Q스킬 5×5 폭발 |
 | Stage 7.4 — 파티 시스템 (EXP 분배 + 미니맵 + HP 바) | ✅ 완료 | /invite·/accept·/reject·/leave 명령, EXP 균등분배, 미니맵 청록 표시, 파티원 HP 바 HUD |
-| Stage 7 — 가산점 (아이템/퀘스트) | ⏳ 보류 | |
+| Stage 8 — 아이템 시스템 (소모/누적/인벤/장착) | ✅ 완료 | 카탈로그 8종(items.txt), NPC 드롭+G줍기, I 인벤 패널, 무기 공격력/방어구 max_hp, DB 영속성. 30초 stress 0 신규 에러 |
+| Stage 7 — 가산점 (퀘스트) | ⏳ 보류 | |
 
 **현재 부하 테스트 결과** (Stage 6.1 완료 시점, 2026-05-24): Release x64 기준 30초간 약 580+ connect / 신규 stderr 에러 0건. 200K NPC 활성 + 64개 장애물 rect (5.18% 점유) + 충돌 체크 통합 상태에서 Stage 5 대비 성능 회귀 없음.
 
@@ -460,18 +461,18 @@ PDF 기본 스펙을 코드/스크립트로 모두 반영. AI 결정 로직은 C
 
 ---
 
-### ⏳ Stage 7 — 나머지 가산점 추가 요소 — *게임성 40점이 최종 점수 가른다*
+### Stage 7 — 가산점 추가 요소 진행 현황 — *게임성 40점이 최종 점수 가른다*
 
-| 우선순위 | 항목 | 점수 | 권장 이유 |
+| 우선순위 | 항목 | 점수 | 상태 |
 |---|---|---|---|
-| A | 스크립트 NPC 배치 | 5점 | Stage 4에서 사실상 완료 |
-| B | 스킬: 범위/방향성 + 버프 | 10점 | AoE는 시야 내 ID 순회로 자연 구현 |
-| C | 보스 패턴 (이동/채팅/스킬) | 5-10점 | NPC 타입 추가만으로 가능 |
-| D | 파티 시스템 | 10점 | 파티 → 시야 동기화 → EXP 분배 |
-| E | 아이템: 소모 + 누적 + 인벤 + 장착 | 20점 | DB 스키마 확장 필요 |
-| F | 퀘스트 풀세트 | 25점 | 슬레이/대화/연쇄 — 시간 많이 필요 |
+| A | 스크립트 NPC 배치 | 5점 | ✅ 완료 (Stage 4 — `npc_spawn.txt`/`npc_ai.lua`) |
+| B | 스킬: 범위/방향성 | 10점 | ✅ 완료 (Stage 7.1 — Q/W/E AoE·Line·Heal) |
+| C | 보스 패턴 (이동/채팅/스킬) | 5-10점 | ✅ 완료 (Stage 7.2 — 바이옴별 보스 4마리, 2단계 AI) |
+| D | 파티 시스템 | 10점 | ✅ 완료 (Stage 7.4 — 초대/EXP분배/미니맵/HP바) |
+| E | 아이템: 소모 + 누적 + 인벤 + 장착 | 20점 | ✅ 완료 (Stage 8 — 4요소 모두 구현) |
+| F | 퀘스트 풀세트 | 25점 | ⏳ 미착수 (슬레이/대화/연쇄 — 시간 많이 필요) |
 
-**전략**: A→B→C→D 순으로 안전 30점 확보 후 시간 남으면 E/F.
+**전략**: A→B→C→D→E로 50점 확보 완료. 남은 시간은 F(퀘스트).
 
 ---
 
@@ -566,6 +567,45 @@ PDF 기본 스펙을 코드/스크립트로 모두 반영. AI 결정 로직은 C
 
 ---
 
+### ✅ Stage 7.4 — 파티 시스템 (완료, 2026-05-28)
+
+게임성 가산점(10점) 항목. NPC/맵 추가 작업 없이 패킷 + 로직만으로 구현. 채팅 명령 기반 UX.
+
+**신규 패킷** (`protocol_2026.h`):
+- `C2S_PartyInvite` (target_name) — 이름으로 파티 초대
+- `C2S_PartyAccept` / `C2S_PartyReject` / `C2S_PartyLeave` (헤더만)
+- `S2C_PartyInvited` (inviter_id, inviter_name) — 초대 수신 알림
+- `S2C_PartyUpdate` (state, member_id, member_name) — state: 0=joined / 1=left / 2=disbanded
+
+**서버 (`MMOSERVER_Termproject.cpp`)**:
+- `Player`: `atomic<int> party_id{-1}` (-1 = 파티 없음)
+- `struct Party { int leader_id; vector<int> members; }` + `g_parties` (`unordered_map<int, shared_ptr<Party>>`) + `g_party_mutex` + `g_next_party_id` + `g_pending_invites` (초대받은자→초대자 매핑). `MAX_PARTY_SIZE = 4`
+- `C2S_PARTY_INVITE` 핸들러: 내 파티가 풀(4명)이면 거부 → 대상이 이미 파티면 거부 → `g_pending_invites` 등록 → 대상에게 `S2C_PartyInvited` 전송 + 시전자에게 `SendSystemMessage` 피드백
+- `C2S_PARTY_ACCEPT` 핸들러: pending invite 조회 → 초대자에게 파티 없으면 신규 생성(초대자 리더) → 양쪽 `party_id` 설정 → 기존/신규 멤버 전원에게 `S2C_PartyUpdate(joined)` 브로드캐스트
+- `C2S_PARTY_REJECT` 핸들러: pending invite 제거 + 양쪽 시스템 메시지
+- `C2S_PARTY_LEAVE` 핸들러 → `PlayerLeaveParty(session)` 공통 경로
+- `GiveExpToKillerAndParty(killer, exp_gain)`: 파티 없으면 단독 `LevelUpPlayer`. 파티면 **온라인 파티원 균등 분배** (`share = max(1, exp_gain / online_members.size())`). 전투/스킬 처치 3개 지점(`C2S_ATTACK`, AoE 스킬, Line 스킬)에서 기존 단독 EXP 부여를 이 함수로 교체
+- `PlayerLeaveParty(session)`: pending invite 정리 → `party_id.exchange(-1)` → members에서 제거 → **2명 미만 남으면 자동 해산**(전원 `party_id=-1` + `S2C_PartyUpdate(disbanded)`), 그 외엔 `S2C_PartyUpdate(left)` 통지 + **리더가 나가면 첫 멤버로 위임**
+- disconnect 경로: 이름 있는 클라 정리 시 `PlayerLeaveParty(disconnected)` 호출 (파티 상태 누수 방지)
+
+**클라이언트 (`client.cpp`)**:
+- 채팅 입력에서 명령 파싱: `/invite <name>` / `/accept` / `/reject` / `/leave` → 해당 패킷 송신, 그 외는 일반 채팅
+- `g_party_members` (자신 제외 최대 3명) + `g_party_member_ids` (미니맵/HP바 빠른 조회용 set)
+- `S2C_PARTY_INVITED` → `"[Party] {이름} invited you. /accept or /reject"` 채팅 알림
+- `S2C_PARTY_UPDATE` → joined/left/disbanded별 멤버 목록 갱신 + 채팅 로그
+- **미니맵**: 파티원을 청록색 `(80,210,255)` 점으로 구분 표시 (일반 플레이어/NPC/보스와 분기)
+- **파티 HP 바 HUD**: 채팅 패널 아래에 파티원별 이름 + HP 바 렌더링
+
+**표절 회피**:
+- 파티 자료구조/EXP 분배/리더 위임 모두 직접 작성. `Docs/npc.cpp`에 파티 개념 자체가 없음
+- `unordered_map + mutex` 표준 라이브러리 조합
+
+**검증**:
+- Release x64 서버/클라/STRESS_TEST 모두 빌드 성공 (`S2C_PARTY_*` no-op 케이스 STRESS_TEST에 추가)
+- 수동 검증: 2클라로 `/invite`→`/accept` 시 파티 결성, 미니맵 청록 표시 + HP 바 노출, NPC 처치 EXP 균등 분배, `/leave`·disconnect 시 해산/위임 정상
+
+---
+
 ## 4. 검증 전략
 
 | 도구 | 사용처 | 현재 상태 |
@@ -650,23 +690,22 @@ MMOSERVER_Termproject/MMOSERVER_Termproject/
 
 ---
 
-## 우선순위 TOP 3 (남은 작업 기준, 2026-05-28 업데이트)
+## 우선순위 TOP 3 (남은 작업 기준, 2026-05-29 업데이트)
 
-**현재 상태**: PDF 명시 항목(IOCP/타이머/스크립트/시야/AI/A\*/DB) 전부 충족 + 스킬·보스·시각 완성도 강화 완료. 다음 작업은 모두 게임성 가산점 영역.
+**현재 상태**: PDF 명시 항목(IOCP/타이머/스크립트/시야/AI/A\*/DB) 전부 충족 + 스킬·보스·시각 완성도 강화 + **파티(10점) + 아이템(20점) 완료**. 가산점 50점 확보. 남은 작업은 퀘스트뿐.
 
-### 1순위: **파티 시스템 (10점)** — 가장 빠른 점수 확보
-- 새 패킷: C2S_PartyInvite / S2C_PartyJoin / S2C_PartyLeave / C2S_PartyLeave
-- 파티 EXP 분배(시야 내 파티원 균등 분배 or 기여도 기반), 파티원 위치를 미니맵에 다른 색으로 표시
-- NPC/맵 추가 작업 없이 패킷 + 로직만으로 점수 확보 가능
+### ✅ 완료: 파티 시스템 (10점) — Stage 7.4
+- 패킷 6종, 온라인 파티원 EXP 균등 분배, 미니맵 청록 표시 + HP 바 HUD. 상세는 Stage 7.4 섹션 참조.
 
-### 2순위: **아이템 시스템 (20점)**
-- DB 스키마 확장: PlayerSnapshot에 inventory[] / equipped[] 추가 (JSON 백엔드는 배열 직렬화 추가만 하면 됨)
-- 신규 패킷: S2C_ItemDrop / C2S_PickUp / S2C_ItemAdd / C2S_UseItem / C2S_EquipItem
-- 소모(포션) → 누적(스택) → 인벤 UI → 장착 UI 단계적 진행
+### ✅ 완료: 아이템 시스템 (20점) — Stage 8
+- 카탈로그 8종(data/items.txt), NPC 드롭 + 수동 줍기(G), I 인벤 패널 + 숫자키, 무기 공격력/방어구 max_hp, DB 영속성. 상세는 Stage 8 섹션 참조.
 
-### 3순위: **퀘스트 시스템 (25점)** — 최대 점수지만 가장 시간 소요
+### 1순위: **퀘스트 시스템 (25점)** — 최대 점수지만 가장 시간 소요
 - 슬레이/대화/연쇄 등 풀세트 필요
 - 마을 NPC와 대화 — 이미 g_village_npcs 4명 있으니 그 위에 쌓을 수 있음
+
+### 2순위: (선택) SQL Server 백엔드 / STRESS_TEST 강화
+- JSON stub → OdbcBackend 교체 (IDbBackend 그대로). 더미에 공격/줍기 추가 시 아이템 부하도 측정 가능
 
 ### (선택) SQL Server 백엔드
 - 현재는 JSON 파일 stub. 채점 환경에 SQL Server 있으면 OdbcBackend 추가만 하면 교체 (IDbBackend 인터페이스 그대로)
@@ -759,3 +798,56 @@ MMOSERVER_Termproject/MMOSERVER_Termproject/
 - 빨간 디버그 박스로 RectangleShape 렌더링 경로 확인 → 정상
 - 콘솔 디버그 로그로 `exp_ratio` / `g_my_exp` / `g_my_level` 값 확인 → 정상 갱신
 - 모든 디버그 코드는 사용자 확인 후 제거 완료
+
+---
+
+## ✅ Stage 8 — 아이템 시스템 (가산점 20점, 완료, 2026-05-29)
+
+가산점 4요소 **소모 + 누적(스택) + 인벤토리 + 장착**을 모두 구현. 기존 DB/전투/브로드캐스트/HUD 패턴 위에 얹음.
+
+### 설계 결정 (사용자 합의)
+- **줍기**: 수동 키 `G` (근처 바닥 아이템 줍기)
+- **카탈로그**: 포션 2종 + 무기 3티어 + 방어구 3티어 (총 8종)
+- **인벤 UI**: `I` 토글 패널 + 숫자키(패널 열렸을 때만 슬롯 조작 — 모달)
+- **블라스트 최소화**: 무기 공격력은 `atk_bonus`(atomic, lockless) 분리 / 방어구 보너스는 `max_hp`에 **직접 합산**(기존 max_hp 사용처 무수정), DB는 base(=max_hp−방어구보너스)로 저장해 재장착 중복 합산 방지
+
+### 신규 파일
+- `data/items.txt` — 카탈로그 (`id name type value stack_max drop_weight`, sscanf 라인 파서). type 0=소모/1=무기/2=방어구
+- `Core/Item.h / .cpp` — `ItemDef`/`ItemType`, `g_item_defs`, `GetItemDef`, `LoadItemDefs`(경로 후보 탐색), 드롭 로직(`RollShouldDrop` 일반35%/Agro50%/Boss100%, `RollDropItems` drop_weight 가중 랜덤, 보스는 무기+방어구+포션 보장)
+
+### 프로토콜 (`protocol_2026.h`) — enum 끝에 append (기존 ID 불변)
+- `C2S_PICKUP` / `C2S_USE_ITEM(slot)` / `C2S_EQUIP_ITEM(slot)` / `C2S_UNEQUIP_ITEM(which)`
+- `S2C_ITEM_DROP(drop_id,item_id,x,y)` / `S2C_ITEM_REMOVE(drop_id)` / `S2C_INVENTORY`(슬롯 배열 + 장착 ID, 전체 스냅샷)
+- `MAX_INVENTORY_SLOTS=20` (패킷 174B < 256 보장), `InvSlotNet{item_id, qty}`
+
+### 서버 (`MMOSERVER_Termproject.cpp`, `Core/GameConfig.h`, `Core/TimerManager.h`)
+- `Player`: `inv_lock` + `inventory`(vector<pair>) + `equipped_weapon_id/armor_id`(atomic) + `atk_bonus`(atomic)
+- 바닥 아이템: `g_ground_items`(map) + `g_ground_mutex` + `g_next_drop_id`(DROP_ID_START=2,000,000), `BroadcastToSectorPlayers`(3×3 섹터)
+- `SpawnNpcLoot()` — NPC 사망 3곳(기본공격/AoE/Line)에서 호출, 드롭 생성 + `GroundItemExpire` 60초 타이머
+- 핸들러: `C2S_PICKUP`(claim-first 이중줍기 방지, 가득이면 바닥 복귀) / `C2S_USE_ITEM`(소모품 HP회복) / `C2S_EQUIP_ITEM`(swap, 슬롯 −1/+1로 오버플로 불가) / `C2S_UNEQUIP_ITEM`
+- 헬퍼: `AddToInventoryLocked`(스택/신슬롯), `SendInventory`, `SendStatusChange`(본인+파티)
+- 데미지 계산 3곳에 `+ atk_bonus` 가산
+- `GameConfig`: `MAX_INVENTORY_SLOTS`(protocol), `GROUND_ITEM_EXPIRE_MS=60000`, `ITEM_PICKUP_RANGE=1`, `DROP_ID_START`
+- `TimerManager`: `TimerEventKind::GroundItemExpire` 추가
+
+### DB 영속성 (`Core/Db/DbTypes.h`, `JsonFileBackend.cpp`)
+- `PlayerSnapshot`에 `inventory[] / equipped_weapon_id / equipped_armor_id` 추가
+- Save: `"inventory":[[id,qty],...],"weapon":W,"armor":A` 직렬화. Load: `ReadIntPairArray` 미니 파서(키 없으면 빈 인벤 — 구버전 호환)
+- `SnapshotPlayer`: max_hp를 base로 보정 저장 / `OnPlayerSpawn`: 복원 + 보너스 재계산 + AvatarInfo 직후 `SendInventory`
+
+### 클라이언트 (`CLIENT/client_sample/client.cpp`)
+- 아이템 메타 테이블(items.txt와 동일 ID), `g_ground_items` / `g_inventory` / `g_equipped_*` / `g_inv_open`
+- 핸들러 `S2C_ITEM_DROP/REMOVE/INVENTORY`, 바닥 아이템(회전 보석) 렌더, `I` 토글 인벤 패널(5×4 그리드 + 장착 슬롯 + 힌트)
+- 입력: `I` 토글, `G` 줍기, **패널 열렸을 때** 숫자키로 사용/장착(클라가 타입 판별) + `R/F` 무기/방어구 해제, 패널 닫히면 숫자키는 기존 텔레포트 유지(모달 분기)
+
+### STRESS_TEST
+- `S2C_ITEM_DROP/REMOVE/INVENTORY` no-op 케이스 추가
+
+### 검증 (Release x64, 2026-05-29)
+- 서버/클라/STRESS_TEST 3종 모두 빌드 0 에러 (서버 0경고, stress는 기존 C4819 한글 인코딩 경고만)
+- 부팅: `[Item] Loaded 8 item defs.` / 200K NPC + Lua + DB 정상 / 무크래시
+- 30초 stress(NPC 200K 활성): 서버·stress 생존, **신규 stderr 0건**, **588개 player JSON이 신규 포맷(`"inventory":[],"weapon":-1,"armor":-1`)으로 저장** → SnapshotPlayer/Save 직렬화 + 매 로그인 SendInventory가 churn 하에서 안정. 처리량 Stage 5/6 베이스라인(586~588)과 동등
+- 수동 검증(권장): NPC 처치 → 바닥 보석 → `G` 줍기 → `I` 패널 → 숫자키로 포션(HP↑)·무기(데미지↑)·방어구(maxHP↑) → `R/F` 해제 → 재로그인 시 인벤/장착 유지
+
+### 표절 회피
+- 카탈로그/드롭/인벤/장착 로직 모두 자체 작성. JSON 배열 직렬화도 외부 라이브러리 없이 수동. `Docs/npc.cpp`에 아이템 개념 없음

@@ -36,6 +36,9 @@ ipch/
 *.tmp
 *.bak
 
+# Headless 부하 측정 하네스 빌드 산출물 (소스 headless_main.cpp만 추적)
+STRESS_TEST/headless_build/
+
 # Documents (Optional - if you want to keep them, remove these lines)
 # *.docx
 # *.pdf

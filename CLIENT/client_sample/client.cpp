@@ -59,6 +59,32 @@ struct PartyMemberInfo {
 std::vector<PartyMemberInfo> g_party_members;   // 자신 제외, 최대 3명
 std::unordered_set<int> g_party_member_ids;     // 미니맵 색상 분기용 빠른 조회
 
+// === Stage 8: 아이템 ===
+// 카테고리/이름/색은 서버 data/items.txt와 동일 ID로 매핑 (동기화 유지 필요)
+enum ClientItemCat { CIC_CONSUMABLE = 0, CIC_WEAPON = 1, CIC_ARMOR = 2 };
+struct ClientItemMeta { const char* name; sf::Color color; int cat; };
+static const std::unordered_map<int, ClientItemMeta> g_item_meta = {
+    { 1,  { "Health Potion",       sf::Color(230,  60,  60), CIC_CONSUMABLE } },
+    { 2,  { "Great Health Potion", sf::Color(255, 120, 120), CIC_CONSUMABLE } },
+    { 10, { "Rusty Sword",         sf::Color(150, 150, 160), CIC_WEAPON } },
+    { 11, { "Iron Sword",          sf::Color(120, 160, 210), CIC_WEAPON } },
+    { 12, { "Mythril Blade",       sf::Color(120, 230, 210), CIC_WEAPON } },
+    { 20, { "Leather Armor",       sf::Color(170, 120,  70), CIC_ARMOR } },
+    { 21, { "Chain Mail",          sf::Color(180, 180, 190), CIC_ARMOR } },
+    { 22, { "Plate Armor",         sf::Color(220, 200, 120), CIC_ARMOR } },
+};
+static const ClientItemMeta* item_meta(int id) {
+    auto it = g_item_meta.find(id);
+    return (it == g_item_meta.end()) ? nullptr : &it->second;
+}
+
+struct GroundItemView { int item_id; int x; int y; };
+std::unordered_map<int, GroundItemView> g_ground_items;  // drop_id → view
+std::vector<std::pair<int, int>> g_inventory;            // (item_id, qty) — S2C_Inventory로 갱신
+int  g_equipped_weapon_id = -1;
+int  g_equipped_armor_id  = -1;
+bool g_inv_open = false;
+
 static void add_chat_line(const std::string& s) {
     g_chat_log.push_back(s);
     if ((int)g_chat_log.size() > CHAT_LOG_MAX) {
@@ -1213,6 +1239,30 @@ void ProcessPacket(char* ptr)
         else if (p->skill_id == 3) spawn_effect_skill_heal(p->x, p->y);
         break;
     }
+    // === Stage 8: 아이템 ===
+    case S2C_ITEM_DROP:
+    {
+        S2C_ItemDrop* p = reinterpret_cast<S2C_ItemDrop*>(ptr);
+        g_ground_items[p->drop_id] = GroundItemView{ p->item_id, p->x, p->y };
+        break;
+    }
+    case S2C_ITEM_REMOVE:
+    {
+        S2C_ItemRemove* p = reinterpret_cast<S2C_ItemRemove*>(ptr);
+        g_ground_items.erase(p->drop_id);
+        break;
+    }
+    case S2C_INVENTORY:
+    {
+        S2C_Inventory* p = reinterpret_cast<S2C_Inventory*>(ptr);
+        g_inventory.clear();
+        int n = p->count; if (n > MAX_INVENTORY_SLOTS) n = MAX_INVENTORY_SLOTS;
+        for (int i = 0; i < n; ++i)
+            g_inventory.emplace_back(p->slots[i].item_id, p->slots[i].qty);
+        g_equipped_weapon_id = p->equipped_weapon_id;
+        g_equipped_armor_id  = p->equipped_armor_id;
+        break;
+    }
     }
 }
 
@@ -1765,6 +1815,89 @@ static void draw_hud()
             }
         }
     }
+
+    // ---- Stage 8: 조작 힌트 (항상, 좌하단) ----
+    {
+        sf::Text t; t.setFont(*g_font);
+        t.setString("[I] Inventory   [G] Pickup");
+        t.setCharacterSize(13);
+        t.setFillColor(sf::Color(210, 210, 210));
+        t.setOutlineColor(sf::Color::Black);
+        t.setOutlineThickness(1.0f);
+        t.setPosition(12.0f, WINDOW_HEIGHT - 150.0f);
+        g_window->draw(t);
+    }
+
+    // ---- Stage 8: 인벤토리 패널 (I 토글) ----
+    if (g_inv_open) {
+        constexpr float PW = 400.0f, PH = 392.0f;
+        float panel_x = (WINDOW_WIDTH - PW) * 0.5f;
+        float panel_y = (WINDOW_HEIGHT - PH) * 0.5f;
+        sf::RectangleShape bg(sf::Vector2f(PW, PH));
+        bg.setFillColor(sf::Color(15, 12, 28, 238));
+        bg.setOutlineColor(sf::Color(230, 190, 90));
+        bg.setOutlineThickness(2.0f);
+        bg.setPosition(panel_x, panel_y);
+        g_window->draw(bg);
+
+        auto panel_text = [&](const std::string& s, float x, float y, unsigned sz, sf::Color c) {
+            sf::Text t; t.setFont(*g_font);
+            t.setString(sf::String::fromUtf8(s.begin(), s.end()));
+            t.setCharacterSize(sz); t.setFillColor(c);
+            t.setOutlineColor(sf::Color::Black); t.setOutlineThickness(1.0f);
+            t.setPosition(x, y); g_window->draw(t);
+        };
+
+        panel_text("Inventory  [I] close", panel_x + 14, panel_y + 10, 18, sf::Color(255, 230, 150));
+        const ClientItemMeta* wm = item_meta(g_equipped_weapon_id);
+        const ClientItemMeta* am = item_meta(g_equipped_armor_id);
+        panel_text(std::string("Weapon: ") + (wm ? wm->name : "(none)"), panel_x + 14, panel_y + 40, 14, sf::Color(180, 210, 255));
+        panel_text(std::string("Armor : ") + (am ? am->name : "(none)"), panel_x + 14, panel_y + 60, 14, sf::Color(220, 200, 150));
+
+        constexpr int   COLS = 5;
+        constexpr float CELL = 66.0f, CELL_GAP = 6.0f;
+        float grid_x = panel_x + 14;
+        float grid_y = panel_y + 92;
+        for (int i = 0; i < MAX_INVENTORY_SLOTS; ++i) {
+            int col = i % COLS, row = i / COLS;
+            float cx = grid_x + col * (CELL + CELL_GAP);
+            float cy = grid_y + row * (CELL + CELL_GAP);
+            sf::RectangleShape cell(sf::Vector2f(CELL, CELL));
+            cell.setFillColor(sf::Color(30, 28, 45, 220));
+            cell.setOutlineColor(sf::Color(90, 90, 110));
+            cell.setOutlineThickness(1.0f);
+            cell.setPosition(cx, cy);
+            g_window->draw(cell);
+
+            if (i < 10) {  // 앞 10칸만 숫자키 매핑 (1..9, 0)
+                int keynum = (i == 9) ? 0 : (i + 1);
+                char kb[4]; sprintf_s(kb, "%d", keynum);
+                panel_text(kb, cx + 4, cy + 2, 12, sf::Color(160, 160, 160));
+            }
+
+            if (i < (int)g_inventory.size()) {
+                int item_id = g_inventory[i].first;
+                int qty = g_inventory[i].second;
+                const ClientItemMeta* m = item_meta(item_id);
+                sf::Color col2 = m ? m->color : sf::Color(220, 220, 220);
+                sf::RectangleShape gem(sf::Vector2f(26, 26));
+                gem.setOrigin(13, 13);
+                gem.setPosition(cx + CELL * 0.5f, cy + 28);
+                gem.setRotation(45.0f);
+                gem.setFillColor(col2);
+                gem.setOutlineColor(sf::Color(20, 20, 20));
+                gem.setOutlineThickness(1.5f);
+                g_window->draw(gem);
+
+                std::string nm = m ? m->name : "item";
+                if (nm.size() > 10) nm = nm.substr(0, 10);
+                panel_text(nm, cx + 3, cy + CELL - 28, 10, sf::Color(235, 235, 235));
+                if (qty > 1) { char qb[8]; sprintf_s(qb, "x%d", qty); panel_text(qb, cx + CELL - 28, cy + CELL - 15, 12, sf::Color(255, 240, 160)); }
+            }
+        }
+
+        panel_text("1-0 use/equip   R unequip weapon   F unequip armor", panel_x + 14, panel_y + PH - 24, 12, sf::Color(200, 200, 200));
+    }
 }
 
 void client_main()
@@ -1913,6 +2046,24 @@ void client_main()
     for (const auto& d : g_decorations) draw_landmark_sprite(d);
     for (const auto& d : g_landmarks)   draw_landmark_sprite(d);
 
+    // === Stage 8: 바닥 아이템 (캐릭터 아래) — 회전 사각형 보석 + 외곽선 ===
+    for (const auto& kv : g_ground_items) {
+        const GroundItemView& gi = kv.second;
+        if (!in_view_tile(gi.x, gi.y)) continue;
+        const ClientItemMeta* meta = item_meta(gi.item_id);
+        sf::Color col = meta ? meta->color : sf::Color(220, 220, 220);
+        float px = (gi.x - g_left_x) * (float)TILE_WIDTH;
+        float py = (gi.y - g_top_y)  * (float)TILE_WIDTH;
+        sf::RectangleShape gem(sf::Vector2f(TILE_WIDTH * 0.42f, TILE_WIDTH * 0.42f));
+        gem.setOrigin(gem.getSize().x * 0.5f, gem.getSize().y * 0.5f);
+        gem.setPosition(px + TILE_WIDTH * 0.5f, py + TILE_WIDTH * 0.5f);
+        gem.setRotation(45.0f);
+        gem.setFillColor(col);
+        gem.setOutlineColor(sf::Color(20, 20, 20));
+        gem.setOutlineThickness(2.0f);
+        g_window->draw(gem);
+    }
+
     avatar.draw();
     for (auto& pl : players) pl.second.draw();
 
@@ -2028,6 +2179,49 @@ int main()
                     continue;
                 }
 
+                // Stage 8: 인벤토리 패널이 열린 동안엔 숫자/장착 키를 인벤 조작으로 가로챔 (모달)
+                if (g_inv_open) {
+                    int slot = -1;
+                    switch (event.key.code) {
+                    case sf::Keyboard::Num1: slot = 0; break;
+                    case sf::Keyboard::Num2: slot = 1; break;
+                    case sf::Keyboard::Num3: slot = 2; break;
+                    case sf::Keyboard::Num4: slot = 3; break;
+                    case sf::Keyboard::Num5: slot = 4; break;
+                    case sf::Keyboard::Num6: slot = 5; break;
+                    case sf::Keyboard::Num7: slot = 6; break;
+                    case sf::Keyboard::Num8: slot = 7; break;
+                    case sf::Keyboard::Num9: slot = 8; break;
+                    case sf::Keyboard::Num0: slot = 9; break;
+                    case sf::Keyboard::I:
+                    case sf::Keyboard::Escape:
+                        g_inv_open = false; break;
+                    case sf::Keyboard::G: {  // 패널 열린 채로도 줍기 가능
+                        C2S_PickUp pk; pk.size = sizeof(pk); pk.type = C2S_PICKUP; send_packet(&pk);
+                        break;
+                    }
+                    case sf::Keyboard::R: {  // 무기 해제
+                        C2S_UnequipItem u; u.size = sizeof(u); u.type = C2S_UNEQUIP_ITEM; u.which = 0; send_packet(&u);
+                        break;
+                    }
+                    case sf::Keyboard::F: {  // 방어구 해제
+                        C2S_UnequipItem u; u.size = sizeof(u); u.type = C2S_UNEQUIP_ITEM; u.which = 1; send_packet(&u);
+                        break;
+                    }
+                    default: break;
+                    }
+                    if (slot >= 0 && slot < (int)g_inventory.size()) {
+                        int item_id = g_inventory[slot].first;
+                        const ClientItemMeta* m = item_meta(item_id);
+                        if (m && m->cat == CIC_CONSUMABLE) {
+                            C2S_UseItem u; u.size = sizeof(u); u.type = C2S_USE_ITEM; u.slot = (unsigned char)slot; send_packet(&u);
+                        } else if (m) {
+                            C2S_EquipItem e; e.size = sizeof(e); e.type = C2S_EQUIP_ITEM; e.slot = (unsigned char)slot; send_packet(&e);
+                        }
+                    }
+                    continue;  // 인벤 모드에선 이동/공격/스킬 입력 무시
+                }
+
                 short target_x = avatar.m_x;
                 short target_y = avatar.m_y;
                 bool moved = false;
@@ -2075,6 +2269,12 @@ int main()
                     C2S_UseSkill sk; sk.size = sizeof(sk); sk.type = C2S_USE_SKILL; sk.skill_id = 3;
                     send_packet(&sk);
                     g_skill3_clock.restart(); g_skill3_used = true;
+                    break;
+                }
+                // Stage 8: I=인벤토리 열기, G=근처 바닥 아이템 줍기
+                case sf::Keyboard::I: g_inv_open = true; break;
+                case sf::Keyboard::G: {
+                    C2S_PickUp pk; pk.size = sizeof(pk); pk.type = C2S_PICKUP; send_packet(&pk);
                     break;
                 }
                 case sf::Keyboard::Escape: window.close(); break;

@@ -17,6 +17,7 @@ enum class TimerEventKind : unsigned char {
     AttackCooldown,
     SkillCooldown,
     PlayerAutoSave,  // Stage 6.3 — 주기적 DB 자동 저장
+    GroundItemExpire, // Stage 8 — 바닥 아이템 만료 (entity_id 자리에 drop_id)
     TestPing,    // 검증 테스트용
 };
 
@@ -44,6 +45,11 @@ struct TimerOverlapped {
     }
 };
 
+// [perf] 샤딩된 타이머.
+// 기존 단일 디스패처 스레드 + 단일 mutex/priority_queue는 활성 NPC가 많을 때(초당 수십만
+// reschedule) 직렬화 병목이었다. entity_id로 N개 샤드에 분산해 스케줄/디스패치를 병렬화한다.
+// 같은 entity는 항상 같은 샤드로 가므로 엔티티별 처리 순서는 보존된다.
+// 만기 처리(콜백)는 기존과 동일하게 PostQueuedCompletionStatus로 공유 IOCP에 post한다.
 class TimerManager {
 public:
     using FireCallback = std::function<void(const TimerEvent&)>;
@@ -51,15 +57,21 @@ public:
     void Start(FireCallback cb);
     void Stop();
     void Schedule(int entity_id, TimerEventKind kind, int delay_ms);
-    size_t QueueSize();
+    size_t QueueSize();  // 전체 샤드 합계
 
 private:
-    void DispatcherLoop();
+    static constexpr int kShardCount = 8;
 
-    std::priority_queue<TimerEvent> queue_;
-    std::mutex mu_;
-    std::condition_variable cv_;
-    std::thread dispatcher_;
+    struct Shard {
+        std::priority_queue<TimerEvent> queue;
+        std::mutex mu;
+        std::condition_variable cv;
+        std::thread thread;
+    };
+
+    void DispatcherLoop(int shard_index);
+
+    Shard shards_[kShardCount];
     std::atomic<bool> running_{ false };
     FireCallback callback_;
 };

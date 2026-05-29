@@ -3,11 +3,12 @@
 #include <string>
 #include <mutex>
 
-// Lua 5.5 단일 인터프리터 래퍼.
+// Lua 5.5 인터프리터 래퍼.
 //
-// 스레드 모델: lua_State는 thread-safe가 아니므로 내부 mutex로 모든 호출을 직렬화.
-// 200K NPC가 worker pool에서 동시에 호출하면 contention이 생기지만,
-// 현재는 단순성 우선. 측정 후 worker별 state 풀로 확장 가능.
+// 스레드 모델: lua_State는 thread-safe가 아니다. [perf] AI 핫패스(NpcTick/BossTick)는
+// 워커 스레드당 1개씩 두는 thread_local 인스턴스에서만 호출하므로 동시 접근이 없고,
+// 이 두 함수는 락을 잡지 않는다(단일 전역 락 직렬화 병목 제거).
+// 부팅 시 단일 스레드 초기화 경로(OpenStdLibs/DoFile/SetGlobalInt)는 mu_로 보호 유지.
 
 // NPC AI tick 입력: C++가 Lua로 넘기는 정보
 struct NpcTickContext {
