@@ -39,6 +39,9 @@ ipch/
 # Headless 부하 측정 하네스 빌드 산출물 (소스 headless_main.cpp만 추적)
 STRESS_TEST/headless_build/
 
+# 런타임 player 세이브 데이터 (서버가 로그인 시 생성, git 추적 제외)
+data/players/
+
 # Documents (Optional - if you want to keep them, remove these lines)
 # *.docx
 # *.pdf
