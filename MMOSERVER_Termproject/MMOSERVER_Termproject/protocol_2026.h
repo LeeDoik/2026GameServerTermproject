@@ -6,23 +6,24 @@ constexpr int WORLD_HEIGHT = 2000;
 constexpr int MAX_PLAYERS = 10000;
 constexpr int NUM_NPCS = 200000;
 constexpr int NPC_ID_START = 1000000;
-constexpr int NPC_MOVE_INTERVAL = 1000; // in milliseconds
+// NPC 이동 주기는 GameConfig.h의 NPC_TICK_INTERVAL_MS(500ms)가 단일 진실원.
+// (구버전 NPC_MOVE_INTERVAL 상수는 미사용이라 제거됨)
 constexpr int MAX_NAME_LEN = 20;
 constexpr int MAX_CHAT_MSG_LEN = 200;
 constexpr int MAX_INVENTORY_SLOTS = 20; // Stage 8: 인벤토리 슬롯 수 (S2C_Inventory 패킷 크기 < 256 보장)
 
 enum PACKET_TYPE {
 	C2S_LOGIN,			// Client to Server: Login request
-	// ����� �̸��� ������ �α��� ��û ��Ŷ
+	// 사용자 이름을 포함한 로그인 요청 패킷
 	C2S_MOVE,			// Client to Server: Move request
-	// �̵� ����� �̵� �ð��� ������ �̵� ��û ��Ŷ
+	// 목표 좌표와 이동 시각을 포함한 이동 요청 패킷
 	C2S_CHAT,			// Client to Server: Chat message
-	// ä�� �޽����� ������ ä�� ��û ��Ŷ
+	// 채팅 메시지를 포함한 채팅 요청 패킷
 	C2S_ATTACK,			// Client to Server: Attack request
-	// ���� ��û ��Ŷ (4 ���� ���� ����)
+	// 4방향 근접 공격 요청 패킷
 	C2S_TELEPORT,		// Client to Server: Teleport request
-	// �ڷ���Ʈ ��û ��Ŷ (������ ��ǥ ����)
-	// STRESS TEST������ �߰��� ��Ŷ�Դϴ�. ���� ������ ������ ���� ����.
+	// 텔레포트 요청 패킷 (목적지 좌표 포함)
+	// STRESS TEST 전용으로 추가된 패킷. 실제 게임 플레이에는 사용되지 않을 수 있음.
 	C2S_LOGOUT,			// Client to Server: Logout request
 	C2S_USE_SKILL,		// Client to Server: Skill use request (skill_id: 1=AoE, 2=Line, 3=Heal)
 	C2S_PARTY_INVITE,	// Client to Server: 파티 초대 (target_name)
@@ -31,7 +32,7 @@ enum PACKET_TYPE {
 	C2S_PARTY_LEAVE,	// Client to Server: 파티 탈퇴
 
 	S2C_LOGIN_RESULT,	//	Server to Client: Login result
-	// �α��� ��� ��Ŷ (���� ���ο� �޽��� ����)
+	// 로그인 결과 패킷 (성공 여부와 메시지 포함)
 	S2C_AVATAR_INFO,	//	Server to Client: Avatar information
 	S2C_ADD_OBJECT,		//	Server to Client: Add player or NPC
 	S2C_REMOVE_OBJECT,	//	Server to Client: Remove player or NPC

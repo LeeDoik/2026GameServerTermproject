@@ -14,6 +14,7 @@
 #include <tbb/concurrent_hash_map.h>
 #include <random>
 #include <chrono>
+#include <fstream>
 #include "protocol_2026.h"
 #include "Core/ObjectPool.h"
 #include "Core/Entity.h"
@@ -30,6 +31,7 @@
 #include "Core/Quest.h"
 #include "Core/Db/DbTypes.h"
 #include "Core/Db/JsonFileBackend.h"
+#include "Core/Db/MySqlOdbcBackend.h"
 #include "Core/Db/DbWorker.h"
 
 #pragma comment(lib, "ws2_32.lib")
@@ -1611,7 +1613,10 @@ void LevelUpPlayer(shared_ptr<Player> session, unsigned long long exp_gain) {
     bool leveled_up = false;
     while (true) {
         unsigned char cur_lv = session->level.load();
-        unsigned long long need = 100ULL << (cur_lv - 1);
+        // 레벨업 임계 = 100 * level^2 (완만한 다항식). 구버전 100<<(level-1)는
+        // 고레벨에서 시프트 폭 ≥ 64로 UB가 되므로 교체. (level≥1 보장 → 언더플로 없음)
+        unsigned long long lvq = (cur_lv > 0) ? cur_lv : 1;
+        unsigned long long need = 100ULL * lvq * lvq;
         unsigned long long cur_exp = session->exp.load();
         if (cur_exp < need) break;
         if (session->exp.compare_exchange_weak(cur_exp, cur_exp - need)) {
@@ -1700,6 +1705,113 @@ void GiveExpToKillerAndParty(shared_ptr<Player> killer, unsigned long long exp_g
     for (auto& member : online_members) {
         LevelUpPlayer(member, share);
     }
+}
+
+// 처치한 NPC 1마리가 주는 EXP. 문서화된 다항식 모델로 통일 (GameConfig.h 주석과 일치).
+//   일반: level^2 * BASE_EXP_MULTIPLIER  (Agro x2, Roaming x2)
+//   보스: level^2 * BASE_EXP_MULTIPLIER * BOSS_EXP_MULTIPLIER
+// (구버전은 지수형 1<<(level-1) + 보스 매직넘버 1<<30 → 중간레벨 폭주/오버플로 위험이라 교체)
+unsigned long long ComputeNpcExp(const NPC& n) {
+    unsigned long long lv = (n.level > 0) ? n.level : 1;
+    unsigned long long base = lv * lv * (unsigned long long)BASE_EXP_MULTIPLIER;
+    if (n.type == NpcType::Boss) return base * (unsigned long long)BOSS_EXP_MULTIPLIER;
+    if (n.type == NpcType::Agro)             base *= 2;
+    if (n.move_mode == NpcMoveMode::Roaming) base *= 2;
+    return base;
+}
+
+// NPC에게 damage를 입히고 결과를 브로드캐스트. 막타면 사망 전체 처리(시야정리/섹터제거/
+// S2C_DEATH/리스폰예약/EXP/루트/퀘스트)까지 수행. 기본공격/AoE/Line 등 모든 공격 경로 공용.
+// per-NPC view_lock이 데미지 적용을 직렬화하므로, hp를 0으로 만든 막타 호출만 사망 경로를
+// 정확히 1회 실행한다 (이중 EXP/루트/리스폰 방지).
+// 반환: 이번 타격으로 NPC가 죽었으면 true.
+bool DamageNpcAndReport(const std::shared_ptr<Player>& attacker, int nid, int damage) {
+    const int client_id = attacker->id;
+    NPC& n = GetNpc(nid);
+
+    int new_hp = 0;
+    short nx = 0, ny = 0;
+    bool dealt = false;
+    {
+        lock_guard<mutex> lock(n.view_lock);
+        if (n.hp > 0) {
+            n.hp -= damage;
+            if (n.hp < 0) n.hp = 0;
+            new_hp = n.hp;
+            nx = n.x;
+            ny = n.y;
+            dealt = true;
+        }
+    }
+    if (!dealt) return false;
+
+    // S2C_DAMAGE — NPC view_list의 모든 플레이어 + 공격자(중복 방지 위해 set 사용)
+    S2C_Damage dmg;
+    dmg.size = sizeof(dmg);
+    dmg.type = S2C_DAMAGE;
+    dmg.attacker_id = client_id;
+    dmg.target_id = nid;
+    dmg.damage = damage;
+    dmg.new_hp = new_hp;
+    dmg.target_x = nx;
+    dmg.target_y = ny;
+
+    unordered_set<int> dmg_viewers;
+    {
+        lock_guard<mutex> lock(n.view_lock);
+        for (int vid : n.view_list) dmg_viewers.insert(vid);
+    }
+    dmg_viewers.insert(client_id);  // 공격자도 항상 받음
+    for (int vid : dmg_viewers) {
+        ClientMap::const_accessor a;
+        if (g_clients.find(a, vid)) a->second->do_send(dmg.size, &dmg);
+    }
+
+    if (new_hp != 0) return false;
+
+    // === NPC 사망 처리: state=Dead + 시야 정리 + 섹터 제거 + 리스폰 예약 ===
+    unordered_set<int> death_viewers;
+    {
+        lock_guard<mutex> lock(n.view_lock);
+        for (int vid : n.view_list) death_viewers.insert(vid);
+        n.view_list.clear();
+        n.state = NpcFsmState::Dead;
+        n.target_id = -1;
+    }
+    death_viewers.insert(client_id);  // 공격자가 시야 밖에서 죽일 일은 없지만 안전망
+
+    // 시야 안 모든 플레이어의 view_list에서도 이 NPC 제거 (즉시 정리해두면 일관)
+    for (int vid : death_viewers) {
+        ClientMap::const_accessor a;
+        if (g_clients.find(a, vid)) {
+            lock_guard<mutex> lock(a->second->view_lock);
+            a->second->view_list.erase(nid);
+        }
+    }
+    n.active.store(false);
+    RemoveObjectFromSector(nid, nx, ny, false);
+
+    // S2C_DEATH 브로드캐스트
+    S2C_Death dpkt;
+    dpkt.size = sizeof(dpkt);
+    dpkt.type = S2C_DEATH;
+    dpkt.object_id = nid;
+    dpkt.death_x = nx;
+    dpkt.death_y = ny;
+    for (int vid : death_viewers) {
+        ClientMap::const_accessor a;
+        if (g_clients.find(a, vid)) a->second->do_send(dpkt.size, &dpkt);
+    }
+
+    // 보스는 5분 리스폰, 일반 NPC는 30초
+    int respawn_ms = (n.type == NpcType::Boss) ? BOSS_RESPAWN_MS : NPC_RESPAWN_MS;
+    g_timer_manager.Schedule(nid, TimerEventKind::NpcRespawn, respawn_ms);
+
+    // EXP: 파티원 균등 분배 (파티 없으면 킬러 단독) / 루트 드롭 / 퀘스트 처치 카운트
+    GiveExpToKillerAndParty(attacker, ComputeNpcExp(n));
+    SpawnNpcLoot(n.type, n.move_mode, n.level, nx, ny);  // Stage 8
+    OnNpcKilledForQuest(attacker, n);                    // Stage 9
+    return true;
 }
 
 // 파티 탈퇴 (disconnect 또는 C2S_PARTY_LEAVE 시 공통 경로).
@@ -1914,21 +2026,66 @@ int main(int argc, char* argv[]) {
             static_cast<ULONG_PTR>(ev.entity_id), &tov->overlapped);
     });
 
-    // --- Stage 6.3: DB 워커 시작 (JSON 파일 백엔드) ---
+    // --- Stage 6.3 + DB연동: DB 워커 시작 ---
+    // 우선순위: data/db.ini의 enabled=1 + MySQL(ODBC) 연결 성공 시 MySQL 백엔드 사용.
+    // 미설정/연결 실패 시 JSON 파일 백엔드로 자동 폴백 → 무DB 환경에서도 서버 항상 동작.
     // 응답 콜백: PostQueuedCompletionStatus로 IOCP에 IO_DB_DONE 이벤트 post.
-    // data/ 부모 디렉토리 위치를 먼저 찾고, 그 아래 players/ 사용 (JsonFileBackend가 자동 mkdir)
     const char* parent_candidates[] = { "data", "../../data", "../../../data" };
+    std::string data_dir = "data";
     std::string db_root = "data/players";
     for (const char* p : parent_candidates) {
         DWORD attr = GetFileAttributesA(p);
         if (attr != INVALID_FILE_ATTRIBUTES && (attr & FILE_ATTRIBUTE_DIRECTORY)) {
+            data_dir = p;
             db_root = std::string(p) + "/players";
             break;
         }
     }
-    cout << "[Db] JSON backend root: " << db_root << endl;
+
+    // db.ini 파싱 (key=value, '#' 주석). 키: enabled / conn(ODBC 연결 문자열)
+    bool db_enabled = false;
+    std::string db_conn;
+    {
+        std::ifstream ini(data_dir + "/db.ini");
+        std::string line;
+        while (std::getline(ini, line)) {
+            size_t s = line.find_first_not_of(" \t\r\n");
+            if (s == std::string::npos || line[s] == '#') continue;
+            size_t eq = line.find('=', s);
+            if (eq == std::string::npos) continue;
+            std::string key = line.substr(s, eq - s);
+            size_t ke = key.find_last_not_of(" \t");
+            key = (ke == std::string::npos) ? std::string() : key.substr(0, ke + 1);
+            std::string val = line.substr(eq + 1);
+            size_t vs = val.find_first_not_of(" \t");
+            val = (vs == std::string::npos) ? std::string() : val.substr(vs);
+            size_t ve = val.find_last_not_of(" \t\r\n");
+            val = (ve == std::string::npos) ? std::string() : val.substr(0, ve + 1);
+            if (key == "enabled")   db_enabled = (!val.empty() && val[0] == '1');
+            else if (key == "conn") db_conn = val;
+        }
+    }
+
+    std::unique_ptr<IDbBackend> db_backend;
+    if (db_enabled && !db_conn.empty()) {
+        auto mysql = std::make_unique<MySqlOdbcBackend>(db_conn);
+        if (mysql->Connected()) {
+            db_backend = std::move(mysql);
+            cout << "[Db] MySQL(ODBC) connected." << endl;
+        }
+        else {
+            cout << "[Db] MySQL connect failed -> JSON fallback (root: " << db_root << ")" << endl;
+        }
+    }
+    else {
+        cout << "[Db] MySQL disabled in db.ini -> JSON backend (root: " << db_root << ")" << endl;
+    }
+    if (!db_backend) {
+        db_backend = std::make_unique<JsonFileBackend>(db_root);
+    }
+
     g_db_worker.Start(
-        std::make_unique<JsonFileBackend>(db_root),
+        std::move(db_backend),
         [](DbResponse&& resp) {
             auto* dov = g_db_pool.Acquire();
             dov->type = IO_DB_DONE;
@@ -2405,98 +2562,7 @@ void process_packet(int client_id, unsigned char* ptr) {
             }
 
             for (int nid : npc_ids) {
-                NPC& n = GetNpc(nid);
-                int new_hp = 0;
-                short nx = 0, ny = 0;
-                bool dealt = false;
-                {
-                    lock_guard<mutex> lock(n.view_lock);
-                    if (n.hp > 0) {
-                        n.hp -= damage;
-                        if (n.hp < 0) n.hp = 0;
-                        new_hp = n.hp;
-                        nx = n.x;
-                        ny = n.y;
-                        dealt = true;
-                    }
-                }
-                if (!dealt) continue;
-
-                // S2C_DAMAGE — NPC view_list의 모든 플레이어 + 공격자(중복 방지 위해 set 사용)
-                S2C_Damage dmg;
-                dmg.size = sizeof(dmg);
-                dmg.type = S2C_DAMAGE;
-                dmg.attacker_id = client_id;
-                dmg.target_id = nid;
-                dmg.damage = damage;
-                dmg.new_hp = new_hp;
-                dmg.target_x = nx;
-                dmg.target_y = ny;
-
-                unordered_set<int> dmg_viewers;
-                {
-                    lock_guard<mutex> lock(n.view_lock);
-                    for (int vid : n.view_list) dmg_viewers.insert(vid);
-                }
-                dmg_viewers.insert(client_id);  // 공격자도 항상 받음
-                for (int vid : dmg_viewers) {
-                    ClientMap::const_accessor a;
-                    if (g_clients.find(a, vid)) a->second->do_send(dmg.size, &dmg);
-                }
-
-                // NPC 사망 처리: state=Dead + 시야 정리 + 섹터 제거 + 30초 리스폰 예약
-                if (new_hp == 0) {
-                    unordered_set<int> death_viewers;
-                    {
-                        lock_guard<mutex> lock(n.view_lock);
-                        for (int vid : n.view_list) death_viewers.insert(vid);
-                        n.view_list.clear();
-                        n.state = NpcFsmState::Dead;
-                        n.target_id = -1;
-                    }
-                    death_viewers.insert(client_id);  // 공격자가 시야 밖에서 죽일 일은 없지만 안전망
-
-                    // 시야 안 모든 플레이어의 view_list에서도 이 NPC 제거 (다음 SyncPlayerNpcView가
-                    // sector에서 못 찾아 left로 자연 처리되지만, 즉시 정리해두면 일관)
-                    for (int vid : death_viewers) {
-                        ClientMap::const_accessor a;
-                        if (g_clients.find(a, vid)) {
-                            lock_guard<mutex> lock(a->second->view_lock);
-                            a->second->view_list.erase(nid);
-                        }
-                    }
-                    n.active.store(false);
-                    RemoveObjectFromSector(nid, nx, ny, false);
-
-                    // S2C_DEATH 브로드캐스트
-                    S2C_Death dpkt;
-                    dpkt.size = sizeof(dpkt);
-                    dpkt.type = S2C_DEATH;
-                    dpkt.object_id = nid;
-                    dpkt.death_x = nx;
-                    dpkt.death_y = ny;
-                    for (int vid : death_viewers) {
-                        ClientMap::const_accessor a;
-                        if (g_clients.find(a, vid)) a->second->do_send(dpkt.size, &dpkt);
-                    }
-
-                    // 보스는 5분 리스폰, 일반 NPC는 30초
-                    int respawn_ms = (n.type == NpcType::Boss) ? BOSS_RESPAWN_MS : NPC_RESPAWN_MS;
-                    g_timer_manager.Schedule(nid, TimerEventKind::NpcRespawn, respawn_ms);
-
-                    // EXP: 파티원 균등 분배 (파티 없으면 킬러 단독)
-                    unsigned long long exp_gain;
-                    if (n.type == NpcType::Boss) {
-                        exp_gain = (1ULL << 30) * (unsigned long long)BOSS_EXP_MULTIPLIER;
-                    } else {
-                        exp_gain = 1ULL << (n.level > 0 ? n.level - 1 : 0);
-                        if (n.type == NpcType::Agro)             exp_gain *= 2;
-                        if (n.move_mode == NpcMoveMode::Roaming) exp_gain *= 2;
-                    }
-                    GiveExpToKillerAndParty(session, exp_gain);
-                    SpawnNpcLoot(n.type, n.move_mode, n.level, nx, ny);  // Stage 8: 루트 드롭
-                    OnNpcKilledForQuest(session, n);                     // Stage 9: 퀘스트 처치 카운트
-                }
+                DamageNpcAndReport(session, nid, damage);
             }
         }
         break;
@@ -2571,48 +2637,7 @@ void process_packet(int client_id, unsigned char* ptr) {
                         NPC& n = GetNpc(nid);
                         // chebyshev 거리 체크
                         if (abs(n.x - cx) > r || abs(n.y - cy) > r) continue;
-
-                        int new_hp = 0; short nx = 0, ny = 0; bool dealt = false;
-                        {
-                            lock_guard<mutex> nlk(n.view_lock);
-                            if (n.hp > 0) {
-                                n.hp -= damage; if (n.hp < 0) n.hp = 0;
-                                new_hp = n.hp; nx = n.x; ny = n.y; dealt = true;
-                            }
-                        }
-                        if (!dealt) continue;
-
-                        S2C_Damage dmg; dmg.size = sizeof(dmg); dmg.type = S2C_DAMAGE;
-                        dmg.attacker_id = client_id; dmg.target_id = nid;
-                        dmg.damage = damage; dmg.new_hp = new_hp;
-                        dmg.target_x = nx; dmg.target_y = ny;
-
-                        unordered_set<int> dviewers;
-                        { lock_guard<mutex> nlk(n.view_lock); for (int v : n.view_list) dviewers.insert(v); }
-                        dviewers.insert(client_id);
-                        for (int vid : dviewers) {
-                            ClientMap::const_accessor a;
-                            if (g_clients.find(a, vid)) a->second->do_send(dmg.size, &dmg);
-                        }
-
-                        if (new_hp == 0) {
-                            unordered_set<int> dv;
-                            { lock_guard<mutex> nlk(n.view_lock); for (int v : n.view_list) dv.insert(v); n.view_list.clear(); n.state = NpcFsmState::Dead; n.target_id = -1; }
-                            dv.insert(client_id);
-                            for (int vid : dv) { ClientMap::const_accessor a; if (g_clients.find(a, vid)) { lock_guard<mutex> vl(a->second->view_lock); a->second->view_list.erase(nid); } }
-                            n.active.store(false);
-                            RemoveObjectFromSector(nid, nx, ny, false);
-                            S2C_Death dpkt; dpkt.size = sizeof(dpkt); dpkt.type = S2C_DEATH; dpkt.object_id = nid; dpkt.death_x = nx; dpkt.death_y = ny;
-                            for (int vid : dv) { ClientMap::const_accessor a; if (g_clients.find(a, vid)) a->second->do_send(dpkt.size, &dpkt); }
-                            { int rm = (n.type == NpcType::Boss) ? BOSS_RESPAWN_MS : NPC_RESPAWN_MS; g_timer_manager.Schedule(nid, TimerEventKind::NpcRespawn, rm); }
-
-                            unsigned long long eg;
-                            if (n.type == NpcType::Boss) { eg = (1ULL << 30) * (unsigned long long)BOSS_EXP_MULTIPLIER; }
-                            else { eg = 1ULL << (n.level > 0 ? n.level - 1 : 0); if (n.type == NpcType::Agro) eg *= 2; if (n.move_mode == NpcMoveMode::Roaming) eg *= 2; }
-                            GiveExpToKillerAndParty(session, eg);
-                            SpawnNpcLoot(n.type, n.move_mode, n.level, nx, ny);  // Stage 8: 루트 드롭
-                            OnNpcKilledForQuest(session, n);                     // Stage 9: 퀘스트 처치 카운트
-                        }
+                        DamageNpcAndReport(session, nid, damage);
                     }
                 }
             }
@@ -2635,34 +2660,7 @@ void process_packet(int client_id, unsigned char* ptr) {
                 { lock_guard<mutex> slk(g_sectors[sy][sxx].m_lock); for (int nid : g_sectors[sy][sxx].npcs) { NPC& n = GetNpc(nid); if (n.x == tx && n.y == ty) npc_ids.push_back(nid); } }
 
                 for (int nid : npc_ids) {
-                    NPC& n = GetNpc(nid);
-                    int new_hp = 0; short nx = 0, ny = 0; bool dealt = false;
-                    { lock_guard<mutex> nlk(n.view_lock); if (n.hp > 0) { n.hp -= damage; if (n.hp < 0) n.hp = 0; new_hp = n.hp; nx = n.x; ny = n.y; dealt = true; } }
-                    if (!dealt) continue;
-
-                    S2C_Damage dmg; dmg.size = sizeof(dmg); dmg.type = S2C_DAMAGE;
-                    dmg.attacker_id = client_id; dmg.target_id = nid; dmg.damage = damage; dmg.new_hp = new_hp; dmg.target_x = nx; dmg.target_y = ny;
-                    unordered_set<int> dv; { lock_guard<mutex> nlk(n.view_lock); for (int v : n.view_list) dv.insert(v); } dv.insert(client_id);
-                    for (int vid : dv) { ClientMap::const_accessor a; if (g_clients.find(a, vid)) a->second->do_send(dmg.size, &dmg); }
-
-                    if (new_hp == 0) {
-                        unordered_set<int> dv2;
-                        { lock_guard<mutex> nlk(n.view_lock); for (int v : n.view_list) dv2.insert(v); n.view_list.clear(); n.state = NpcFsmState::Dead; n.target_id = -1; }
-                        dv2.insert(client_id);
-                        for (int vid : dv2) { ClientMap::const_accessor a; if (g_clients.find(a, vid)) { lock_guard<mutex> vl(a->second->view_lock); a->second->view_list.erase(nid); } }
-                        n.active.store(false);
-                        RemoveObjectFromSector(nid, nx, ny, false);
-                        S2C_Death dpkt; dpkt.size = sizeof(dpkt); dpkt.type = S2C_DEATH; dpkt.object_id = nid; dpkt.death_x = nx; dpkt.death_y = ny;
-                        for (int vid : dv2) { ClientMap::const_accessor a; if (g_clients.find(a, vid)) a->second->do_send(dpkt.size, &dpkt); }
-                        { int rm2 = (n.type == NpcType::Boss) ? BOSS_RESPAWN_MS : NPC_RESPAWN_MS; g_timer_manager.Schedule(nid, TimerEventKind::NpcRespawn, rm2); }
-
-                        unsigned long long eg;
-                        if (n.type == NpcType::Boss) { eg = (1ULL << 30) * (unsigned long long)BOSS_EXP_MULTIPLIER; }
-                        else { eg = 1ULL << (n.level > 0 ? n.level - 1 : 0); if (n.type == NpcType::Agro) eg *= 2; if (n.move_mode == NpcMoveMode::Roaming) eg *= 2; }
-                        GiveExpToKillerAndParty(session, eg);
-                        SpawnNpcLoot(n.type, n.move_mode, n.level, nx, ny);  // Stage 8: 루트 드롭
-                        OnNpcKilledForQuest(session, n);                     // Stage 9: 퀘스트 처치 카운트
-                    }
+                    DamageNpcAndReport(session, nid, damage);
                 }
             }
         }

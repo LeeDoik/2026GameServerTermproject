@@ -152,6 +152,7 @@
     <ClCompile Include="Core\Quest.cpp" />
     <ClCompile Include="Core\Db\JsonFileBackend.cpp" />
     <ClCompile Include="Core\Db\DbWorker.cpp" />
+    <ClCompile Include="Core\Db\MySqlOdbcBackend.cpp" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="protocol_2026.h" />
@@ -172,6 +173,7 @@
     <ClInclude Include="Core\Db\IDbBackend.h" />
     <ClInclude Include="Core\Db\JsonFileBackend.h" />
     <ClInclude Include="Core\Db\DbWorker.h" />
+    <ClInclude Include="Core\Db\MySqlOdbcBackend.h" />
   </ItemGroup>
   <ItemGroup>
     <None Include="..\..\DEVELOPMENT_LOG.md" />

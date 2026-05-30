@@ -20,7 +20,8 @@ constexpr int NPC_RESPAWN_MS = 30000;
 constexpr int HP_REGEN_INTERVAL_MS = 5000;
 constexpr int HP_REGEN_PERCENT = 10;
 
-// 경험치 공식: 레벨^2 * 2 (Agro x2, Roaming x2 — Stage 5 적용)
+// 처치 EXP 공식: level^2 * BASE_EXP_MULTIPLIER (일반 NPC). Agro x2, Roaming x2.
+// 보스는 추가로 BOSS_EXP_MULTIPLIER 배. 구현은 MMOSERVER_Termproject.cpp의 ComputeNpcExp().
 constexpr int BASE_EXP_MULTIPLIER = 2;
 
 // 전투
