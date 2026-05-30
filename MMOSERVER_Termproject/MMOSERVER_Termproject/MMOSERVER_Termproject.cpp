@@ -304,6 +304,13 @@ atomic<int> g_next_drop_id{ DROP_ID_START };
 using ClientMap = tbb::concurrent_hash_map<int, std::shared_ptr<Player>>;
 ClientMap g_clients;
 atomic<int> g_next_id{ 1 };  // id 0은 시스템 메시지(S2C_CHAT_MESSAGE object_id=0) 전용 sentinel — 플레이어 id는 1부터
+
+// 이름→client_id 인덱스 (파티 초대 등 이름 탐색용).
+// g_clients(tbb concurrent_hash_map)를 begin()/end()로 직접 순회하면 다른 워커의 동시 erase로
+// 이터레이터가 무효화될 수 있어, O(1) 조회용 별도 인덱스를 둔다. 동명이인 대비 multimap + 전용 mutex.
+// (login/disconnect/invite만 접근 — 핫패스가 아니라 락 경합 무시 가능)
+std::unordered_multimap<std::string, int> g_name_index;
+std::mutex g_name_index_mutex;
 HANDLE g_h_iocp;
 SOCKET g_listen_socket;
 LPFN_ACCEPTEX g_fp_accept_ex = nullptr;
@@ -1364,13 +1371,20 @@ void OnDbResponse(DbResponse& resp) {
 
 // 30초마다 모든 활성 플레이어 상태를 EnqueueSave.
 void PlayerOnAutoSave() {
-    vector<shared_ptr<Player>> snapshots;
-    for (auto it = g_clients.begin(); it != g_clients.end(); ++it) {
-        if (it->second) snapshots.push_back(it->second);
+    // 로그인한(이름 있는) 클라 id 스냅샷 — g_clients(tbb)를 직접 순회하면 동시 erase로 UB이므로
+    // g_name_index(로그인~접속종료 동안만 존재)에서 id를 먼저 복사한 뒤 락 밖에서 find/save.
+    vector<int> ids;
+    {
+        lock_guard<mutex> lk(g_name_index_mutex);
+        ids.reserve(g_name_index.size());
+        for (auto& kv : g_name_index) ids.push_back(kv.second);
     }
-    for (auto& p : snapshots) {
+    for (int id : ids) {
+        shared_ptr<Player> p;
+        { ClientMap::const_accessor a; if (g_clients.find(a, id)) p = a->second; }
+        if (!p) continue;  // 스냅샷 직후 접속종료된 경우
         auto name_ptr = atomic_load(&p->name);
-        if (!name_ptr || name_ptr->empty()) continue;  // 아직 LOGIN 전이거나 익명
+        if (!name_ptr || name_ptr->empty()) continue;
         g_db_worker.EnqueueSave(p->id, SnapshotPlayer(p));
     }
     // 다음 자동 저장 tick 재스케줄 (entity_id=0은 dummy)
@@ -2229,6 +2243,13 @@ void worker_thread() {
                     auto name_ptr = atomic_load(&disconnected->name);
                     if (name_ptr && !name_ptr->empty()) {
                         g_db_worker.EnqueueSave(client_id, SnapshotPlayer(disconnected));
+                        // 이름 인덱스에서 이 client_id 항목 제거 (동명이인의 다른 항목은 보존)
+                        lock_guard<mutex> lk(g_name_index_mutex);
+                        auto range = g_name_index.equal_range(*name_ptr);
+                        for (auto it = range.first; it != range.second; ) {
+                            if (it->second == client_id) it = g_name_index.erase(it);
+                            else ++it;
+                        }
                     }
                 }
 
@@ -2323,6 +2344,11 @@ static void HandleLogin(const shared_ptr<Player>& session, int client_id, unsign
     C2S_Login* pkt = reinterpret_cast<C2S_Login*>(ptr);
     std::string username = pkt->username;
     atomic_store(&session->name, make_shared<string>(username));
+    // 이름 인덱스 등록 (파티 초대 이름 탐색용). disconnect 시 같은 client_id 항목만 제거.
+    {
+        lock_guard<mutex> lk(g_name_index_mutex);
+        g_name_index.emplace(username, client_id);
+    }
     g_db_worker.EnqueueLoad(client_id, std::move(username));
 }
 
@@ -2684,13 +2710,18 @@ static void HandlePartyInvite(const shared_ptr<Player>& session, int client_id, 
         }
     }
 
-    // 이름으로 대상 찾기
+    // 이름으로 대상 찾기 — g_name_index O(1) 조회 (g_clients 직접 순회는 동시 erase로 UB).
+    // 동명이인 대비 equal_range 순회 + 현재 이름 재확인. 자기 자신은 제외.
     shared_ptr<Player> target;
-    for (auto it = g_clients.begin(); it != g_clients.end(); ++it) {
-        auto nptr = atomic_load(&it->second->name);
-        if (nptr && *nptr == target_name && it->second->id != client_id) {
-            target = it->second;
-            break;
+    {
+        lock_guard<mutex> lk(g_name_index_mutex);
+        auto range = g_name_index.equal_range(target_name);
+        for (auto it = range.first; it != range.second; ++it) {
+            if (it->second == client_id) continue;
+            ClientMap::const_accessor a;
+            if (!g_clients.find(a, it->second)) continue;
+            auto nptr = atomic_load(&a->second->name);
+            if (nptr && *nptr == target_name) { target = a->second; break; }
         }
     }
     if (!target) { SendSystemMessage(session, "Player not found."); return; }
