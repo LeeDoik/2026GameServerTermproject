@@ -9,36 +9,37 @@
 #   area      : 마을(960~1040) 회피해서 4지역별로 좁은 사각형 지정
 #
 # 각 지역 50K, 종당 12.5K (총 200K).
+# [밸런스] 2026-05-30: 일반 NPC hp를 약 절반으로 하향 (몬스터가 잘 안 죽던 문제).
 
 # ==== SW 초원 (0..960, 1040..2000) — Lv 1~10 ====
-12496  Peace    Roaming  1   Slime        1    20    0     1040  960   2000
-12500  Peace    Roaming  2   Rat          3    60    0     1040  960   2000
-12500  Peace    Roaming  3   Goblin       5   100    0     1040  960   2000
-12500  Agro     Roaming  4   Wolf         8   160    0     1040  960   2000
+12496  Peace    Roaming  1   Slime        1    10    0     1040  960   2000
+12500  Peace    Roaming  2   Rat          3    30    0     1040  960   2000
+12500  Peace    Roaming  3   Goblin       5    50    0     1040  960   2000
+12500  Agro     Roaming  4   Wolf         8    80    0     1040  960   2000
 
 # ==== SE 숲 (1040..2000, 1040..2000) — Lv 10~20 ====
-12500  Agro     Roaming  5   Spriggan    11   220   1040  1040  2000  2000
-12500  Agro     Roaming  6   ForestDrake 14   280   1040  1040  2000  2000
-12500  Peace    Roaming  7   Dryad       12   240   1040  1040  2000  2000
-12500  Agro     Roaming  8   Centaur     17   340   1040  1040  2000  2000
+12500  Agro     Roaming  5   Spriggan    11   110   1040  1040  2000  2000
+12500  Agro     Roaming  6   ForestDrake 14   140   1040  1040  2000  2000
+12500  Peace    Roaming  7   Dryad       12   120   1040  1040  2000  2000
+12500  Agro     Roaming  8   Centaur     17   170   1040  1040  2000  2000
 
 # ==== NE 사막 (1040..2000, 0..960) — Lv 20~30 ====
-12500  Agro     Roaming  9   Mummy       21   420   1040  0     2000  960
-12500  Agro     Roaming  10  Naga        24   480   1040  0     2000  960
-12500  Agro     Roaming  11  Anubis      27   540   1040  0     2000  960
-12500  Agro     Roaming  12  Sphinx      30   600   1040  0     2000  960
+12500  Agro     Roaming  9   Mummy       21   210   1040  0     2000  960
+12500  Agro     Roaming  10  Naga        24   240   1040  0     2000  960
+12500  Agro     Roaming  11  Anubis      27   270   1040  0     2000  960
+12500  Agro     Roaming  12  Sphinx      30   300   1040  0     2000  960
 
 # ==== NW 설원 (0..960, 0..960) — Lv 30~40 ====
-12500  Agro     Roaming  13  IceBeast    32   640    0     0     960   960
-12500  Agro     Roaming  14  FrostGiant  35   700    0     0     960   960
-12500  Agro     Roaming  15  Wraith      37   740    0     0     960   960
-12500  Agro     Roaming  16  IceDragon   40   800    0     0     960   960
+12500  Agro     Roaming  13  IceBeast    32   320    0     0     960   960
+12500  Agro     Roaming  14  FrostGiant  35   350    0     0     960   960
+12500  Agro     Roaming  15  Wraith      37   370    0     0     960   960
+12500  Agro     Roaming  16  IceDragon   40   400    0     0     960   960
 
 # ==== 보스 (바이옴별 1마리, 총 4마리 = 200000 총합 유지) ====
 # visual_id=17: 보스 전용 스프라이트 슬롯 (클라이언트에서 red-orc 대형으로 표시)
 # area 는 Fixed 이므로 spawn 위치만 의미. NpcSpawner가 walkable 위치 추첨.
 # level/hp 는 GameConfig.h BOSS_LEVEL/BOSS_MAX_HP 로 덮어씀
-1  Boss  Fixed  17  GrassBoss   50  5000   400  1300  600  1500
-1  Boss  Fixed  17  ForestBoss  50  5000  1400  1300 1600  1500
-1  Boss  Fixed  17  DesertBoss  50  5000  1400   300 1600   500
-1  Boss  Fixed  17  IceBoss     50  5000   400   300  600   500
+1  Boss  Fixed  17  GrassBoss   50  3000   400  1300  600  1500
+1  Boss  Fixed  17  ForestBoss  50  3000  1400  1300 1600  1500
+1  Boss  Fixed  17  DesertBoss  50  3000  1400   300 1600   500
+1  Boss  Fixed  17  IceBoss     50  3000   400   300  600   500

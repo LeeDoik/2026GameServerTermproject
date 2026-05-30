@@ -55,6 +55,12 @@ enum PACKET_TYPE {
 	S2C_ITEM_DROP,		// Server to Client: 바닥 아이템 생성 (drop_id/item_id/x/y)
 	S2C_ITEM_REMOVE,	// Server to Client: 바닥 아이템 제거 (줍힘/만료)
 	S2C_INVENTORY,		// Server to Client: 인벤토리 + 장착 전체 스냅샷 (본인 전용)
+
+	// Stage 9: 퀘스트 시스템
+	C2S_QUEST_INTERACT,	// Client to Server: 마을 NPC(장로)와 대화 시도 (npc_index)
+	C2S_QUEST_ACTION,	// Client to Server: 대화창에서 수락/보상수령 확정 (quest_id, action)
+	S2C_QUEST_DIALOGUE,	// Server to Client: 대화창 표시 지시 (kind)
+	S2C_QUEST_UPDATE,	// Server to Client: 퀘스트 상태/진행 동기화
 };
 
 #pragma pack(push, 1) // Ensure no padding between struct members
@@ -311,6 +317,41 @@ struct S2C_Inventory {
 	InvSlotNet    slots[MAX_INVENTORY_SLOTS];
 	int           equipped_weapon_id;       // -1 = 없음
 	int           equipped_armor_id;        // -1 = 없음
+};
+
+// === Stage 9: 퀘스트 패킷 ===
+// 마을 NPC(장로)와 대화 시도. 서버가 좌표 근접성을 검증.
+struct C2S_QuestInteract {
+	unsigned char size;
+	PACKET_TYPE   type;
+	unsigned char npc_index; // 0 = 장로(퀘스트 giver)
+};
+
+// 대화창에서의 확정 입력.
+struct C2S_QuestAction {
+	unsigned char size;
+	PACKET_TYPE   type;
+	int           quest_id;
+	unsigned char action;    // 0=accept, 1=turnin
+};
+
+// 서버가 클라에 어떤 대화창을 띄울지 지시.
+struct S2C_QuestDialogue {
+	unsigned char size;
+	PACKET_TYPE   type;
+	unsigned char npc_index;
+	int           quest_id;  // 관련 퀘스트 (kind=None이면 -1)
+	unsigned char kind;      // 0=Offer(수락가능) 1=InProgress(진행중) 2=ReadyTurnIn(보상수령) 3=None
+};
+
+// 퀘스트 상태/진행 동기화 (수락/킬진행/완료/로그인복원 시).
+struct S2C_QuestUpdate {
+	unsigned char size;
+	PACKET_TYPE   type;
+	int           quest_id;
+	int           kill_count;
+	int           target_count;
+	unsigned char state;     // 0=active, 1=completed
 };
 
 #pragma pack(pop) // Restore default packing

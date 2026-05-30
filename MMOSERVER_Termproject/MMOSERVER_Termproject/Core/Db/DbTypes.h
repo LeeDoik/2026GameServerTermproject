@@ -6,6 +6,7 @@
 #include <string>
 #include <vector>
 #include <utility>
+#include <array>
 
 // 저장 대상 핵심 필드 (PDF 명세 6장 수준 — 사용자 합의)
 struct PlayerSnapshot {
@@ -20,6 +21,8 @@ struct PlayerSnapshot {
     std::vector<std::pair<int, int>> inventory;  // (item_id, qty)
     int equipped_weapon_id = -1;
     int equipped_armor_id = -1;
+    // Stage 9: 퀘스트 — (quest_id, kill_count, state) state 0=active,1=completed
+    std::vector<std::array<int, 3>> quests;
 };
 
 enum class DbReqKind {

@@ -85,6 +85,37 @@ int  g_equipped_weapon_id = -1;
 int  g_equipped_armor_id  = -1;
 bool g_inv_open = false;
 
+// === Stage 9: 퀘스트 ===
+// 제목/설명은 서버 data/quests.txt와 동일 ID로 매핑 (서버는 로직, 클라는 표시 텍스트).
+struct ClientQuestMeta { const char* title; const char* desc; const char* target_disp; int target_count; };
+static const std::unordered_map<int, ClientQuestMeta> g_quest_meta = {
+    { 1, { "슬라임 퇴치",   "초원의 슬라임이 마을을 위협합니다. 슬라임을 처치하세요.", "Slime",  3 } },
+    { 2, { "쥐 사냥",      "창고의 쥐가 식량을 갉아먹습니다. 쥐를 사냥하세요.",       "Rat",    5 } },
+    { 3, { "고블린 토벌",   "고블린 무리가 길을 막고 있습니다. 고블린을 토벌하세요.",   "Goblin", 5 } },
+};
+static const ClientQuestMeta* quest_meta(int id) {
+    auto it = g_quest_meta.find(id);
+    return (it == g_quest_meta.end()) ? nullptr : &it->second;
+}
+
+struct QuestProgressC { int id; int kill_count; int target; int state; }; // state 0=active,1=completed
+std::vector<QuestProgressC> g_quests;          // 보유 퀘스트 (진행+완료)
+bool g_quest_log_open = false;                  // J 토글
+
+// 대화창 상태 (S2C_QUEST_DIALOGUE로 세팅)
+bool          g_dialogue_open = false;
+int           g_dialogue_quest = -1;
+unsigned char g_dialogue_kind = 3;             // 0=Offer 1=InProgress 2=ReadyTurnIn 3=None
+unsigned char g_dialogue_npc = 0;
+
+// 장로(g_village_npcs[0])에게 받을 수 있는/완료 가능한 퀘스트가 있으면 머리 위 마커 강조용
+static bool quest_has_turnin_ready() {
+    for (const auto& q : g_quests) {
+        if (q.state == 0 && q.kill_count >= q.target) return true;
+    }
+    return false;
+}
+
 static void add_chat_line(const std::string& s) {
     g_chat_log.push_back(s);
     if ((int)g_chat_log.size() > CHAT_LOG_MAX) {
@@ -1263,6 +1294,42 @@ void ProcessPacket(char* ptr)
         g_equipped_armor_id  = p->equipped_armor_id;
         break;
     }
+    case S2C_QUEST_DIALOGUE:
+    {
+        S2C_QuestDialogue* p = reinterpret_cast<S2C_QuestDialogue*>(ptr);
+        g_dialogue_npc   = p->npc_index;
+        g_dialogue_quest = p->quest_id;
+        g_dialogue_kind  = p->kind;
+        g_dialogue_open  = true;
+        break;
+    }
+    case S2C_QUEST_UPDATE:
+    {
+        S2C_QuestUpdate* p = reinterpret_cast<S2C_QuestUpdate*>(ptr);
+        bool found = false;
+        for (auto& q : g_quests) {
+            if (q.id == p->quest_id) {
+                q.kill_count = p->kill_count;
+                q.target     = p->target_count;
+                q.state      = p->state;
+                found = true;
+                break;
+            }
+        }
+        if (!found) g_quests.push_back({ p->quest_id, p->kill_count, p->target_count, p->state });
+
+        const ClientQuestMeta* m = quest_meta(p->quest_id);
+        std::string title = m ? m->title : ("Quest " + std::to_string(p->quest_id));
+        if (p->state == 1) {
+            add_chat_line("[Quest] '" + title + "' 완료!");
+        } else if (p->kill_count >= p->target_count && p->target_count > 0) {
+            add_chat_line("[Quest] '" + title + "' 목표 달성 — 장로에게 보고하세요.");
+        } else {
+            add_chat_line("[Quest] '" + title + "' " +
+                          std::to_string(p->kill_count) + "/" + std::to_string(p->target_count));
+        }
+        break;
+    }
     }
 }
 
@@ -1898,6 +1965,89 @@ static void draw_hud()
 
         panel_text("1-0 use/equip   R unequip weapon   F unequip armor", panel_x + 14, panel_y + PH - 24, 12, sf::Color(200, 200, 200));
     }
+
+    // 공용 텍스트 헬퍼 (퀘스트 UI)
+    auto hud_text = [&](const std::string& s, float x, float y, unsigned sz, sf::Color c) {
+        sf::Text t; t.setFont(*g_font);
+        t.setString(sf::String::fromUtf8(s.begin(), s.end()));
+        t.setCharacterSize(sz); t.setFillColor(c);
+        t.setOutlineColor(sf::Color::Black); t.setOutlineThickness(1.0f);
+        t.setPosition(x, y); g_window->draw(t);
+    };
+
+    // Stage 9: 퀘스트 로그 패널 (J 토글) — 화면 우측 상단
+    if (g_quest_log_open) {
+        constexpr float PW = 320.0f, PH = 230.0f;
+        float px = WINDOW_WIDTH - PW - 16.0f;
+        float py = 80.0f;
+        sf::RectangleShape bg(sf::Vector2f(PW, PH));
+        bg.setFillColor(sf::Color(15, 12, 28, 232));
+        bg.setOutlineColor(sf::Color(130, 200, 255));
+        bg.setOutlineThickness(2.0f);
+        bg.setPosition(px, py);
+        g_window->draw(bg);
+
+        hud_text("퀘스트  [J] 닫기", px + 14, py + 10, 18, sf::Color(150, 220, 255));
+        float ty = py + 42;
+        if (g_quests.empty()) {
+            hud_text("진행 중인 퀘스트가 없습니다.", px + 14, ty, 14, sf::Color(190, 190, 190));
+            hud_text("마을 북서쪽 장로에게 T로 말을 거세요.", px + 14, ty + 22, 13, sf::Color(160, 160, 160));
+        } else {
+            for (const auto& q : g_quests) {
+                const ClientQuestMeta* m = quest_meta(q.id);
+                std::string title = m ? m->title : ("Quest " + std::to_string(q.id));
+                if (q.state == 1) {
+                    hud_text(title + "  (완료)", px + 14, ty, 14, sf::Color(140, 140, 140));
+                } else if (q.kill_count >= q.target) {
+                    hud_text(title + "  [보고 가능]", px + 14, ty, 14, sf::Color(255, 220, 120));
+                } else {
+                    char prog[16]; sprintf_s(prog, "%d/%d", q.kill_count, q.target);
+                    hud_text(title + "  " + prog, px + 14, ty, 14, sf::Color(220, 235, 255));
+                }
+                ty += 24;
+                if (ty > py + PH - 20) break;
+            }
+        }
+    }
+
+    // Stage 9: 퀘스트 대화창 (장로와 대화 시) — 화면 하단 중앙
+    if (g_dialogue_open) {
+        constexpr float PW = 560.0f, PH = 150.0f;
+        float px = (WINDOW_WIDTH - PW) * 0.5f;
+        float py = WINDOW_HEIGHT - PH - 40.0f;
+        sf::RectangleShape bg(sf::Vector2f(PW, PH));
+        bg.setFillColor(sf::Color(10, 10, 20, 240));
+        bg.setOutlineColor(sf::Color(230, 200, 110));
+        bg.setOutlineThickness(2.0f);
+        bg.setPosition(px, py);
+        g_window->draw(bg);
+
+        hud_text("장로 (Elder)", px + 16, py + 10, 16, sf::Color(255, 225, 150));
+
+        const ClientQuestMeta* m = quest_meta(g_dialogue_quest);
+        std::string title = m ? m->title : ("Quest " + std::to_string(g_dialogue_quest));
+        std::string desc  = m ? m->desc : "";
+
+        if (g_dialogue_kind == 0) {  // Offer
+            hud_text("[새 퀘스트] " + title, px + 16, py + 40, 16, sf::Color(180, 230, 255));
+            hud_text(desc, px + 16, py + 66, 13, sf::Color(220, 220, 220));
+            hud_text("[Y] 수락     [Esc] 닫기", px + 16, py + PH - 28, 14, sf::Color(160, 255, 160));
+        } else if (g_dialogue_kind == 2) {  // ReadyTurnIn
+            hud_text(title + " — 목표 달성!", px + 16, py + 40, 16, sf::Color(255, 220, 120));
+            hud_text("수고했네. 보상을 받게나.", px + 16, py + 66, 13, sf::Color(220, 220, 220));
+            hud_text("[Y] 보상 받기     [Esc] 닫기", px + 16, py + PH - 28, 14, sf::Color(255, 220, 120));
+        } else if (g_dialogue_kind == 1) {  // InProgress
+            int kc = 0, tg = 0;
+            for (const auto& q : g_quests) if (q.id == g_dialogue_quest) { kc = q.kill_count; tg = q.target; break; }
+            char prog[24]; sprintf_s(prog, "진행 중: %d/%d", kc, tg);
+            hud_text(title, px + 16, py + 40, 16, sf::Color(200, 220, 255));
+            hud_text(prog, px + 16, py + 66, 14, sf::Color(220, 235, 255));
+            hud_text("[Esc] 닫기", px + 16, py + PH - 28, 14, sf::Color(200, 200, 200));
+        } else {  // None
+            hud_text("지금은 줄 퀘스트가 없네. 다음에 또 오게.", px + 16, py + 44, 14, sf::Color(210, 210, 210));
+            hud_text("[Esc] 닫기", px + 16, py + PH - 28, 14, sf::Color(200, 200, 200));
+        }
+    }
 }
 
 void client_main()
@@ -2015,14 +2165,20 @@ void client_main()
     if (in_view_tile(VILLAGE_X2-1, 994)) draw_village_sprite(VILLAGE_X2-1, 994, 6);
     if (in_view_tile(VILLAGE_X2-1, 1005)) draw_village_sprite(VILLAGE_X2-1, 1005, 7);
     // 마을 NPC 4명 + 머리 위 라벨
-    for (const auto& npc : g_village_npcs) {
+    int npc_count = (int)(sizeof(g_village_npcs) / sizeof(g_village_npcs[0]));
+    for (int ni = 0; ni < npc_count; ++ni) {
+        const auto& npc = g_village_npcs[ni];
         if (!in_view_tile(npc.x, npc.y)) continue;
         draw_village_sprite(npc.x, npc.y, npc.sprite_col);
+        // Stage 9: 장로(0)는 보고 가능 퀘스트가 있으면 "?"(금색)로 강조
+        const char* label = npc.label;
+        sf::Color label_color = sf::Color::Yellow;
+        if (ni == 0 && quest_has_turnin_ready()) { label = "?"; label_color = sf::Color(255, 215, 90); }
         sf::Text t;
         t.setFont(*g_font);
-        t.setString(npc.label);
+        t.setString(label);
         t.setCharacterSize(20);
-        t.setFillColor(sf::Color::Yellow);
+        t.setFillColor(label_color);
         t.setOutlineColor(sf::Color::Black);
         t.setOutlineThickness(2.0f);
         t.setStyle(sf::Text::Bold);
@@ -2179,6 +2335,26 @@ int main()
                     continue;
                 }
 
+                // Stage 9: 퀘스트 대화창이 열린 동안엔 Y=확정 / Escape=닫기만 처리 (모달)
+                if (g_dialogue_open) {
+                    if (event.key.code == sf::Keyboard::Y) {
+                        if (g_dialogue_kind == 0 || g_dialogue_kind == 2) {  // Offer 또는 ReadyTurnIn
+                            C2S_QuestAction qa;
+                            qa.size = sizeof(qa);
+                            qa.type = C2S_QUEST_ACTION;
+                            qa.quest_id = g_dialogue_quest;
+                            qa.action = (g_dialogue_kind == 0) ? 0 : 1;  // 0=accept,1=turnin
+                            send_packet(&qa);
+                        }
+                        g_dialogue_open = false;
+                    }
+                    else if (event.key.code == sf::Keyboard::Escape ||
+                             event.key.code == sf::Keyboard::T) {
+                        g_dialogue_open = false;
+                    }
+                    continue;  // 대화창 동안 다른 입력 차단
+                }
+
                 // Stage 8: 인벤토리 패널이 열린 동안엔 숫자/장착 키를 인벤 조작으로 가로챔 (모달)
                 if (g_inv_open) {
                     int slot = -1;
@@ -2277,6 +2453,22 @@ int main()
                     C2S_PickUp pk; pk.size = sizeof(pk); pk.type = C2S_PICKUP; send_packet(&pk);
                     break;
                 }
+                // Stage 9: T=장로와 대화(근처에서만), J=퀘스트 로그 토글
+                case sf::Keyboard::T: {
+                    int ndx = abs((int)avatar.m_x - g_village_npcs[0].x);
+                    int ndy = abs((int)avatar.m_y - g_village_npcs[0].y);
+                    if (std::max(ndx, ndy) <= 3) {
+                        C2S_QuestInteract qi;
+                        qi.size = sizeof(qi);
+                        qi.type = C2S_QUEST_INTERACT;
+                        qi.npc_index = 0;
+                        send_packet(&qi);
+                    } else {
+                        add_chat_line("[Quest] 장로 근처(마을 북서쪽)에서 T로 대화하세요.");
+                    }
+                    break;
+                }
+                case sf::Keyboard::J: g_quest_log_open = !g_quest_log_open; break;
                 case sf::Keyboard::Escape: window.close(); break;
                 }
 

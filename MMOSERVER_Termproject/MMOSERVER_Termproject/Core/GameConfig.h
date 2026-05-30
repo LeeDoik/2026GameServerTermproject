@@ -27,7 +27,7 @@ constexpr int BASE_EXP_MULTIPLIER = 2;
 constexpr int ATTACK_INTERVAL_MS = 1000;     // 플레이어 공격 쿨타임 (PDF: 1초/공격)
 constexpr int BASE_DAMAGE_PER_LEVEL = 10;    // 플레이어 데미지 = level * 10
 constexpr int NPC_ATTACK_INTERVAL_MS = 1000; // NPC 공격 쿨타임
-constexpr int NPC_BASE_DAMAGE = 5;           // NPC 데미지 = level * 5 (플레이어보다 약하게)
+constexpr int NPC_BASE_DAMAGE = 2;           // NPC 데미지 = level * 2 (밸런스 하향: 캐릭터가 너무 빨리 죽던 문제)
 
 // 사망 시 리스폰 위치 (Aetheria Village 분수 남쪽 — 분수 sprite 위에 안 겹치게)
 constexpr short PLAYER_SPAWN_X = 1000;
@@ -50,9 +50,9 @@ constexpr int BOSS_AGRO_RANGE         = 10;       // Agro 감지 반경 (일반:
 constexpr int BOSS_AOE_RANGE          = 3;        // AoE 타격 반경 (chebyshev)
 constexpr int BOSS_AOE_INTERVAL_TICKS = 5;        // AoE는 5틱마다 1회
 constexpr int BOSS_CHAT_INTERVAL_TICKS= 3;        // 분노 상태 채팅 주기 (틱)
-constexpr int BOSS_MAX_HP             = 5000;
+constexpr int BOSS_MAX_HP             = 3000;     // 밸런스 하향 (기존 5000)
 constexpr int BOSS_LEVEL              = 50;
-constexpr int BOSS_BASE_DAMAGE        = 30;       // 보스 기본 타격 데미지
+constexpr int BOSS_BASE_DAMAGE        = 15;       // 보스 기본 타격 데미지 (밸런스 하향, 기존 30)
 constexpr int BOSS_EXP_MULTIPLIER     = 20;       // 일반 EXP 공식에 추가로 20배
 
 // Stage 7: 스킬 시스템
@@ -72,3 +72,10 @@ constexpr int SKILL_HEAL_PERCENT          = 30; // max_hp의 30%
 constexpr int GROUND_ITEM_EXPIRE_MS = 60000;   // 바닥 아이템 60초 후 자동 소멸
 constexpr int ITEM_PICKUP_RANGE     = 1;       // 줍기 가능 거리 (manhattan)
 constexpr int DROP_ID_START         = 2000000; // 바닥 아이템 ID 시작 (player<1e6, npc<1.2e6과 분리)
+
+// Stage 9: 퀘스트 시스템
+// 장로(퀘스트 giver, 마을 NPC index 0) 좌표 — client.cpp g_village_npcs[0]와 일치해야 함.
+// 서버는 상호작용 시 플레이어가 이 좌표 ±RANGE 내인지 검증 (클라 좌표 불신).
+constexpr short QUEST_GIVER_X       = 985;
+constexpr short QUEST_GIVER_Y       = 985;
+constexpr int   QUEST_INTERACT_RANGE = 3;      // chebyshev 거리

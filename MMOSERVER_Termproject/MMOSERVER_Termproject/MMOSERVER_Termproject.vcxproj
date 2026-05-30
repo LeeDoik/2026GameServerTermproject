@@ -149,6 +149,7 @@
     <ClCompile Include="Core\Map.cpp" />
     <ClCompile Include="Core\AStar.cpp" />
     <ClCompile Include="Core\Item.cpp" />
+    <ClCompile Include="Core\Quest.cpp" />
     <ClCompile Include="Core\Db\JsonFileBackend.cpp" />
     <ClCompile Include="Core\Db\DbWorker.cpp" />
   </ItemGroup>
@@ -166,6 +167,7 @@
     <ClInclude Include="Core\Map.h" />
     <ClInclude Include="Core\AStar.h" />
     <ClInclude Include="Core\Item.h" />
+    <ClInclude Include="Core\Quest.h" />
     <ClInclude Include="Core\Db\DbTypes.h" />
     <ClInclude Include="Core\Db\IDbBackend.h" />
     <ClInclude Include="Core\Db\JsonFileBackend.h" />

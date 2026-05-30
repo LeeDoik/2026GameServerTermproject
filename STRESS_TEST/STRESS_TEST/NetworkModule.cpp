@@ -182,6 +182,8 @@ void ProcessPacket(int ci, unsigned char packet[])
 	case S2C_ITEM_DROP: break;     // Stage 8 아이템 — 더미 클라는 무시
 	case S2C_ITEM_REMOVE: break;
 	case S2C_INVENTORY: break;
+	case S2C_QUEST_DIALOGUE: break;  // Stage 9 퀘스트 — 더미 클라는 무시
+	case S2C_QUEST_UPDATE: break;
 	case S2C_AVATAR_INFO:
 	{
 		g_clients[ci].connected = true;

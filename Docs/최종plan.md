@@ -1,7 +1,7 @@
 # Aetheria Online MMO 서버 재설계 계획
 
-> 최종 업데이트: 2026-05-29
-> Stage 1~6 완료. Stage 7.1 스킬 / 7.2 보스 / 7.3 클라 이펙트 / 7.4 파티 / 7.5 클라 메시지·EXP바 완료. Stage 8 아이템 시스템(소모·누적·인벤·장착) 완료. SQL Server 백엔드는 선택사항.
+> 최종 업데이트: 2026-05-30
+> Stage 1~6 완료. Stage 7.1 스킬 / 7.2 보스 / 7.3 클라 이펙트 / 7.4 파티 / 7.5 클라 메시지·EXP바 완료. Stage 8 아이템 시스템(소모·누적·인벤·장착) 완료. Stage 9 퀘스트 시스템(슬레이·대화·연쇄) 완료. SQL Server 백엔드는 선택사항.
 
 ---
 
@@ -25,7 +25,7 @@
 | Stage 7.3 — 클라 이펙트 완성도 강화 | ✅ 완료 | 공격 이펙트 분리(zap/sandblast), 데미지 popup, 화면흔들기, HP보간/저체력경고, Q스킬 5×5 폭발 |
 | Stage 7.4 — 파티 시스템 (EXP 분배 + 미니맵 + HP 바) | ✅ 완료 | /invite·/accept·/reject·/leave 명령, EXP 균등분배, 미니맵 청록 표시, 파티원 HP 바 HUD |
 | Stage 8 — 아이템 시스템 (소모/누적/인벤/장착) | ✅ 완료 | 카탈로그 8종(items.txt), NPC 드롭+G줍기, I 인벤 패널, 무기 공격력/방어구 max_hp, DB 영속성. 30초 stress 0 신규 에러 |
-| Stage 7 — 가산점 (퀘스트) | ⏳ 보류 | |
+| Stage 9 — 퀘스트 시스템 (슬레이/대화/연쇄) | ✅ 완료 | quests.txt 3단 연쇄, 처치 카운트 훅 3곳, 장로 대화 UI(T/J/Y), DB 영속성. 3종 빌드 0에러, 부팅 `[Quest] Loaded 3 quest defs.` / stderr 0 |
 
 **현재 부하 테스트 결과** (Stage 6.1 완료 시점, 2026-05-24): Release x64 기준 30초간 약 580+ connect / 신규 stderr 에러 0건. 200K NPC 활성 + 64개 장애물 rect (5.18% 점유) + 충돌 체크 통합 상태에서 Stage 5 대비 성능 회귀 없음.
 
@@ -470,9 +470,9 @@ PDF 기본 스펙을 코드/스크립트로 모두 반영. AI 결정 로직은 C
 | C | 보스 패턴 (이동/채팅/스킬) | 5-10점 | ✅ 완료 (Stage 7.2 — 바이옴별 보스 4마리, 2단계 AI) |
 | D | 파티 시스템 | 10점 | ✅ 완료 (Stage 7.4 — 초대/EXP분배/미니맵/HP바) |
 | E | 아이템: 소모 + 누적 + 인벤 + 장착 | 20점 | ✅ 완료 (Stage 8 — 4요소 모두 구현) |
-| F | 퀘스트 풀세트 | 25점 | ⏳ 미착수 (슬레이/대화/연쇄 — 시간 많이 필요) |
+| F | 퀘스트 풀세트 | 25점 | ✅ 완료 (Stage 9 — 슬레이/대화/연쇄 데이터 주도) |
 
-**전략**: A→B→C→D→E로 50점 확보 완료. 남은 시간은 F(퀘스트).
+**전략**: A→B→C→D→E→F 가산점 풀세트 확보 완료. 남은 작업은 (선택) SQL Server 백엔드 / 부하 측정 강화뿐.
 
 ---
 
@@ -690,9 +690,9 @@ MMOSERVER_Termproject/MMOSERVER_Termproject/
 
 ---
 
-## 우선순위 TOP 3 (남은 작업 기준, 2026-05-29 업데이트)
+## 우선순위 TOP 3 (남은 작업 기준, 2026-05-30 업데이트)
 
-**현재 상태**: PDF 명시 항목(IOCP/타이머/스크립트/시야/AI/A\*/DB) 전부 충족 + 스킬·보스·시각 완성도 강화 + **파티(10점) + 아이템(20점) 완료**. 가산점 50점 확보. 남은 작업은 퀘스트뿐.
+**현재 상태**: PDF 명시 항목(IOCP/타이머/스크립트/시야/AI/A\*/DB) 전부 충족 + 스킬·보스·시각 완성도 강화 + **파티(10점) + 아이템(20점) + 퀘스트(25점) 완료**. 가산점 풀세트 확보. 남은 작업은 (선택) SQL Server 백엔드 / 부하 측정 강화.
 
 ### ✅ 완료: 파티 시스템 (10점) — Stage 7.4
 - 패킷 6종, 온라인 파티원 EXP 균등 분배, 미니맵 청록 표시 + HP 바 HUD. 상세는 Stage 7.4 섹션 참조.
@@ -700,11 +700,10 @@ MMOSERVER_Termproject/MMOSERVER_Termproject/
 ### ✅ 완료: 아이템 시스템 (20점) — Stage 8
 - 카탈로그 8종(data/items.txt), NPC 드롭 + 수동 줍기(G), I 인벤 패널 + 숫자키, 무기 공격력/방어구 max_hp, DB 영속성. 상세는 Stage 8 섹션 참조.
 
-### 1순위: **퀘스트 시스템 (25점)** — 최대 점수지만 가장 시간 소요
-- 슬레이/대화/연쇄 등 풀세트 필요
-- 마을 NPC와 대화 — 이미 g_village_npcs 4명 있으니 그 위에 쌓을 수 있음
+### ✅ 완료: 퀘스트 시스템 (25점) — Stage 9
+- 슬레이 + 대화 + 연쇄를 한 데이터 주도(`data/quests.txt`) 아키텍처로 구현. 장로 대화 UI(T/J/Y), 처치 카운트 훅 3곳, DB 영속성. 상세는 Stage 9 섹션 참조.
 
-### 2순위: (선택) SQL Server 백엔드 / STRESS_TEST 강화
+### 1순위: (선택) SQL Server 백엔드 / STRESS_TEST 강화
 - JSON stub → OdbcBackend 교체 (IDbBackend 그대로). 더미에 공격/줍기 추가 시 아이템 부하도 측정 가능
 
 ### (선택) SQL Server 백엔드
@@ -851,3 +850,56 @@ MMOSERVER_Termproject/MMOSERVER_Termproject/
 
 ### 표절 회피
 - 카탈로그/드롭/인벤/장착 로직 모두 자체 작성. JSON 배열 직렬화도 외부 라이브러리 없이 수동. `Docs/npc.cpp`에 아이템 개념 없음
+
+---
+
+## ✅ Stage 9 — 퀘스트 시스템 (가산점 25점, 완료, 2026-05-30)
+
+가산점 최대 항목인 퀘스트를 **슬레이(처치) + 대화(수락/보상) + 연쇄(선행 퀘스트)** 풀세트로 구현. 기존 아이템/DB/브로드캐스트/HUD 패턴 위에 얹음.
+
+### 설계 결정
+- **단일 진실원 분리**: 서버가 퀘스트 로직(목표/보상/선행/상태)의 단일 진실원, 클라는 텍스트(제목/설명) 메타만 미러링. 패킷은 id/카운트/상태만 → 경량. (아이템 시스템의 `ClientItemMeta` 미러 패턴과 동일)
+- **마을 NPC는 클라 시각 마커**(`g_village_npcs[]`)일 뿐 서버 엔티티가 아님 → 상호작용은 "근처에서 키 입력 → 패킷 + 서버 좌표 근접 검증" 방식으로 우회 (장로 = index 0).
+- **슬레이 타겟 매칭**: NPC 이름(`Slime_00042`)의 `_` 앞 접두사 비교. `SlimeKing`이 `Slime`에 오매칭되지 않도록 접두사 직후가 `_` 또는 끝일 때만 일치.
+- **킬 크레딧**: 파티가 있으면 온라인 파티원 전원, 없으면 처치자 단독 (EXP 분배와 동일하게 거리 무관, 온라인 멤버 기준).
+
+### 신규 파일
+- `data/quests.txt` — 카탈로그 (`id prereq giver target_species count reward_exp reward_item reward_qty`, sscanf 라인 파서). 장로 3단 연쇄: 슬라임(3)→쥐(5)→고블린(5).
+- `Core/Quest.h / .cpp` — `QuestDef`, `g_quest_defs`, `GetQuestDef`, `LoadQuestDefs`(경로 후보 탐색), `QuestSpeciesMatches`(접두사 매칭). `Item.h/.cpp` 구조 모방.
+
+### 프로토콜 (`protocol_2026.h`) — enum 끝에 append (기존 ID 불변)
+- `C2S_QUEST_INTERACT(npc_index)` / `C2S_QUEST_ACTION(quest_id, action: 0=accept,1=turnin)`
+- `S2C_QUEST_DIALOGUE(npc_index, quest_id, kind)` — kind: 0=Offer / 1=InProgress / 2=ReadyTurnIn / 3=None
+- `S2C_QUEST_UPDATE(quest_id, kill_count, target_count, state)` — state: 0=active / 1=completed
+
+### 서버 (`MMOSERVER_Termproject.cpp`, `Core/GameConfig.h`)
+- `Player`: `quest_lock` + `vector<QuestProgress>{quest_id, kill_count, state}`
+- `GameConfig`: `QUEST_GIVER_X/Y=985`, `QUEST_INTERACT_RANGE=3` (chebyshev). client `g_village_npcs[0]`와 일치.
+- main(): 아이템 로드 직후 `LoadQuestDefs` (경로 후보 3개).
+- 헬퍼: `SendQuestUpdate`(1건), `SendAllQuestUpdates`(로그인 복원 동기화), `OnNpcKilledForQuest`(처치 카운트).
+- `C2S_QUEST_INTERACT` 핸들러: 근접 검증 → 대화 종류 판정(우선순위 ReadyTurnIn > InProgress > Offer > None) → `S2C_QuestDialogue`.
+- `C2S_QUEST_ACTION` 핸들러: 근접 재검증 → accept(선행 완료+미보유 검증 후 추가) / turnin(카운트 충족 시 state=completed + 보상: EXP는 `LevelUpPlayer`, 아이템은 `AddToInventoryLocked`+`SendInventory`).
+- **처치 훅 3지점**: 기본공격/AoE스킬/Line스킬 사망 처리에서 `GiveExpToKillerAndParty` 직후 `OnNpcKilledForQuest(session, n)` 호출.
+- `OnPlayerSpawn`: 인벤 복원 직후 `SendAllQuestUpdates`로 퀘스트 로그 영속 동기화.
+
+### DB 영속성 (`Core/Db/DbTypes.h`, `JsonFileBackend.cpp`)
+- `PlayerSnapshot`에 `std::vector<std::array<int,3>> quests` 추가.
+- Save: `"quests":[[id,cnt,state],...]` 직렬화. Load: `ReadIntTripleArray` 미니 파서(키 없으면 빈 목록 — 구버전 호환).
+- `SnapshotPlayer`: `quest_lock` 잡고 저장 / `OnPlayerSpawn`: 복원(def 없는 퀘스트는 스킵).
+
+### 클라이언트 (`CLIENT/client_sample/client.cpp`)
+- `ClientQuestMeta` 텍스트 테이블(quests.txt와 동일 id) + `g_quests` 상태 + 대화창 상태.
+- 입력: **T**=장로 대화(±3타일 근접 시 `C2S_QuestInteract`), **J**=퀘스트 로그 토글, 대화창 모달에서 **Y**=수락/보상수령·**Esc**=닫기.
+- 핸들러 `S2C_QUEST_DIALOGUE`(대화창 open) / `S2C_QUEST_UPDATE`(g_quests upsert + 채팅 로그).
+- 렌더: 하단 중앙 대화창(kind별 분기) + 우측 퀘스트 로그 패널 + 장로 마커 "!"→"?"(보고 가능 시 금색). 인벤 패널과 동일한 `RectangleShape`+`fromUtf8` 스타일.
+
+### STRESS_TEST
+- `S2C_QUEST_DIALOGUE/UPDATE` no-op case 추가 (기존 PARTY/ITEM no-op 패턴).
+
+### 검증 (Release x64, 2026-05-30)
+- 서버 / `client_sample` / `STRESS_TEST` 3종 모두 빌드 0 에러 (stress는 기존 C4819 한글 인코딩 경고만).
+- 부팅: `[Quest] Loaded 3 quest defs.` / 200K NPC + Lua + DB 정상 / **stderr 0건**.
+- 수동 검증(권장): 장로(985,985) `T` → 대화창 q1 Offer → `Y` 수락 → `J` 로그 0/3 → SW 초원 Slime 처치 1/3→3/3 → 장로 `T` ReadyTurnIn → `Y` 보상(EXP/포션, `I`로 확인) → q2 연쇄 등장 → 다른 종족(Rat)은 q1 미카운트 → 재로그인 시 진행/완료 유지(`data/players/<n>.json`에 `"quests":[...]`).
+
+### 표절 회피
+- 카탈로그/상태머신/연쇄/보상 로직 모두 자체 작성. JSON 3쌍 배열 직렬화도 외부 라이브러리 없이 수동. `Docs/npc.cpp`에 퀘스트 개념 없음.

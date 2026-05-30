@@ -27,6 +27,7 @@
 #include "Core/Map.h"
 #include "Core/AStar.h"
 #include "Core/Item.h"
+#include "Core/Quest.h"
 #include "Core/Db/DbTypes.h"
 #include "Core/Db/JsonFileBackend.h"
 #include "Core/Db/DbWorker.h"
@@ -234,6 +235,11 @@ struct Player : public Entity {
     atomic<int> equipped_armor_id{ -1 };         // 장착 방어구 item_id (-1=없음). max_hp에 보너스 직접 합산
     atomic<int> atk_bonus{ 0 };                  // 장착 무기 공격력 보너스 (데미지 핫패스 lockless 읽기)
 
+    // 퀘스트 — Stage 9
+    struct QuestProgress { int quest_id; int kill_count; unsigned char state; }; // state 0=active,1=completed
+    mutex quest_lock;                            // quests 변경 보호
+    vector<QuestProgress> quests;                // 진행중 + 완료 모두 보관, quest_lock 보호
+
     Player() : Entity(), socket(INVALID_SOCKET), recv_overlapped(IO_RECV), is_active(false),
                hp(100), max_hp(100), exp(0), level(1), last_attack_ms(0),
                last_skill1_ms(0), last_skill2_ms(0), last_skill3_ms(0) {
@@ -295,7 +301,7 @@ atomic<int> g_next_drop_id{ DROP_ID_START };
 // TBB concurrent_hash_map: 버킷 단위 락. accessor 패턴으로 find/insert/erase 모두 동시 안전
 using ClientMap = tbb::concurrent_hash_map<int, std::shared_ptr<Player>>;
 ClientMap g_clients;
-atomic<int> g_next_id{ 0 };
+atomic<int> g_next_id{ 1 };  // id 0은 시스템 메시지(S2C_CHAT_MESSAGE object_id=0) 전용 sentinel — 플레이어 id는 1부터
 HANDLE g_h_iocp;
 SOCKET g_listen_socket;
 LPFN_ACCEPTEX g_fp_accept_ex = nullptr;
@@ -453,6 +459,9 @@ void SendSystemMessage(std::shared_ptr<Player> session, const std::string& msg);
 void SpawnNpcLoot(NpcType type, NpcMoveMode mode, int level, short x, short y);
 void OnGroundItemExpire(int drop_id);
 void SendInventory(const std::shared_ptr<Player>& session);
+void SendQuestUpdate(const std::shared_ptr<Player>& session, int quest_id, int kill_count, int target_count, unsigned char state);
+void SendAllQuestUpdates(const std::shared_ptr<Player>& session);
+void OnNpcKilledForQuest(const std::shared_ptr<Player>& killer, const NPC& n);
 
 // 플레이어 시점에서 자기 시야 안의 NPC와 view_list를 동기화.
 // 새로 시야에 들어온 NPC: Add 전송 + 양방향 view 등록 + Lazy AI 활성
@@ -1186,6 +1195,13 @@ PlayerSnapshot SnapshotPlayer(const std::shared_ptr<Player>& session) {
     snap.equipped_weapon_id = session->equipped_weapon_id.load();
     snap.equipped_armor_id  = armor_id;
     { lock_guard<mutex> lk(session->inv_lock); snap.inventory = session->inventory; }
+    // Stage 9: 퀘스트 진행/완료 상태 저장
+    {
+        lock_guard<mutex> lk(session->quest_lock);
+        snap.quests.reserve(session->quests.size());
+        for (const auto& q : session->quests)
+            snap.quests.push_back({ q.quest_id, q.kill_count, static_cast<int>(q.state) });
+    }
     return snap;
 }
 
@@ -1234,6 +1250,16 @@ void OnPlayerSpawn(int client_id, const PlayerSnapshot& snap, bool exists) {
         session->equipped_armor_id.store(armor);
         session->atk_bonus.store(wdef ? wdef->value : 0);
         { lock_guard<mutex> lk(session->inv_lock); session->inventory = snap.inventory; }
+        // Stage 9: 퀘스트 진행/완료 상태 복원 (def가 없는 퀘스트는 스킵)
+        {
+            lock_guard<mutex> lk(session->quest_lock);
+            session->quests.clear();
+            for (const auto& q : snap.quests) {
+                if (!GetQuestDef(q[0])) continue;
+                unsigned char st = (q[2] != 0) ? 1 : 0;
+                session->quests.push_back({ q[0], q[1], st });
+            }
+        }
     }
     // 신규 캐릭은 atomic 기본값 (Player ctor: hp=100, max_hp=100, exp=0, level=1, 빈 인벤) 그대로 사용
 
@@ -1257,6 +1283,9 @@ void OnPlayerSpawn(int client_id, const PlayerSnapshot& snap, bool exists) {
 
     // Stage 8: 인벤토리 + 장착 상태 전송 (신규는 빈 인벤, 기존은 복원된 상태)
     SendInventory(session);
+
+    // Stage 9: 복원된 퀘스트 진행/완료 상태 동기화 (퀘스트 로그 영속)
+    SendAllQuestUpdates(session);
 
     // 2. 초기 view_list 구축 + 상호 가시화
     int sx = session->x / SECTOR_SIZE;
@@ -1355,6 +1384,83 @@ void SendSystemMessage(std::shared_ptr<Player> session, const std::string& msg) 
     strncpy_s(cm.message, sizeof(cm.message), msg.c_str(), _TRUNCATE);
     cm.message[MAX_CHAT_MSG_LEN - 1] = '\0';
     session->do_send(cm.size, &cm);
+}
+
+// === Stage 9: 퀘스트 헬퍼 ===
+
+// 퀘스트 상태 1건을 본인에게 전송 (수락/킬진행/완료/로그인복원 시).
+void SendQuestUpdate(const std::shared_ptr<Player>& session, int quest_id,
+                     int kill_count, int target_count, unsigned char state) {
+    S2C_QuestUpdate u;
+    u.size = sizeof(u);
+    u.type = S2C_QUEST_UPDATE;
+    u.quest_id = quest_id;
+    u.kill_count = kill_count;
+    u.target_count = target_count;
+    u.state = state;
+    session->do_send(u.size, &u);
+}
+
+// 로그인 직후: 보유한 모든 퀘스트 상태를 클라에 동기화 (퀘스트 로그 복원).
+void SendAllQuestUpdates(const std::shared_ptr<Player>& session) {
+    vector<Player::QuestProgress> snapshot;
+    {
+        lock_guard<mutex> lk(session->quest_lock);
+        snapshot = session->quests;
+    }
+    for (const auto& q : snapshot) {
+        const QuestDef* def = GetQuestDef(q.quest_id);
+        int target = def ? def->target_count : q.kill_count;
+        SendQuestUpdate(session, q.quest_id, q.kill_count, target, q.state);
+    }
+}
+
+// 한 플레이어의 진행중 슬레이 퀘스트에 처치 1건 반영 + 변경 시 본인에게 동기화.
+static void CreditQuestKill(const std::shared_ptr<Player>& p, const NPC& n) {
+    struct Changed { int quest_id; int kill_count; int target; unsigned char state; };
+    vector<Changed> changed;
+    {
+        lock_guard<mutex> lk(p->quest_lock);
+        for (auto& q : p->quests) {
+            if (q.state != 0) continue;  // active만
+            const QuestDef* def = GetQuestDef(q.quest_id);
+            if (!def) continue;
+            if (q.kill_count >= def->target_count) continue;  // 이미 충족
+            if (!QuestSpeciesMatches(def->target_species, n.name)) continue;
+            q.kill_count++;
+            if (q.kill_count > def->target_count) q.kill_count = def->target_count;
+            changed.push_back({ q.quest_id, q.kill_count, def->target_count, q.state });
+        }
+    }
+    for (const auto& c : changed) {
+        SendQuestUpdate(p, c.quest_id, c.kill_count, c.target, c.state);
+    }
+}
+
+// NPC 처치 시 호출 (전투/스킬 처치 3지점).
+// 파티가 있으면 온라인 파티원 전원에게, 없으면 처치자 본인에게 킬 크레딧.
+// (EXP 분배 GiveExpToKillerAndParty와 동일한 "멤버 수집 → 락 밖 처리" 패턴)
+void OnNpcKilledForQuest(const std::shared_ptr<Player>& killer, const NPC& n) {
+    if (g_quest_defs.empty()) return;
+
+    int party_id_val = killer->party_id.load();
+    if (party_id_val < 0) { CreditQuestKill(killer, n); return; }
+
+    vector<int> member_ids;
+    {
+        lock_guard<mutex> lk(g_party_mutex);
+        auto it = g_parties.find(party_id_val);
+        if (it != g_parties.end()) member_ids = it->second->members;
+    }
+
+    vector<shared_ptr<Player>> online_members;
+    for (int mid : member_ids) {
+        ClientMap::const_accessor a;
+        if (g_clients.find(a, mid)) online_members.push_back(a->second);
+    }
+    if (online_members.empty()) { CreditQuestKill(killer, n); return; }
+
+    for (auto& m : online_members) CreditQuestKill(m, n);
 }
 
 // === Stage 8: 바닥 아이템 헬퍼 ===
@@ -1727,6 +1833,23 @@ int main(int argc, char* argv[]) {
         cout << "[Item] Loaded " << item_count << " item defs." << endl;
     } else {
         cout << "[Item] items.txt not found — drops/equipment disabled." << endl;
+    }
+
+    // --- Stage 9: 퀘스트 카탈로그 로드 ---
+    const char* quest_paths[] = {
+        "data/quests.txt",
+        "../../data/quests.txt",
+        "../../../data/quests.txt",
+    };
+    int quest_count = -1;
+    for (const char* p : quest_paths) {
+        quest_count = LoadQuestDefs(p);
+        if (quest_count >= 0) break;
+    }
+    if (quest_count >= 0) {
+        cout << "[Quest] Loaded " << quest_count << " quest defs." << endl;
+    } else {
+        cout << "[Quest] quests.txt not found — quests disabled." << endl;
     }
 
     // --- Stage 4: NPC 스폰 ---
@@ -2372,6 +2495,7 @@ void process_packet(int client_id, unsigned char* ptr) {
                     }
                     GiveExpToKillerAndParty(session, exp_gain);
                     SpawnNpcLoot(n.type, n.move_mode, n.level, nx, ny);  // Stage 8: 루트 드롭
+                    OnNpcKilledForQuest(session, n);                     // Stage 9: 퀘스트 처치 카운트
                 }
             }
         }
@@ -2487,6 +2611,7 @@ void process_packet(int client_id, unsigned char* ptr) {
                             else { eg = 1ULL << (n.level > 0 ? n.level - 1 : 0); if (n.type == NpcType::Agro) eg *= 2; if (n.move_mode == NpcMoveMode::Roaming) eg *= 2; }
                             GiveExpToKillerAndParty(session, eg);
                             SpawnNpcLoot(n.type, n.move_mode, n.level, nx, ny);  // Stage 8: 루트 드롭
+                            OnNpcKilledForQuest(session, n);                     // Stage 9: 퀘스트 처치 카운트
                         }
                     }
                 }
@@ -2536,6 +2661,7 @@ void process_packet(int client_id, unsigned char* ptr) {
                         else { eg = 1ULL << (n.level > 0 ? n.level - 1 : 0); if (n.type == NpcType::Agro) eg *= 2; if (n.move_mode == NpcMoveMode::Roaming) eg *= 2; }
                         GiveExpToKillerAndParty(session, eg);
                         SpawnNpcLoot(n.type, n.move_mode, n.level, nx, ny);  // Stage 8: 루트 드롭
+                        OnNpcKilledForQuest(session, n);                     // Stage 9: 퀘스트 처치 카운트
                     }
                 }
             }
@@ -2853,6 +2979,132 @@ void process_packet(int client_id, unsigned char* ptr) {
         }
         if (changed) { SendInventory(session); SendStatusChange(session); }
         else SendSystemMessage(session, "Cannot unequip (inventory full or nothing equipped).");
+        break;
+    }
+    case C2S_QUEST_INTERACT: {
+        C2S_QuestInteract* p = reinterpret_cast<C2S_QuestInteract*>(ptr);
+        if (p->npc_index != 0) break;  // MVP: 장로(0)만 퀘스트 제공
+
+        // 근접성 검증 — 클라 좌표 불신, 서버 좌표로 chebyshev 거리 체크
+        int gdx = abs(static_cast<int>(session->x) - static_cast<int>(QUEST_GIVER_X));
+        int gdy = abs(static_cast<int>(session->y) - static_cast<int>(QUEST_GIVER_Y));
+        if (max(gdx, gdy) > QUEST_INTERACT_RANGE) {
+            SendSystemMessage(session, "You are too far from the Elder.");
+            break;
+        }
+
+        // 보유 퀘스트 스냅샷
+        vector<Player::QuestProgress> snap;
+        { lock_guard<mutex> lk(session->quest_lock); snap = session->quests; }
+        auto find_q = [&](int qid) -> const Player::QuestProgress* {
+            for (auto& q : snap) if (q.quest_id == qid) return &q;
+            return nullptr;
+        };
+
+        int dlg_quest = -1;
+        unsigned char kind = 3;  // None
+
+        // 1) 보상 수령 가능 (active + 카운트 충족) — 가장 낮은 id
+        for (const auto& q : snap) {
+            if (q.state != 0) continue;
+            const QuestDef* def = GetQuestDef(q.quest_id);
+            if (def && q.kill_count >= def->target_count) {
+                if (dlg_quest == -1 || q.quest_id < dlg_quest) dlg_quest = q.quest_id;
+            }
+        }
+        if (dlg_quest != -1) { kind = 2; }  // ReadyTurnIn
+        else {
+            // 2) 진행 중 (미충족) — 가장 낮은 id
+            for (const auto& q : snap) {
+                if (q.state != 0) continue;
+                if (dlg_quest == -1 || q.quest_id < dlg_quest) dlg_quest = q.quest_id;
+            }
+            if (dlg_quest != -1) { kind = 1; }  // InProgress
+            else {
+                // 3) offer 가능 (giver=0, 미보유, 선행 완료) — 가장 낮은 id
+                for (const QuestDef& def : g_quest_defs) {
+                    if (def.giver_npc != 0) continue;
+                    if (find_q(def.id)) continue;  // 이미 보유(진행 또는 완료)
+                    if (def.prereq_id >= 0) {
+                        const Player::QuestProgress* pr = find_q(def.prereq_id);
+                        if (!pr || pr->state != 1) continue;  // 선행 미완료
+                    }
+                    if (dlg_quest == -1 || def.id < dlg_quest) dlg_quest = def.id;
+                }
+                if (dlg_quest != -1) kind = 0;  // Offer
+            }
+        }
+
+        S2C_QuestDialogue dlg;
+        dlg.size = sizeof(dlg);
+        dlg.type = S2C_QUEST_DIALOGUE;
+        dlg.npc_index = 0;
+        dlg.quest_id = dlg_quest;
+        dlg.kind = kind;
+        session->do_send(dlg.size, &dlg);
+        break;
+    }
+    case C2S_QUEST_ACTION: {
+        C2S_QuestAction* p = reinterpret_cast<C2S_QuestAction*>(ptr);
+        const QuestDef* def = GetQuestDef(p->quest_id);
+        if (!def || def->giver_npc != 0) break;
+
+        // 보상이 걸린 동작이므로 근접성 재검증
+        int gdx = abs(static_cast<int>(session->x) - static_cast<int>(QUEST_GIVER_X));
+        int gdy = abs(static_cast<int>(session->y) - static_cast<int>(QUEST_GIVER_Y));
+        if (max(gdx, gdy) > QUEST_INTERACT_RANGE) {
+            SendSystemMessage(session, "You are too far from the Elder.");
+            break;
+        }
+
+        if (p->action == 0) {
+            // 수락
+            bool ok = false;
+            {
+                lock_guard<mutex> lk(session->quest_lock);
+                bool have = false;
+                for (auto& q : session->quests) if (q.quest_id == def->id) { have = true; break; }
+                bool prereq_ok = true;
+                if (def->prereq_id >= 0) {
+                    prereq_ok = false;
+                    for (auto& q : session->quests)
+                        if (q.quest_id == def->prereq_id && q.state == 1) { prereq_ok = true; break; }
+                }
+                if (!have && prereq_ok) {
+                    session->quests.push_back({ def->id, 0, (unsigned char)0 });
+                    ok = true;
+                }
+            }
+            if (ok) {
+                SendQuestUpdate(session, def->id, 0, def->target_count, 0);
+                SendSystemMessage(session, "Quest accepted.");
+            }
+        }
+        else if (p->action == 1) {
+            // 보상 수령 (active + 카운트 충족 시에만)
+            bool completed = false;
+            {
+                lock_guard<mutex> lk(session->quest_lock);
+                for (auto& q : session->quests) {
+                    if (q.quest_id == def->id && q.state == 0 && q.kill_count >= def->target_count) {
+                        q.state = 1;  // completed
+                        completed = true;
+                        break;
+                    }
+                }
+            }
+            if (completed) {
+                if (def->reward_exp > 0) LevelUpPlayer(session, def->reward_exp);
+                if (def->reward_item_id >= 0 && def->reward_item_qty > 0) {
+                    bool added;
+                    { lock_guard<mutex> lk(session->inv_lock); added = AddToInventoryLocked(*session, def->reward_item_id, def->reward_item_qty); }
+                    if (added) SendInventory(session);
+                    else SendSystemMessage(session, "Inventory full — reward item not granted.");
+                }
+                SendQuestUpdate(session, def->id, def->target_count, def->target_count, 1);
+                SendSystemMessage(session, "Quest complete! Rewards granted.");
+            }
+        }
         break;
     }
     case C2S_LOGOUT: {
