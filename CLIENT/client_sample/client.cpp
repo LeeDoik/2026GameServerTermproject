@@ -1,6 +1,7 @@
 #define _CRT_SECURE_NO_WARNINGS
 #include <SFML/Graphics.hpp>
 #include <SFML/Network.hpp>
+#include <SFML/Audio.hpp>
 #include <iostream>
 #include <unordered_map>
 #include <unordered_set>
@@ -126,6 +127,10 @@ static void add_chat_line(const std::string& s) {
 
 sf::RenderWindow* g_window;
 sf::Font* g_font;
+
+// 스킬 효과음
+sf::SoundBuffer g_sfx_q_buf, g_sfx_w_buf, g_sfx_e_buf;
+sf::Sound       g_sfx_q,     g_sfx_w,     g_sfx_e;
 
 // 워리어 스프라이트 시트 레이아웃 (256x256, 각 셀 64x64)
 //   Row 0: walk DOWN  (↓)  cols 0~3 = walk cycle
@@ -349,7 +354,7 @@ public:
         m_name.setFont(*g_font);
         m_name.setString(str);
         m_name.setCharacterSize(20);
-        m_name.setFillColor(sf::Color(255, 255, 0));
+        m_name.setFillColor(sf::Color(80, 220, 80));
         m_name.setStyle(sf::Text::Bold);
     }
 };
@@ -528,9 +533,15 @@ sf::Texture* skill_line_tex;    // 192x32, 6 프레임 — searing_ray (Line 관
 sf::Texture* skill_heal_tex;    // 96x32,  3 프레임 — goldaura (Heal 오라)
 sf::Texture* skill_sparkle_tex; // 96x32,  3 프레임 — gold_sparkles (Heal 스파클)
 
-// 기본 공격 이펙트 (DCSS 32x32, scale=2.0)
-sf::Texture* attack_player_tex; // 128x32, 4 프레임 — zap (플레이어 4방향 1칸 광역)
-sf::Texture* attack_npc_tex;    // 96x32,  3 프레임 — sandblast (NPC 정면 1칸)
+// 스킬 슬롯 아이콘 (DCSS gui 32x32)
+sf::Texture* skill_icon_q_tex;  // Q: AoE 화염 아이콘 (qazlal_upheaval)
+sf::Texture* skill_icon_w_tex;  // W: Line 관통 아이콘 (dithmenos_shadow_step)
+sf::Texture* skill_icon_e_tex;  // E: Heal 아이콘 (elyvilon_heal_other)
+
+// 기본 공격 이펙트
+sf::Texture* attack_player_tex;        // (구) 128x32, 4 프레임 — zap (미사용, 호환용)
+sf::Texture* attack_player_impact_tex; // 160x32, 5 프레임 — sfx-Sheet1 Row0 임팩트 버스트
+sf::Texture* attack_npc_tex;           // 96x32,  3 프레임 — sandblast (NPC 정면 1칸)
 
 sf::Sprite hud_sprite;       // HUD 그리기용 재사용 sprite
 
@@ -545,6 +556,7 @@ struct Effect {
     int offset_x, offset_y;    // 그릴 때 타일 좌상단 기준 픽셀 보정
     float scale = 1.0f;        // 렌더 배율 (DCSS 32x32 → 2.0f로 64x64)
     int start_delay_ms = 0;    // 이 시간 지나기 전엔 보이지 않음
+    sf::Color tint{ 255, 255, 255, 255 };  // 스프라이트 색상 틴트
     sf::Clock clock;
 
     long long active_ms() const {
@@ -569,6 +581,7 @@ struct Effect {
         int f = current_frame();
         sprite.setTextureRect(sf::IntRect(f * frame_w, 0, frame_w, frame_h));
         sprite.setScale(scale, scale);
+        sprite.setColor(tint);
         float rx = (world_x - g_left_x) * (float)TILE_WIDTH + offset_x;
         float ry = (world_y - g_top_y) * (float)TILE_WIDTH + offset_y;
         sprite.setPosition(rx, ry);
@@ -692,11 +705,24 @@ static void spawn_effect_skill_heal(int wx, int wy) {
     g_effects.push_back(make_dcss_effect(skill_sparkle_tex, 3, 700, wx, wy));
 }
 
-// 플레이어 기본 공격: zap 이펙트를 시전자 4방향 인접 1칸에 동시 spawn (광역 공격 표시)
+// 플레이어 기본 공격: 위→아래 내려치기 슬래시 (sfx-Sheet1 Row5)
 static void spawn_effect_attack_player(int wx, int wy) {
+    // 시전자 타일에 메인 슬래시 (scale 3.0 → 96px, 청백 날카로운 색)
+    {
+        Effect e = make_dcss_effect(attack_player_impact_tex, 5, 350, wx, wy);
+        e.scale = 3.0f;
+        e.offset_x = (TILE_WIDTH - (int)(32 * 3.0f)) / 2;  // 중앙 정렬
+        e.offset_y = (TILE_WIDTH - (int)(32 * 3.0f)) / 2;
+        e.tint = sf::Color(200, 235, 255);  // 청백 — 날카로운 칼날 느낌
+        g_effects.push_back(std::move(e));
+    }
+    // 인접 4칸에 잔상 슬래시 (scale 2.0, 짧게 200ms, 반투명)
     int offsets[4][2] = {{0,-1},{0,1},{-1,0},{1,0}};
-    for (auto& o : offsets)
-        g_effects.push_back(make_dcss_effect(attack_player_tex, 4, 350, wx + o[0], wy + o[1]));
+    for (auto& o : offsets) {
+        Effect e = make_dcss_effect(attack_player_impact_tex, 5, 200, wx + o[0], wy + o[1]);
+        e.tint = sf::Color(180, 220, 255, 140);
+        g_effects.push_back(std::move(e));
+    }
 }
 
 // NPC 기본 공격: sandblast 이펙트를 공격 방향 1칸에만 spawn
@@ -838,8 +864,12 @@ void client_initialize()
     skill_line_tex   = new sf::Texture;
     skill_heal_tex   = new sf::Texture;
     skill_sparkle_tex= new sf::Texture;
-    attack_player_tex= new sf::Texture;
-    attack_npc_tex   = new sf::Texture;
+    attack_player_tex        = new sf::Texture;
+    attack_player_impact_tex = new sf::Texture;
+    attack_npc_tex           = new sf::Texture;
+    skill_icon_q_tex = new sf::Texture;
+    skill_icon_w_tex = new sf::Texture;
+    skill_icon_e_tex = new sf::Texture;
 
     if (!LoadTextureWithFallback(dungeon_tiles,  "dungeon-tiles-dcss.png",           "tiles"))     exit(-1);
     if (!LoadTextureWithFallback(obstacle_tex,     "obstacles-dcss.png",             "tiles"))     exit(-1);
@@ -866,8 +896,12 @@ void client_initialize()
     if (!LoadTextureWithFallback(skill_line_tex,  "skill-line-ray-192x32.png",        "effects"))   exit(-1);
     if (!LoadTextureWithFallback(skill_heal_tex,  "skill-heal-gold-96x32.png",        "effects"))   exit(-1);
     if (!LoadTextureWithFallback(skill_sparkle_tex,"skill-heal-sparkle-96x32.png",    "effects"))   exit(-1);
-    if (!LoadTextureWithFallback(attack_player_tex,"attack-player-zap-128x32.png",    "effects"))   exit(-1);
-    if (!LoadTextureWithFallback(attack_npc_tex,   "attack-npc-sandblast-96x32.png",  "effects"))   exit(-1);
+    if (!LoadTextureWithFallback(attack_player_tex,       "attack-player-zap-128x32.png",    "effects"))   exit(-1);
+    if (!LoadTextureWithFallback(attack_player_impact_tex,"attack-player-slash-down-160x32.png", "effects"))   exit(-1);
+    if (!LoadTextureWithFallback(attack_npc_tex,          "attack-npc-sandblast-96x32.png",  "effects"))   exit(-1);
+    if (!LoadTextureWithFallback(skill_icon_q_tex, "skill-icon-q.png",                "ui"))        exit(-1);
+    if (!LoadTextureWithFallback(skill_icon_w_tex, "skill-icon-w.png",                "ui"))        exit(-1);
+    if (!LoadTextureWithFallback(skill_icon_e_tex, "skill-icon-e.png",                "ui"))        exit(-1);
 
     tile_sprite.setTexture(*dungeon_tiles);
     // DCSS 32x32 원본을 64px 칸에 정수배(2x) 업스케일. setSmooth(false)로 픽셀아트 보존.
@@ -922,6 +956,26 @@ void client_initialize()
         cout << "Font Loading Error!\n";
         exit(-1);
     }
+
+    // 스킬 효과음 로드 (실패해도 경고만, 게임 계속 동작)
+    auto load_sfx = [](sf::SoundBuffer& buf, sf::Sound& snd, const char* name) {
+        char p1[80], p2[80], p3[80];
+        std::snprintf(p1, sizeof(p1), "Resource/audio/sfx/%s", name);
+        std::snprintf(p2, sizeof(p2), "../../Resource/audio/sfx/%s", name);
+        std::snprintf(p3, sizeof(p3), "../../../Resource/audio/sfx/%s", name);
+        for (const char* p : {p1, p2, p3}) {
+            if (buf.loadFromFile(p)) {
+                snd.setBuffer(buf);
+                cout << "[Client] sfx loaded: " << p << "\n";
+                return;
+            }
+        }
+        cout << "[Client] sfx not found: " << name << "\n";
+    };
+    load_sfx(g_sfx_q_buf, g_sfx_q, "Q.wav");
+    load_sfx(g_sfx_w_buf, g_sfx_w, "W.wav");
+    load_sfx(g_sfx_e_buf, g_sfx_e, "E.wav");
+
     avatar = OBJECT{};
     avatar.set_hero(*hero_tex, hero_attack_tex);
     avatar.set_name(avatar_name.c_str());
@@ -954,6 +1008,10 @@ void client_finish()
     delete skill_line_tex;
     delete skill_heal_tex;
     delete skill_sparkle_tex;
+    delete skill_icon_q_tex;
+    delete skill_icon_w_tex;
+    delete skill_icon_e_tex;
+    delete attack_player_impact_tex;
 }
 
 void send_packet(void* packet)
@@ -1593,65 +1651,63 @@ static void draw_hud()
         hp_color = sf::Color(r, gb, gb);
     }
 
-    // ---- 채팅 패널 (우상단, 512x192 → 320x120) ----
-    constexpr float CHAT_W = 320.0f, CHAT_H = 120.0f;
-    const float CHAT_X = WINDOW_WIDTH - CHAT_W - 10.0f;
-    const float CHAT_Y = 10.0f;
-    {
-        hud_sprite.setTexture(*chat_panel_tex, true);
-        hud_sprite.setTextureRect(sf::IntRect(0, 0, 512, 192));
-        hud_sprite.setScale(CHAT_W / 512.0f, CHAT_H / 192.0f);
-        hud_sprite.setPosition(CHAT_X, CHAT_Y);
-        g_window->draw(hud_sprite);
-    }
-
-    // 채팅 로그 (최근 메시지를 위에서부터 표시)
+    // ---- 로그 패널 (좌하단, HP orb 위, 최대 10줄) ----
+    // HP orb: y = WINDOW_HEIGHT - 128 - 50 = 846. 레벨 배지: orb_y - 18 ≈ 828.
+    constexpr float LOG_LINE_H  = 15.0f;
+    constexpr int   LOG_LINES   = 10;
+    constexpr float LOG_X       = 10.0f;
+    // orb_y=846, 레벨배지 top≈812. 입력박스 bottom이 812보다 작아야 가려지지 않음.
+    // LOG_BOTTOM=776 → 입력박스 778~800, 레벨배지 812~ 로 12px 여유.
+    const float     LOG_BOTTOM  = (float)WINDOW_HEIGHT - 128.0f - 50.0f - 70.0f; // 776
+    const float     LOG_TOP     = LOG_BOTTOM - LOG_LINE_H * LOG_LINES;            // 626
     {
         sf::Text txt;
         txt.setFont(*g_font);
         txt.setCharacterSize(13);
-        txt.setFillColor(sf::Color(245, 235, 200));
         txt.setOutlineColor(sf::Color::Black);
         txt.setOutlineThickness(1.0f);
-        const float line_h = 15.0f;
-        const float text_pad_x = 14.0f;
-        const float text_pad_y = 8.0f;
-        for (size_t i = 0; i < g_chat_log.size(); ++i) {
-            // 한글(UTF-8) 메시지가 Latin-1로 잘못 해석되지 않도록 명시적 변환
+        // 최근 LOG_LINES 줄만 표시 (오래된 것은 위쪽)
+        int total = (int)g_chat_log.size();
+        int start = std::max(0, total - LOG_LINES);
+        for (int i = start; i < total; ++i) {
+            int row = i - start;
+            // 시스템 메시지(접두 "[") 흰색, 일반 채팅 황금색
+            bool is_sys = !g_chat_log[i].empty() && g_chat_log[i][0] == '[';
+            txt.setFillColor(is_sys ? sf::Color(200, 200, 200) : sf::Color(245, 235, 200));
             txt.setString(sf::String::fromUtf8(g_chat_log[i].begin(), g_chat_log[i].end()));
-            txt.setPosition(CHAT_X + text_pad_x, CHAT_Y + text_pad_y + i * line_h);
+            txt.setPosition(LOG_X, LOG_TOP + row * LOG_LINE_H);
             g_window->draw(txt);
         }
     }
 
-    // 입력 박스 (채팅 모드일 때만, 패널 바로 아래)
+    // 채팅 입력 박스 (Enter 모드일 때만, 로그 바로 아래)
     if (g_chat_input_mode) {
-        const float input_h = 22.0f;
-        const float input_y = CHAT_Y + CHAT_H + 4.0f;
-        sf::RectangleShape box(sf::Vector2f(CHAT_W, input_h));
+        constexpr float input_w = 280.0f;
+        const float input_y = LOG_BOTTOM + 2.0f;
+        sf::RectangleShape box(sf::Vector2f(input_w, 22.0f));
         box.setFillColor(sf::Color(10, 8, 20, 230));
         box.setOutlineColor(sf::Color(230, 190, 90));
         box.setOutlineThickness(2.0f);
-        box.setPosition(CHAT_X, input_y);
+        box.setPosition(LOG_X, input_y);
         g_window->draw(box);
 
         sf::Text inp;
         inp.setFont(*g_font);
         inp.setCharacterSize(14);
         inp.setFillColor(sf::Color::White);
-        // 깜빡이는 커서 (~0.5초 주기)
         static sf::Clock cursor_clock;
         bool show_cursor = (cursor_clock.getElapsedTime().asMilliseconds() / 500) % 2 == 0;
         inp.setString("> " + g_chat_buffer + (show_cursor ? "_" : " "));
-        inp.setPosition(CHAT_X + 6.0f, input_y + 2.0f);
+        inp.setPosition(LOG_X + 6.0f, input_y + 2.0f);
         g_window->draw(inp);
     }
 
-    // ---- 파티 HP 바 패널 (채팅 패널 바로 아래, 파티원이 있을 때만) ----
+    // ---- 파티 HP 바 패널 (미니맵 오른쪽, 파티원이 있을 때만) ----
+    // 미니맵: x=10, y=10, 200x200 → 파티패널 x=218, y=10
     if (!g_party_members.empty()) {
-        constexpr float PARTY_W  = 240.0f;
-        const float PARTY_X = CHAT_X;
-        const float PARTY_Y = CHAT_Y + CHAT_H + (g_chat_input_mode ? 30.0f : 6.0f);
+        constexpr float PARTY_W  = 200.0f;
+        const float PARTY_X = 218.0f;
+        const float PARTY_Y = 10.0f;
         constexpr float ROW_H = 22.0f;
         float total_h = g_party_members.size() * ROW_H + 6.0f;
 
@@ -1820,6 +1876,7 @@ static void draw_hud()
             sf::Color(60, 120, 220),   // W Line — 파랑
             sf::Color(60, 180, 80)     // E Heal — 초록
         };
+        sf::Texture* icon_texs[3] = { skill_icon_q_tex, skill_icon_w_tex, skill_icon_e_tex };
 
         sf::Text sk_txt;
         sk_txt.setFont(*g_font);
@@ -1827,6 +1884,8 @@ static void draw_hud()
         sk_txt.setStyle(sf::Text::Bold);
         sk_txt.setOutlineColor(sf::Color::Black);
         sk_txt.setOutlineThickness(2.0f);
+
+        sf::Sprite icon_spr;
 
         for (int i = 0; i < 3; ++i) {
             float sx = slot_x0 + i * (SLOT_SIZE + SLOT_GAP);
@@ -1838,6 +1897,13 @@ static void draw_hud()
             slot.setOutlineThickness(2.0f);
             slot.setPosition(sx, slot_y);
             g_window->draw(slot);
+
+            // 스킬 아이콘 (32x32 원본 → 40x40으로 중앙 배치)
+            icon_spr.setTexture(*icon_texs[i], true);
+            icon_spr.setTextureRect(sf::IntRect(0, 0, 32, 32));
+            icon_spr.setScale(40.0f / 32.0f, 40.0f / 32.0f);
+            icon_spr.setPosition(sx + 4.0f, slot_y + 4.0f);
+            g_window->draw(icon_spr);
 
             long long elapsed = clocks[i]->getElapsedTime().asMilliseconds();
             bool on_cd = *used[i] && (elapsed < cds[i]);
@@ -1883,16 +1949,68 @@ static void draw_hud()
         }
     }
 
-    // ---- Stage 8: 조작 힌트 (항상, 좌하단) ----
+    // ---- 조작 힌트 (우상단 고정) ----
+    constexpr float KH_X    = (float)WINDOW_WIDTH - 230.0f;
+    constexpr float KH_Y    = 12.0f;
+    constexpr float KH_LINE = 16.0f;
     {
+        const char* hints[] = {
+            "[Arrow] Move",
+            "[A] Attack",
+            "[Q] Fire  [W] Lightning  [E] Heal",
+            "[I] Inventory  [G] Pickup",
+            "[J] Quest  [T] Talk",
+            "[Enter] Chat  [Esc] Quit",
+        };
         sf::Text t; t.setFont(*g_font);
-        t.setString("[I] Inventory   [G] Pickup");
         t.setCharacterSize(13);
-        t.setFillColor(sf::Color(210, 210, 210));
+        t.setFillColor(sf::Color(200, 200, 200));
         t.setOutlineColor(sf::Color::Black);
         t.setOutlineThickness(1.0f);
-        t.setPosition(12.0f, WINDOW_HEIGHT - 150.0f);
-        g_window->draw(t);
+        for (int hi = 0; hi < 6; ++hi) {
+            t.setString(hints[hi]);
+            t.setPosition(KH_X, KH_Y + hi * KH_LINE);
+            g_window->draw(t);
+        }
+    }
+
+    // ---- 퀘스트 진행상황 (키 바인딩 힌트 바로 아래, 항상 표시) ----
+    {
+        // 한글 포함 문자열을 안전하게 출력하는 인라인 헬퍼
+        auto qtext = [&](const std::string& s, float x, float y, sf::Color c) {
+            sf::Text qt; qt.setFont(*g_font);
+            qt.setCharacterSize(12);
+            qt.setFillColor(c);
+            qt.setOutlineColor(sf::Color::Black);
+            qt.setOutlineThickness(1.0f);
+            qt.setString(sf::String::fromUtf8(s.begin(), s.end()));
+            qt.setPosition(x, y);
+            g_window->draw(qt);
+        };
+
+        float qy = KH_Y + 6 * KH_LINE + 8.0f;
+
+        if (g_quests.empty()) {
+            qtext("[ No quests ]", KH_X, qy, sf::Color(150, 150, 150));
+        } else {
+            qtext("-- Quests --", KH_X, qy, sf::Color(130, 170, 200));
+            qy += 14.0f;
+
+            for (const auto& q : g_quests) {
+                const ClientQuestMeta* m = quest_meta(q.id);
+                std::string title = m ? std::string(m->title) : ("Quest " + std::to_string(q.id));
+                if (q.state == 1) {
+                    qtext(title + "  (done)", KH_X, qy, sf::Color(120, 120, 120));
+                } else if (q.kill_count >= q.target) {
+                    qtext(title + "  [!]", KH_X, qy, sf::Color(255, 220, 80));
+                } else {
+                    char prog[16]; sprintf_s(prog, " %d/%d", q.kill_count, q.target);
+                    qtext(title + prog, KH_X, qy, sf::Color(200, 230, 255));
+                }
+                qy += 14.0f;
+                if (qy > KH_Y + 6 * KH_LINE + 90.0f) break;
+            }
+        }
     }
 
     // ---- Stage 8: 인벤토리 패널 (I 토글) ----
@@ -2429,22 +2547,38 @@ int main()
                     break;
                 }
                 // Q = 스킬 1 (AoE 3칸 반경), W = 스킬 2 (방향 직선 5칸), E = 스킬 3 (Heal 30%)
+                // 쿨타임 중이면 완전히 무시 (키 반복으로 KeyPressed가 계속 발생해도 1회만 처리)
                 case sf::Keyboard::Q: {
-                    C2S_UseSkill sk; sk.size = sizeof(sk); sk.type = C2S_USE_SKILL; sk.skill_id = 1;
-                    send_packet(&sk);
-                    g_skill1_clock.restart(); g_skill1_used = true;
+                    bool on_cd = g_skill1_used &&
+                        g_skill1_clock.getElapsedTime().asMilliseconds() < SKILL1_CD_MS;
+                    if (!on_cd) {
+                        C2S_UseSkill sk; sk.size = sizeof(sk); sk.type = C2S_USE_SKILL; sk.skill_id = 1;
+                        send_packet(&sk);
+                        g_skill1_clock.restart(); g_skill1_used = true;
+                        if (g_sfx_q.getBuffer()) g_sfx_q.play();
+                    }
                     break;
                 }
                 case sf::Keyboard::W: {
-                    C2S_UseSkill sk; sk.size = sizeof(sk); sk.type = C2S_USE_SKILL; sk.skill_id = 2;
-                    send_packet(&sk);
-                    g_skill2_clock.restart(); g_skill2_used = true;
+                    bool on_cd = g_skill2_used &&
+                        g_skill2_clock.getElapsedTime().asMilliseconds() < SKILL2_CD_MS;
+                    if (!on_cd) {
+                        C2S_UseSkill sk; sk.size = sizeof(sk); sk.type = C2S_USE_SKILL; sk.skill_id = 2;
+                        send_packet(&sk);
+                        g_skill2_clock.restart(); g_skill2_used = true;
+                        if (g_sfx_w.getBuffer()) g_sfx_w.play();
+                    }
                     break;
                 }
                 case sf::Keyboard::E: {
-                    C2S_UseSkill sk; sk.size = sizeof(sk); sk.type = C2S_USE_SKILL; sk.skill_id = 3;
-                    send_packet(&sk);
-                    g_skill3_clock.restart(); g_skill3_used = true;
+                    bool on_cd = g_skill3_used &&
+                        g_skill3_clock.getElapsedTime().asMilliseconds() < SKILL3_CD_MS;
+                    if (!on_cd) {
+                        C2S_UseSkill sk; sk.size = sizeof(sk); sk.type = C2S_USE_SKILL; sk.skill_id = 3;
+                        send_packet(&sk);
+                        g_skill3_clock.restart(); g_skill3_used = true;
+                        if (g_sfx_e.getBuffer()) g_sfx_e.play();
+                    }
                     break;
                 }
                 // Stage 8: I=인벤토리 열기, G=근처 바닥 아이템 줍기
