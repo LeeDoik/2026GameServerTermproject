@@ -47,13 +47,19 @@ using namespace std;
 // 링 버퍼 클래스 전방 선언
 class RingBuffer;
 
+// [perf 2A] OVERLAPPED_EX 물리 버퍼 크기. 송신 코얼레싱 1회 WSASend의 적재 상한.
+// recv와 공유하지만 do_recv는 wsa_buf.len을 RECV_BUF_LEN으로 캡해 RingBuffer(8192) 안전을 유지한다.
+constexpr int IO_BUF_SIZE   = 8192;
+constexpr int RECV_BUF_LEN  = MAX_CHAT_MSG_LEN + 256;  // recv 1회 읽기 상한 (기존 동작 보존)
+constexpr int SEND_QUEUE_CAP = 256 * 1024;             // 세션 송신 큐 상한 — 초과 시 느린 소비자로 보고 연결 종료
+
 struct OVERLAPPED_EX {
     WSAOVERLAPPED overlapped;
     IO_TYPE type;
     WSABUF wsa_buf;
     SOCKET client_socket;
     unsigned char pool_shard;   // [perf] IO_SEND이 어느 송신 풀 샤드에서 왔는지 (Release 라우팅용)
-    unsigned char buffer[MAX_CHAT_MSG_LEN + 256];
+    unsigned char buffer[IO_BUF_SIZE];
 
     OVERLAPPED_EX() {
         memset(&overlapped, 0, sizeof(overlapped));
@@ -212,6 +218,11 @@ struct Player : public Entity {
     SOCKET socket;
     OVERLAPPED_EX recv_overlapped;
     RingBuffer packet_buffer;
+    // [perf 2A] 세션별 송신 코얼레싱 — send_lock가 send_queue/send_in_flight 보호.
+    // 한 틱에 쌓인 여러 S2C 패킷을 1회 WSASend로 합치고, in-flight 1건으로 소켓당 송신 순서 보장.
+    std::mutex send_lock;
+    std::vector<unsigned char> send_queue;
+    bool send_in_flight = false;
     shared_ptr<string> name;
     bool is_active;
 
@@ -259,20 +270,48 @@ struct Player : public Entity {
         DWORD recv_bytes = 0;
         memset(&recv_overlapped.overlapped, 0, sizeof(recv_overlapped.overlapped));
         recv_overlapped.wsa_buf.buf = reinterpret_cast<char*>(recv_overlapped.buffer);
-        recv_overlapped.wsa_buf.len = sizeof(recv_overlapped.buffer);
+        recv_overlapped.wsa_buf.len = RECV_BUF_LEN;  // 물리 버퍼는 커졌지만 recv는 기존 상한으로 캡 (RingBuffer 안전)
         WSARecv(socket, &recv_overlapped.wsa_buf, 1, &recv_bytes, &flags, &recv_overlapped.overlapped, NULL);
     }
 
-    void do_send(int num_bytes, void* mess) {
+    // [perf 2A] send_lock 보유 상태에서 호출. send_queue 앞에서 한 청크(≤IO_BUF_SIZE)를 풀 객체에
+    // 담아 WSASend 1회. 완료는 worker_thread의 IO_SEND 분기가 처리(부분전송 되돌림 + 다음 flush).
+    void flush_locked() {
         int shard = WorkerSendShard();
         OVERLAPPED_EX* ov = g_send_pools[shard].Acquire();
         ov->pool_shard = static_cast<unsigned char>(shard);  // Release가 원래 샤드로 반환
         ov->type = IO_SEND;
         memset(&ov->overlapped, 0, sizeof(ov->overlapped));
+        int n = static_cast<int>((std::min)(send_queue.size(), static_cast<size_t>(IO_BUF_SIZE)));
+        memcpy(ov->buffer, send_queue.data(), n);
+        send_queue.erase(send_queue.begin(), send_queue.begin() + n);
         ov->wsa_buf.buf = reinterpret_cast<char*>(ov->buffer);
-        ov->wsa_buf.len = num_bytes;
-        memcpy(ov->buffer, mess, num_bytes);
-        WSASend(socket, &ov->wsa_buf, 1, NULL, 0, &ov->overlapped, NULL);
+        ov->wsa_buf.len = n;
+        int r = WSASend(socket, &ov->wsa_buf, 1, NULL, 0, &ov->overlapped, NULL);
+        if (r == SOCKET_ERROR && WSAGetLastError() != WSA_IO_PENDING) {
+            // 송신 시작 실패(소켓 사망) → 풀 회수 + in-flight 해제. 단절은 IOCP recv 완료가 감지.
+            g_send_pools[ov->pool_shard].Release(ov);
+            send_in_flight = false;
+        }
+    }
+
+    // [perf 2A] fire-and-forget → 세션 큐에 적재 후 idle이면 1회 flush. 패킷당 WSASend 폭주 제거.
+    void do_send(int num_bytes, void* mess) {
+        bool overflow = false;
+        {
+            std::lock_guard<std::mutex> lk(send_lock);
+            if (send_queue.size() + static_cast<size_t>(num_bytes) > SEND_QUEUE_CAP) {
+                overflow = true;  // 느린 소비자 — 락 밖에서 종료
+            } else {
+                const unsigned char* p = reinterpret_cast<const unsigned char*>(mess);
+                send_queue.insert(send_queue.end(), p, p + num_bytes);
+                if (!send_in_flight) {
+                    send_in_flight = true;
+                    flush_locked();
+                }
+            }
+        }
+        if (overflow) closesocket(socket);  // 락 밖에서: IOCP가 단절 정리
     }
 };
 
@@ -2281,6 +2320,10 @@ void worker_thread() {
         int client_id = static_cast<int>(completion_key);
 
         if (!result || bytes_transferred == 0) {
+            if (ov_ex->type == IO_SEND) {
+                // [perf 2A] 송신 실패 완료 — 풀 객체 회수(누수 방지) 후 일반 단절 정리로 진행.
+                g_send_pools[ov_ex->pool_shard].Release(ov_ex);
+            }
             shared_ptr<Player> disconnected;
             {
                 ClientMap::const_accessor a;
@@ -2384,7 +2427,28 @@ void worker_thread() {
             }
         }
         else if (ov_ex->type == IO_SEND) {
-            g_send_pools[ov_ex->pool_shard].Release(ov_ex);  // 원래 샤드로 반환
+            // [perf 2A] 코얼레싱 송신 완료: 부분전송 잔여를 큐 앞에 되돌리고 다음 배치 flush.
+            int sent = static_cast<int>(bytes_transferred);
+            int requested = static_cast<int>(ov_ex->wsa_buf.len);
+            shared_ptr<Player> session;
+            {
+                ClientMap::const_accessor a;
+                if (g_clients.find(a, client_id)) session = a->second;
+            }
+            if (session) {
+                std::lock_guard<std::mutex> lk(session->send_lock);
+                if (sent < requested) {
+                    // 못 보낸 잔여(백프레셔)를 큐 앞에 되돌림 — 세션별 FIFO 순서 보존
+                    session->send_queue.insert(session->send_queue.begin(),
+                        ov_ex->buffer + sent, ov_ex->buffer + requested);
+                }
+                g_send_pools[ov_ex->pool_shard].Release(ov_ex);  // 원래 샤드로 반환
+                if (!session->send_queue.empty()) session->flush_locked();  // 다음 배치
+                else session->send_in_flight = false;
+            } else {
+                // 이미 단절된 세션 — 풀 객체만 회수 (버퍼가 세션과 독립이라 수명 안전)
+                g_send_pools[ov_ex->pool_shard].Release(ov_ex);
+            }
         }
     }
 }
