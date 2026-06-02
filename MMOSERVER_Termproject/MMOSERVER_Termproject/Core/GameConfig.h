@@ -20,6 +20,14 @@ constexpr int NPC_RESPAWN_MS = 30000;
 constexpr int HP_REGEN_INTERVAL_MS = 5000;
 constexpr int HP_REGEN_PERCENT = 10;
 
+// MP 시스템 — 저소모·고속재생 (스킬은 쿨타임이 주 제약, MP는 보조)
+constexpr int MP_MAX               = 100;   // 최대 MP (전 플레이어 고정)
+constexpr int MP_REGEN_INTERVAL_MS = 1000;  // 1초마다 재생 (빠름)
+constexpr int MP_REGEN_AMOUNT      = 30;    // 틱당 +30 → 0→100 약 3.3초, 스킬 1회분은 한 틱 내 회복
+constexpr int SKILL_AOE_MP_COST    = 5;     // Q
+constexpr int SKILL_LINE_MP_COST   = 5;     // W
+constexpr int SKILL_HEAL_MP_COST   = 10;    // E
+
 // 처치 EXP 공식: level^2 * BASE_EXP_MULTIPLIER (일반 NPC). Agro x2, Roaming x2.
 // 보스는 추가로 BOSS_EXP_MULTIPLIER 배. 구현은 MMOSERVER_Termproject.cpp의 ComputeNpcExp().
 constexpr int BASE_EXP_MULTIPLIER = 2;

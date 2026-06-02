@@ -36,10 +36,12 @@
 12500  Agro     Roaming  16  IceDragon   40   400    0     0     960   960
 
 # ==== 보스 (바이옴별 1마리, 총 4마리 = 200000 총합 유지) ====
-# visual_id=17: 보스 전용 스프라이트 슬롯 (클라이언트에서 red-orc 대형으로 표시)
+# visual_id 17~20: 구역 보스 전용 스프라이트 슬롯 (클라 bosses-dcss.png col 0~3, 대형 렌더링)
+#   17=Slime King(SW, royal_jelly) 18=Hydra(SE, lernaean_hydra)
+#   19=Golden Dragon(NE, golden_dragon) 20=Cerebov(NW, cerebov)
 # area 는 Fixed 이므로 spawn 위치만 의미. NpcSpawner가 walkable 위치 추첨.
 # level/hp 는 GameConfig.h BOSS_LEVEL/BOSS_MAX_HP 로 덮어씀
 1  Boss  Fixed  17  GrassBoss   50  3000   400  1300  600  1500
-1  Boss  Fixed  17  ForestBoss  50  3000  1400  1300 1600  1500
-1  Boss  Fixed  17  DesertBoss  50  3000  1400   300 1600   500
-1  Boss  Fixed  17  IceBoss     50  3000   400   300  600   500
+1  Boss  Fixed  18  ForestBoss  50  3000  1400  1300 1600  1500
+1  Boss  Fixed  19  DesertBoss  50  3000  1400   300 1600   500
+1  Boss  Fixed  20  IceBoss     50  3000   400   300  600   500

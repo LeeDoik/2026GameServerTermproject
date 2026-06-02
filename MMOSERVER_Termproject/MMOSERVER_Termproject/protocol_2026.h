@@ -62,6 +62,12 @@ enum PACKET_TYPE {
 	C2S_QUEST_ACTION,	// Client to Server: 대화창에서 수락/보상수령 확정 (quest_id, action)
 	S2C_QUEST_DIALOGUE,	// Server to Client: 대화창 표시 지시 (kind)
 	S2C_QUEST_UPDATE,	// Server to Client: 퀘스트 상태/진행 동기화
+
+	// 인벤토리 아이템 버리기 (기존 패킷 번호 유지 위해 enum 끝에 추가)
+	C2S_DROP_ITEM,		// Client to Server: 인벤 슬롯 아이템을 발밑 바닥에 버림 (slot)
+
+	// MP 시스템
+	S2C_MP_CHANGE,		// Server to Client: 본인 MP 갱신 (스킬 소모/재생). mp/max_mp
 };
 
 #pragma pack(push, 1) // Ensure no padding between struct members
@@ -126,6 +132,8 @@ struct S2C_AvatarInfo {
 	int max_hp;
 	unsigned long long exp;
 	unsigned char level;
+	int mp;       // MP 시스템 (구조체 끝에 추가 — 기존 필드 오프셋 보존)
+	int max_mp;
 };
 
 struct S2C_AddObject {
@@ -172,6 +180,15 @@ struct S2C_StatusChange {
 	int max_hp;
 	unsigned long long exp;
 	unsigned char level;
+};
+
+// MP 갱신 (본인 전용). 스킬 소모 직후 + 재생 틱마다 전송.
+struct S2C_MpChange {
+	unsigned char size;
+	PACKET_TYPE   type;
+	int object_id;
+	int mp;
+	int max_mp;
 };
 
 // 공격 모션 시작 (브로드캐스트). 클라가 워리어 attack 시트를 direction 방향으로 재생.
@@ -286,6 +303,12 @@ struct C2S_UnequipItem {
 	unsigned char size;
 	PACKET_TYPE   type;
 	unsigned char which; // 0=weapon, 1=armor
+};
+
+struct C2S_DropItem {
+	unsigned char size;
+	PACKET_TYPE   type;
+	unsigned char slot; // 버릴 인벤토리 슬롯 인덱스 (슬롯 전체 수량을 발밑에 떨어뜨림)
 };
 
 // 바닥 아이템 생성. 클라가 (x,y)에 아이템 스프라이트를 그림.

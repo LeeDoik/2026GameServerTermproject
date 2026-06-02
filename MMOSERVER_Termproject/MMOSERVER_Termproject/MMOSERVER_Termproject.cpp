@@ -218,6 +218,8 @@ struct Player : public Entity {
     // 전투/스탯 — Stage 5
     atomic<int> hp;
     atomic<int> max_hp;
+    atomic<int> mp;       // MP 시스템 (영속 안 함 — 로그인 시 max로 시작)
+    atomic<int> max_mp;
     atomic<unsigned long long> exp;
     atomic<unsigned char> level;
     atomic<long long> last_attack_ms;  // 쿨타임 검증용
@@ -243,7 +245,7 @@ struct Player : public Entity {
     vector<QuestProgress> quests;                // 진행중 + 완료 모두 보관, quest_lock 보호
 
     Player() : Entity(), socket(INVALID_SOCKET), recv_overlapped(IO_RECV), is_active(false),
-               hp(100), max_hp(100), exp(0), level(1), last_attack_ms(0),
+               hp(100), max_hp(100), mp(MP_MAX), max_mp(MP_MAX), exp(0), level(1), last_attack_ms(0),
                last_skill1_ms(0), last_skill2_ms(0), last_skill3_ms(0) {
         name = make_shared<string>("Guest");
     }
@@ -457,6 +459,7 @@ void NpcOnMove(int npc_id);
 void NpcOnRespawn(int npc_id);
 void PlayerOnDeath(std::shared_ptr<Player> session);
 void PlayerOnHpRegen(int client_id);
+void PlayerOnMpRegen(int client_id);
 void OnPlayerSpawn(int client_id, const PlayerSnapshot& snap, bool exists);
 void OnDbResponse(DbResponse& resp);
 void PlayerOnAutoSave();
@@ -1185,6 +1188,34 @@ void PlayerOnHpRegen(int client_id) {
     g_timer_manager.Schedule(client_id, TimerEventKind::HpRegen, HP_REGEN_INTERVAL_MS);
 }
 
+// MP 고속 재생 틱 (MP_REGEN_INTERVAL_MS마다). 변경이 있을 때만 본인에게 S2C_MpChange 전송.
+void PlayerOnMpRegen(int client_id) {
+    std::shared_ptr<Player> session;
+    {
+        ClientMap::const_accessor a;
+        if (!g_clients.find(a, client_id)) return;  // 접속 종료 — 체인 종료
+        session = a->second;
+    }
+
+    int max_mp = session->max_mp.load();
+    int cur_mp = session->mp.load();
+    if (cur_mp < max_mp) {
+        int next = cur_mp + MP_REGEN_AMOUNT;
+        if (next > max_mp) next = max_mp;
+        session->mp.store(next);
+
+        S2C_MpChange mc;
+        mc.size = sizeof(mc);
+        mc.type = S2C_MP_CHANGE;
+        mc.object_id = client_id;
+        mc.mp = next;
+        mc.max_mp = max_mp;
+        session->do_send(mc.size, &mc);
+    }
+
+    g_timer_manager.Schedule(client_id, TimerEventKind::MpRegen, MP_REGEN_INTERVAL_MS);
+}
+
 // Stage 6.3: 현재 플레이어 상태를 PlayerSnapshot으로 캡쳐 (Save용)
 PlayerSnapshot SnapshotPlayer(const std::shared_ptr<Player>& session) {
     PlayerSnapshot snap;
@@ -1223,11 +1254,23 @@ void OnPlayerSpawn(int client_id, const PlayerSnapshot& snap, bool exists) {
         session = a->second;
     }
 
-    // 모든 LOGIN은 Aetheria Village 영역 안 walkable 좌표에서 시작 (신규/기존 동일).
-    // 스탯(hp/exp/level)만 DB에서 복원하고 위치는 항상 마을 안 무작위로 통일.
+    // 스폰 위치 결정:
+    //  - 기존 캐릭: 마지막 로그아웃 위치(snap.x/y)를 복원 — DB에 저장된 좌표 사용.
+    //    범위 밖 / blocked / 미저장(0,0) 이면 마을로 폴백.
+    //  - 신규 캐릭(또는 폴백): Aetheria Village 영역 안 walkable 무작위 좌표.
     short sx_pos = PLAYER_SPAWN_X;
     short sy_pos = PLAYER_SPAWN_Y;
-    {
+    bool restored_pos = false;
+    if (exists &&
+        !(snap.x == 0 && snap.y == 0) &&
+        snap.x >= 0 && snap.x < WORLD_WIDTH &&
+        snap.y >= 0 && snap.y < WORLD_HEIGHT &&
+        !Map::IsBlocked(snap.x, snap.y)) {
+        sx_pos = snap.x;
+        sy_pos = snap.y;
+        restored_pos = true;
+    }
+    if (!restored_pos) {
         int range_x = VILLAGE_X2 - VILLAGE_X1;
         int range_y = VILLAGE_Y2 - VILLAGE_Y1;
         for (int attempt = 0; attempt < 32; ++attempt) {
@@ -1276,6 +1319,10 @@ void OnPlayerSpawn(int client_id, const PlayerSnapshot& snap, bool exists) {
     session->y = sy_pos;
     UpdateObjectSector(client_id, -1, -1, session->x, session->y, true);
 
+    // MP는 영속하지 않으므로 로그인 시 가득 채워 시작
+    session->max_mp.store(MP_MAX);
+    session->mp.store(MP_MAX);
+
     // 1. 본인에게 아바타 정보 전송 (DB에서 복원된 hp/exp/level 반영)
     S2C_AvatarInfo info;
     info.size = sizeof(info);
@@ -1288,6 +1335,8 @@ void OnPlayerSpawn(int client_id, const PlayerSnapshot& snap, bool exists) {
     info.exp = session->exp.load();
     info.level = session->level.load();
     info.visualId = 0;
+    info.mp = session->mp.load();
+    info.max_mp = session->max_mp.load();
     session->do_send(info.size, &info);
 
     // Stage 8: 인벤토리 + 장착 상태 전송 (신규는 빈 인벤, 기존은 복원된 상태)
@@ -1338,6 +1387,7 @@ void OnPlayerSpawn(int client_id, const PlayerSnapshot& snap, bool exists) {
 
     SyncPlayerNpcView(session);
     g_timer_manager.Schedule(client_id, TimerEventKind::HpRegen, HP_REGEN_INTERVAL_MS);
+    g_timer_manager.Schedule(client_id, TimerEventKind::MpRegen, MP_REGEN_INTERVAL_MS);
 
 #if VERBOSE_CLIENT_EVENTS
     auto name_ptr = atomic_load(&session->name);
@@ -2203,6 +2253,9 @@ void worker_thread() {
             case TimerEventKind::HpRegen:
                 if (!IsNpcId(entity_id)) PlayerOnHpRegen(entity_id);
                 break;
+            case TimerEventKind::MpRegen:
+                if (!IsNpcId(entity_id)) PlayerOnMpRegen(entity_id);
+                break;
             case TimerEventKind::PlayerAutoSave:
                 PlayerOnAutoSave();
                 break;
@@ -2556,9 +2609,9 @@ static void HandleAttack(const shared_ptr<Player>& session, int client_id, unsig
 
     BroadcastToViewerPlayers(session, anim, true);
 
-    // 2) 인접 4타일(상/하/좌/우)에서 NPC 찾기 → 데미지 + S2C_DAMAGE 브로드캐스트
-    int adj[4][2] = { {ax, ay - 1}, {ax, ay + 1}, {ax - 1, ay}, {ax + 1, ay} };
-    for (int i = 0; i < 4; ++i) {
+    // 2) 자기 타일 포함 5칸(자기 자신 + 상/하/좌/우)에서 NPC 찾기 → 데미지 + S2C_DAMAGE 브로드캐스트
+    int adj[5][2] = { {ax, ay}, {ax, ay - 1}, {ax, ay + 1}, {ax - 1, ay}, {ax + 1, ay} };
+    for (int i = 0; i < 5; ++i) {
         int tx = adj[i][0], ty = adj[i][1];
         if (tx < 0 || tx >= WORLD_WIDTH || ty < 0 || ty >= WORLD_HEIGHT) continue;
         int sx = tx / SECTOR_SIZE, sy = ty / SECTOR_SIZE;
@@ -2585,6 +2638,13 @@ static void HandleUseSkill(const shared_ptr<Player>& session, int client_id, uns
     auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now().time_since_epoch()).count();
 
+    // 스킬별 MP 비용 결정 (알 수 없는 스킬은 거름). MP 부족하면 쿨타임 소모 전에 거절.
+    int mp_cost = (skill_id == 1) ? SKILL_AOE_MP_COST
+                : (skill_id == 2) ? SKILL_LINE_MP_COST
+                : (skill_id == 3) ? SKILL_HEAL_MP_COST : -1;
+    if (mp_cost < 0) return;
+    if (session->mp.load() < mp_cost) { SendSystemMessage(session, "Not enough MP."); return; }
+
     // 스킬별 쿨타임 검증
     if (skill_id == 1) {
         long long last = session->last_skill1_ms.load();
@@ -2600,6 +2660,19 @@ static void HandleUseSkill(const shared_ptr<Player>& session, int client_id, uns
         session->last_skill3_ms.store(now_ms);
     } else {
         return; // 알 수 없는 스킬 ID
+    }
+
+    // 쿨타임 통과 → MP 차감 후 본인에게 MP 갱신 통지
+    {
+        int observed = session->mp.fetch_sub(mp_cost) - mp_cost;
+        if (observed < 0) { session->mp.store(0); observed = 0; }
+        S2C_MpChange mc;
+        mc.size = sizeof(mc);
+        mc.type = S2C_MP_CHANGE;
+        mc.object_id = client_id;
+        mc.mp = observed;
+        mc.max_mp = session->max_mp.load();
+        session->do_send(mc.size, &mc);
     }
 
     short cx = session->x, cy = session->y;
@@ -2651,7 +2724,7 @@ static void HandleUseSkill(const shared_ptr<Player>& session, int client_id, uns
         int ddx = 0, ddy = 0;
         switch (dir) { case 0: ddy = 1; break; case 1: ddx = -1; break; case 2: ddx = 1; break; case 3: ddy = -1; break; }
 
-        for (int step = 1; step <= SKILL_LINE_RANGE; ++step) {
+        for (int step = 0; step <= SKILL_LINE_RANGE; ++step) {  // step 0 = 시전자 자기 타일 포함
             int tx = cx + ddx * step;
             int ty = cy + ddy * step;
             if (tx < 0 || tx >= WORLD_WIDTH || ty < 0 || ty >= WORLD_HEIGHT) break;
@@ -2972,6 +3045,45 @@ static void HandleUnequipItem(const shared_ptr<Player>& session, int client_id, 
     else SendSystemMessage(session, "Cannot unequip (inventory full or nothing equipped).");
 }
 
+// 인벤 슬롯 아이템을 발밑 바닥에 버림. 슬롯 전체 수량을 바닥 아이템 1개(count=qty)로 생성 →
+// 다시 줍거나(G) 60초 후 자동 소멸. 줍기/루트와 동일한 ground-item 시스템 재사용.
+static void HandleDropItem(const shared_ptr<Player>& session, int client_id, unsigned char* ptr) {
+    C2S_DropItem* p = reinterpret_cast<C2S_DropItem*>(ptr);
+    int slot = p->slot;
+
+    int item_id = -1, qty = 0;
+    {
+        lock_guard<mutex> lk(session->inv_lock);
+        if (slot < 0 || slot >= static_cast<int>(session->inventory.size())) return;
+        item_id = session->inventory[slot].first;
+        qty     = session->inventory[slot].second;
+        session->inventory.erase(session->inventory.begin() + slot);
+    }
+    const ItemDef* def = GetItemDef(item_id);
+    if (!def || qty <= 0) { SendInventory(session); return; }
+
+    short dx = session->x, dy = session->y;
+    int drop_id = g_next_drop_id.fetch_add(1);
+    {
+        lock_guard<mutex> lk(g_ground_mutex);
+        g_ground_items[drop_id] = GroundItem{ item_id, qty, dx, dy };
+    }
+
+    S2C_ItemDrop pkt;
+    pkt.size = sizeof(pkt);
+    pkt.type = S2C_ITEM_DROP;
+    pkt.drop_id = drop_id;
+    pkt.item_id = item_id;
+    pkt.x = dx;
+    pkt.y = dy;
+    BroadcastToSectorPlayers(dx, dy, pkt);
+    g_timer_manager.Schedule(drop_id, TimerEventKind::GroundItemExpire, GROUND_ITEM_EXPIRE_MS);
+
+    SendInventory(session);
+    SendSystemMessage(session, std::string("Dropped ") + def->name +
+                      (qty > 1 ? " x" + std::to_string(qty) : "") + ".");
+}
+
 static void HandleQuestInteract(const shared_ptr<Player>& session, int client_id, unsigned char* ptr) {
     C2S_QuestInteract* p = reinterpret_cast<C2S_QuestInteract*>(ptr);
     if (p->npc_index != 0) return;  // MVP: 장로(0)만 퀘스트 제공
@@ -3157,6 +3269,9 @@ void process_packet(int client_id, unsigned char* ptr) {
         break;
     case C2S_UNEQUIP_ITEM:
         HandleUnequipItem(session, client_id, ptr);
+        break;
+    case C2S_DROP_ITEM:
+        HandleDropItem(session, client_id, ptr);
         break;
     case C2S_QUEST_INTERACT:
         HandleQuestInteract(session, client_id, ptr);

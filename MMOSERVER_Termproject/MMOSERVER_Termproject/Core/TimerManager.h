@@ -14,6 +14,7 @@ enum class TimerEventKind : unsigned char {
     NpcMove,
     NpcRespawn,
     HpRegen,
+    MpRegen,         // MP 고속 재생 틱
     AttackCooldown,
     SkillCooldown,
     PlayerAutoSave,  // Stage 6.3 — 주기적 DB 자동 저장

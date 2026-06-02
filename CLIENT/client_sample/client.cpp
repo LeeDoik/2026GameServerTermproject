@@ -37,6 +37,8 @@ int g_myid;
 // 플레이어 자신의 스탯 (HUD 표시용). S2C_AVATAR_INFO / S2C_StatusChange로 갱신.
 int g_my_hp = 100;
 int g_my_max_hp = 100;
+int g_my_mp = 100;
+int g_my_max_mp = 100;
 unsigned long long g_my_exp = 0;
 unsigned char g_my_level = 1;
 
@@ -63,16 +65,17 @@ std::unordered_set<int> g_party_member_ids;     // 미니맵 색상 분기용 �
 // === Stage 8: 아이템 ===
 // 카테고리/이름/색은 서버 data/items.txt와 동일 ID로 매핑 (동기화 유지 필요)
 enum ClientItemCat { CIC_CONSUMABLE = 0, CIC_WEAPON = 1, CIC_ARMOR = 2 };
-struct ClientItemMeta { const char* name; sf::Color color; int cat; };
+// sprite_col: items-dcss.png(256x32, 8 cols, 32x32 each) 시트 column. color는 sprite 로드 실패 시 fallback.
+struct ClientItemMeta { const char* name; sf::Color color; int cat; int sprite_col; };
 static const std::unordered_map<int, ClientItemMeta> g_item_meta = {
-    { 1,  { "Health Potion",       sf::Color(230,  60,  60), CIC_CONSUMABLE } },
-    { 2,  { "Great Health Potion", sf::Color(255, 120, 120), CIC_CONSUMABLE } },
-    { 10, { "Rusty Sword",         sf::Color(150, 150, 160), CIC_WEAPON } },
-    { 11, { "Iron Sword",          sf::Color(120, 160, 210), CIC_WEAPON } },
-    { 12, { "Mythril Blade",       sf::Color(120, 230, 210), CIC_WEAPON } },
-    { 20, { "Leather Armor",       sf::Color(170, 120,  70), CIC_ARMOR } },
-    { 21, { "Chain Mail",          sf::Color(180, 180, 190), CIC_ARMOR } },
-    { 22, { "Plate Armor",         sf::Color(220, 200, 120), CIC_ARMOR } },
+    { 1,  { "Health Potion",       sf::Color(230,  60,  60), CIC_CONSUMABLE, 0 } },
+    { 2,  { "Great Health Potion", sf::Color(255, 120, 120), CIC_CONSUMABLE, 1 } },
+    { 10, { "Rusty Sword",         sf::Color(150, 150, 160), CIC_WEAPON,     2 } },
+    { 11, { "Iron Sword",          sf::Color(120, 160, 210), CIC_WEAPON,     3 } },
+    { 12, { "Mythril Blade",       sf::Color(120, 230, 210), CIC_WEAPON,     4 } },
+    { 20, { "Leather Armor",       sf::Color(170, 120,  70), CIC_ARMOR,      5 } },
+    { 21, { "Chain Mail",          sf::Color(180, 180, 190), CIC_ARMOR,      6 } },
+    { 22, { "Plate Armor",         sf::Color(220, 200, 120), CIC_ARMOR,      7 } },
 };
 static const ClientItemMeta* item_meta(int id) {
     auto it = g_item_meta.find(id);
@@ -85,6 +88,7 @@ std::vector<std::pair<int, int>> g_inventory;            // (item_id, qty) — S
 int  g_equipped_weapon_id = -1;
 int  g_equipped_armor_id  = -1;
 bool g_inv_open = false;
+int  g_inv_cursor = 0;   // 인벤토리 커서 슬롯 (0 .. MAX_INVENTORY_SLOTS-1). 방향키로 이동, F/Enter로 사용·장착
 
 // === Stage 9: 퀘스트 ===
 // 제목/설명은 서버 data/quests.txt와 동일 ID로 매핑 (서버는 로직, 클라는 표시 텍스트).
@@ -128,9 +132,11 @@ static void add_chat_line(const std::string& s) {
 sf::RenderWindow* g_window;
 sf::Font* g_font;
 
-// 스킬 효과음
+// 효과음 (스킬 Q/W/E + 공격/레벨업/피격/줍기)
 sf::SoundBuffer g_sfx_q_buf, g_sfx_w_buf, g_sfx_e_buf;
 sf::Sound       g_sfx_q,     g_sfx_w,     g_sfx_e;
+sf::SoundBuffer g_sfx_a_buf, g_sfx_levelup_buf, g_sfx_hurt_buf, g_sfx_pickup_buf;
+sf::Sound       g_sfx_a,     g_sfx_levelup,     g_sfx_hurt,     g_sfx_pickup;
 
 // 워리어 스프라이트 시트 레이아웃 (256x256, 각 셀 64x64)
 //   Row 0: walk DOWN  (↓)  cols 0~3 = walk cycle
@@ -163,7 +169,8 @@ private:
     int m_attack_dir = HERO_DIR_DOWN;
     sf::Clock m_attack_clock;
 
-    float m_boss_scale = 1.0f;  // 보스는 5.0f (일반 크기의 5배)
+    float m_boss_scale = 1.0f;  // 보스는 5.0f (표시 크기 = HERO_TILE * 5 = 320px)
+    int  m_boss_src_px = HERO_TILE;  // 보스 원본 셀 크기 (DCSS 시트 = 32). 실제 스케일 = 표시px / 원본px
     bool m_is_npc = false;
 
 public:
@@ -211,16 +218,20 @@ public:
         m_sprite.setScale((float)TILE_WIDTH / 32.0f, (float)TILE_WIDTH / 32.0f);
     }
 
-    // 보스 전용: 오크 텍스처를 5배 크기로 렌더링
-    void set_boss(sf::Texture& orc_t) {
-        m_is_hero = true;
-        m_boss_scale = 5.0f;
-        m_is_npc = true;
-        m_walk_tex = &orc_t;
+    // 보스 전용: DCSS 보스 시트(bosses-dcss.png, 128x32, 4 cols)에서 col을 골라 대형 렌더링.
+    // col: 0=Slime King(SW) / 1=Hydra(SE) / 2=Golden Dragon(NE) / 3=Cerebov(NW)
+    // DCSS 보스는 정적 32x32 스프라이트(4방향 walk 시트가 아님) → m_is_hero=false 로 애니메이션 비활성.
+    void set_boss(sf::Texture& sheet, int col) {
+        m_is_hero = false;          // 정적 스프라이트 (방향/walk 프레임 없음)
+        m_is_npc = true;            // HP 바 표시
+        m_boss_scale = 5.0f;        // 레이아웃 기준 표시 크기 = HERO_TILE * 5 = 320px
+        m_boss_src_px = 32;         // DCSS 원본 셀 크기
+        m_walk_tex = nullptr;
         m_attack_tex = nullptr;
-        m_sprite.setTexture(orc_t);
-        m_sprite.setTextureRect(sf::IntRect(0, 0, HERO_TILE, HERO_TILE));
-        m_sprite.setScale(m_boss_scale, m_boss_scale);  // 64px × 5 = 320px
+        m_sprite.setTexture(sheet);
+        m_sprite.setTextureRect(sf::IntRect(col * 32, 0, 32, 32));
+        float s = (HERO_TILE * m_boss_scale) / (float)m_boss_src_px;  // 320 / 32 = 10
+        m_sprite.setScale(s, s);
     }
 
     // 공격 모션 트리거. direction은 0~3 (Down/Left/Right/Up).
@@ -294,8 +305,9 @@ public:
 
         // 보스는 스케일 유지 + 타일 중앙 정렬 (320px 스프라이트를 64px 타일 기준 중앙에 배치)
         if (m_boss_scale > 1.0f) {
-            m_sprite.setScale(m_boss_scale, m_boss_scale);
-            float sprite_px = HERO_TILE * m_boss_scale;
+            float sprite_px = HERO_TILE * m_boss_scale;          // 표시 크기 = 320px
+            m_sprite.setScale(sprite_px / (float)m_boss_src_px,  // 원본 32px → 10배 / 64px → 5배
+                              sprite_px / (float)m_boss_src_px);
             float offset = (sprite_px - (float)TILE_WIDTH) * 0.5f;
             rx -= offset;
             ry -= offset;
@@ -511,8 +523,36 @@ sf::Texture* hero_tex;        // 플레이어 워리어 walk
 sf::Texture* hero_attack_tex; // 플레이어 워리어 attack (192x256, 4행x3열, 각 64x64)
 sf::Texture* orc_tex;         // NPC: Agro Orc (fallback — visual_id 범위 밖일 때만)
 sf::Texture* npcs_tex;        // Stage 6.4: DCSS NPC 시트 (512x32, 16 cols, 32×32 each, visual_id 1~16)
+sf::Texture* bosses_tex;      // DCSS 보스 시트 (128x32, 4 cols, 32×32 each, visual_id 17~20)
+                              //   col 0=Slime King(SW) / 1=Hydra(SE) / 2=Golden Dragon(NE) / 3=Cerebov(NW)
 sf::Texture* landmarks_tex;   // Stage 6.4: 랜드마크+보스+장식 시트 (384x32, 12 cols)
+sf::Texture* items_tex;       // Stage 8: DCSS 아이템 시트 (256x32, 8 cols, 32×32). ClientItemMeta.sprite_col로 선택
 sf::Sprite   landmark_sprite;
+
+// 아이템 스프라이트를 (cx,cy) 중심에 한 변 size 픽셀로 그린다 (바닥 드롭 + 인벤토리 공용).
+// meta/텍스처 없으면 기존 회전 사각형(gem)으로 fallback.
+static void draw_item_sprite(int item_id, float cx, float cy, float size) {
+    const ClientItemMeta* m = item_meta(item_id);
+    if (m && items_tex) {
+        sf::Sprite s;
+        s.setTexture(*items_tex);
+        s.setTextureRect(sf::IntRect(m->sprite_col * 32, 0, 32, 32));
+        s.setOrigin(16.0f, 16.0f);
+        s.setScale(size / 32.0f, size / 32.0f);
+        s.setPosition(cx, cy);
+        g_window->draw(s);
+    } else {
+        sf::Color col = m ? m->color : sf::Color(220, 220, 220);
+        sf::RectangleShape gem(sf::Vector2f(size * 0.85f, size * 0.85f));
+        gem.setOrigin(gem.getSize().x * 0.5f, gem.getSize().y * 0.5f);
+        gem.setPosition(cx, cy);
+        gem.setRotation(45.0f);
+        gem.setFillColor(col);
+        gem.setOutlineColor(sf::Color(20, 20, 20));
+        gem.setOutlineThickness(2.0f);
+        g_window->draw(gem);
+    }
+}
 
 // HUD 리소스
 sf::Texture* orb_tex;    // 512x256 (HP구슬 좌측 256, MP구슬 우측 256)
@@ -716,10 +756,10 @@ static void spawn_effect_attack_player(int wx, int wy) {
         e.tint = sf::Color(200, 235, 255);  // 청백 — 날카로운 칼날 느낌
         g_effects.push_back(std::move(e));
     }
-    // 인접 4칸에 잔상 슬래시 (scale 2.0, 짧게 200ms, 반투명)
+    // 인접 4칸에 잔상 슬래시 (scale 2.0, 반투명). 재생속도를 메인과 동일하게 350ms로 통일.
     int offsets[4][2] = {{0,-1},{0,1},{-1,0},{1,0}};
     for (auto& o : offsets) {
-        Effect e = make_dcss_effect(attack_player_impact_tex, 5, 200, wx + o[0], wy + o[1]);
+        Effect e = make_dcss_effect(attack_player_impact_tex, 5, 350, wx + o[0], wy + o[1]);
         e.tint = sf::Color(180, 220, 255, 140);
         g_effects.push_back(std::move(e));
     }
@@ -847,6 +887,8 @@ void client_initialize()
     obstacle_tex     = new sf::Texture;
     village_deco_tex = new sf::Texture;
     npcs_tex         = new sf::Texture;
+    bosses_tex       = new sf::Texture;
+    items_tex        = new sf::Texture;
     landmarks_tex    = new sf::Texture;
     hero_tex         = new sf::Texture;
     hero_attack_tex = new sf::Texture;
@@ -876,6 +918,10 @@ void client_initialize()
     if (!LoadTextureWithFallback(village_deco_tex, "village-deco-dcss.png",          "tiles"))     exit(-1);
     if (!LoadTextureWithFallback(npcs_tex,         "npcs-dcss.png",                  "tiles"))     exit(-1);
     npcs_tex->setSmooth(false);
+    if (!LoadTextureWithFallback(bosses_tex,       "bosses-dcss.png",                "tiles"))     exit(-1);
+    bosses_tex->setSmooth(false);
+    if (!LoadTextureWithFallback(items_tex,        "items-dcss.png",                 "tiles"))     exit(-1);
+    items_tex->setSmooth(false);
     if (!LoadTextureWithFallback(landmarks_tex,    "landmarks-dcss.png",             "tiles"))     exit(-1);
     landmarks_tex->setSmooth(false);
     landmark_sprite.setTexture(*landmarks_tex);
@@ -975,6 +1021,10 @@ void client_initialize()
     load_sfx(g_sfx_q_buf, g_sfx_q, "Q.wav");
     load_sfx(g_sfx_w_buf, g_sfx_w, "W.wav");
     load_sfx(g_sfx_e_buf, g_sfx_e, "E.wav");
+    load_sfx(g_sfx_a_buf,       g_sfx_a,       "A.wav");          // 기본 공격
+    load_sfx(g_sfx_levelup_buf, g_sfx_levelup, "LevelUp.wav");    // 레벨업
+    load_sfx(g_sfx_hurt_buf,    g_sfx_hurt,    "Hurt.wav");       // 피격
+    load_sfx(g_sfx_pickup_buf,  g_sfx_pickup,  "ItemPickup.wav"); // 아이템 줍기
 
     avatar = OBJECT{};
     avatar.set_hero(*hero_tex, hero_attack_tex);
@@ -991,6 +1041,8 @@ void client_finish()
     delete obstacle_tex;
     delete village_deco_tex;
     delete npcs_tex;
+    delete bosses_tex;
+    delete items_tex;
     delete landmarks_tex;
     delete hero_tex;
     delete hero_attack_tex;
@@ -1053,6 +1105,8 @@ void ProcessPacket(char* ptr)
         g_top_y = packet->y - 8;
         g_my_hp = packet->hp;
         g_my_max_hp = packet->max_hp;
+        g_my_mp = packet->mp;
+        g_my_max_mp = packet->max_mp;
         g_my_exp = packet->exp;
         g_my_level = packet->level;
         avatar.show();
@@ -1067,11 +1121,11 @@ void ProcessPacket(char* ptr)
         // 다른 플레이어는 attack 시트도 전달 (공격 시 모션 재생됨)
         players[id] = OBJECT{};
         if (id >= NPC_ID_START) {
-            // Stage 6.4: visual_id (1~16) → DCSS 시트 column (0~15).
-            // visual_id == 17: 보스 → 오크 텍스처 5배 크기
+            // Stage 6.4: visual_id (1~16) → DCSS NPC 시트 column (0~15).
+            // visual_id 17~20: 구역 보스 → DCSS 보스 시트 (17→col0 Slime King ... 20→col3 Cerebov)
             int col = my_packet->visual_id - 1;
-            if (my_packet->visual_id == 17) {
-                players[id].set_boss(*orc_tex);  // 보스: 일반 몬스터의 5배
+            if (my_packet->visual_id >= 17 && my_packet->visual_id <= 20) {
+                players[id].set_boss(*bosses_tex, my_packet->visual_id - 17);
             } else if (col >= 0 && col < 16) {
                 players[id].set_npc(*npcs_tex, col);
             } else {
@@ -1124,6 +1178,7 @@ void ProcessPacket(char* ptr)
         int ax, ay;
         if (aid == g_myid) {
             avatar.on_attack(dir);
+            if (g_sfx_a.getBuffer()) g_sfx_a.play();  // 내 공격 스윙음 (서버 확정 = 쿨타임 통과분만)
             ax = avatar.m_x; ay = avatar.m_y;
         } else {
             auto it = players.find(aid);
@@ -1148,6 +1203,7 @@ void ProcessPacket(char* ptr)
         spawn_damage_popup(p->target_x, p->target_y, p->damage, dmg_color);
 
         if (p->target_id == g_myid) {
+            if (g_sfx_hurt.getBuffer()) g_sfx_hurt.play();  // 피격음
             g_my_hp = p->new_hp;
             // 받은 데미지 크기에 비례한 화면 흔들기 (보스 AoE는 자연스럽게 큰 흔들기)
             float strength = std::min(20.0f, 2.0f + p->damage * 0.4f);
@@ -1209,6 +1265,15 @@ void ProcessPacket(char* ptr)
         }
         break;
     }
+    case S2C_MP_CHANGE:
+    {
+        S2C_MpChange* p = reinterpret_cast<S2C_MpChange*>(ptr);
+        if (p->object_id == g_myid) {
+            g_my_mp = p->mp;
+            g_my_max_mp = p->max_mp;
+        }
+        break;
+    }
     case S2C_DEATH:
     {
         S2C_Death* p = reinterpret_cast<S2C_Death*>(ptr);
@@ -1244,6 +1309,7 @@ void ProcessPacket(char* ptr)
         S2C_LevelUp* p = reinterpret_cast<S2C_LevelUp*>(ptr);
         if (p->object_id == g_myid) {
             spawn_effect_levelup(avatar.m_x, avatar.m_y);
+            if (g_sfx_levelup.getBuffer()) g_sfx_levelup.play();  // 레벨업 효과음
             g_my_level = p->new_level;
             g_my_max_hp = p->new_max_hp;
             // HP는 곧이어 도착하는 S2C_StatusChange에서 풀로 갱신됨
@@ -1344,10 +1410,20 @@ void ProcessPacket(char* ptr)
     case S2C_INVENTORY:
     {
         S2C_Inventory* p = reinterpret_cast<S2C_Inventory*>(ptr);
+        // 줍기 효과음: 인벤 총 수량이 늘었을 때만 재생.
+        // 최초 스냅샷(로그인 복원)은 제외 — inv_synced 플래그로 1회차 건너뜀.
+        long long prev_total = 0;
+        for (const auto& it : g_inventory) prev_total += it.second;
         g_inventory.clear();
         int n = p->count; if (n > MAX_INVENTORY_SLOTS) n = MAX_INVENTORY_SLOTS;
         for (int i = 0; i < n; ++i)
             g_inventory.emplace_back(p->slots[i].item_id, p->slots[i].qty);
+        long long new_total = 0;
+        for (const auto& it : g_inventory) new_total += it.second;
+        static bool inv_synced = false;
+        if (inv_synced && new_total > prev_total && g_sfx_pickup.getBuffer())
+            g_sfx_pickup.play();
+        inv_synced = true;
         g_equipped_weapon_id = p->equipped_weapon_id;
         g_equipped_armor_id  = p->equipped_armor_id;
         break;
@@ -1624,20 +1700,28 @@ static void draw_hud()
 {
     // 비율 계산 (max 0 가드)
     float hp_ratio_target  = (g_my_max_hp > 0) ? std::min(1.0f, (float)g_my_hp / (float)g_my_max_hp) : 0.0f;
-    float mp_ratio  = 1.0f;  // MP 시스템은 아직 없음 — 일단 가득
-    unsigned long long max_exp = 100ULL << (g_my_level - 1);  // 100 × 2^(level-1)
-    float exp_ratio_target = std::min(1.0f, (float)g_my_exp / (float)max_exp);
+    float mp_ratio_target = (g_my_max_mp > 0) ? std::min(1.0f, (float)g_my_mp / (float)g_my_max_mp) : 0.0f;
+    // 레벨업 필요 EXP — 서버 LevelUpPlayer()와 반드시 동일해야 함: need = 100 × level^2.
+    // (구버전 100<<(level-1) 지수식은 서버에서 폐기됨 + 고레벨 시프트 UB. 동기화 안 돼 바가 안 맞던 버그.)
+    unsigned long long lvq = (g_my_level > 0) ? g_my_level : 1;
+    unsigned long long max_exp = 100ULL * lvq * lvq;
+    float exp_ratio_target = (max_exp > 0)
+        ? std::min(1.0f, (float)g_my_exp / (float)max_exp) : 0.0f;
 
     // HP/EXP 보간: 매 프레임 target 쪽으로 lerp. 60fps 기준 약 150ms에 90% 도달.
     static float displayed_hp_ratio  = 1.0f;
+    static float displayed_mp_ratio  = 1.0f;
     static float displayed_exp_ratio = 0.0f;
     const float LERP = 0.18f;
     displayed_hp_ratio  += (hp_ratio_target  - displayed_hp_ratio)  * LERP;
+    displayed_mp_ratio  += (mp_ratio_target  - displayed_mp_ratio)  * LERP;
     displayed_exp_ratio += (exp_ratio_target - displayed_exp_ratio) * LERP;
     // 차이가 충분히 작으면 target에 스냅 (오래된 0.001 잔류 방지)
     if (std::abs(hp_ratio_target  - displayed_hp_ratio)  < 0.002f) displayed_hp_ratio  = hp_ratio_target;
+    if (std::abs(mp_ratio_target  - displayed_mp_ratio)  < 0.002f) displayed_mp_ratio  = mp_ratio_target;
     if (std::abs(exp_ratio_target - displayed_exp_ratio) < 0.002f) displayed_exp_ratio = exp_ratio_target;
     float hp_ratio  = displayed_hp_ratio;
+    float mp_ratio  = displayed_mp_ratio;
     float exp_ratio = displayed_exp_ratio;
 
     // 저체력(30% 미만) 경고: 빨강이 밝게 깜빡임 (sin 기반 ~0.5초 주기)
@@ -2047,10 +2131,11 @@ static void draw_hud()
             int col = i % COLS, row = i / COLS;
             float cx = grid_x + col * (CELL + CELL_GAP);
             float cy = grid_y + row * (CELL + CELL_GAP);
+            bool is_cursor = (i == g_inv_cursor);
             sf::RectangleShape cell(sf::Vector2f(CELL, CELL));
-            cell.setFillColor(sf::Color(30, 28, 45, 220));
-            cell.setOutlineColor(sf::Color(90, 90, 110));
-            cell.setOutlineThickness(1.0f);
+            cell.setFillColor(is_cursor ? sf::Color(58, 52, 82, 235) : sf::Color(30, 28, 45, 220));
+            cell.setOutlineColor(is_cursor ? sf::Color(255, 220, 90) : sf::Color(90, 90, 110));
+            cell.setOutlineThickness(is_cursor ? 3.0f : 1.0f);
             cell.setPosition(cx, cy);
             g_window->draw(cell);
 
@@ -2064,15 +2149,7 @@ static void draw_hud()
                 int item_id = g_inventory[i].first;
                 int qty = g_inventory[i].second;
                 const ClientItemMeta* m = item_meta(item_id);
-                sf::Color col2 = m ? m->color : sf::Color(220, 220, 220);
-                sf::RectangleShape gem(sf::Vector2f(26, 26));
-                gem.setOrigin(13, 13);
-                gem.setPosition(cx + CELL * 0.5f, cy + 28);
-                gem.setRotation(45.0f);
-                gem.setFillColor(col2);
-                gem.setOutlineColor(sf::Color(20, 20, 20));
-                gem.setOutlineThickness(1.5f);
-                g_window->draw(gem);
+                draw_item_sprite(item_id, cx + CELL * 0.5f, cy + 28, 40.0f);
 
                 std::string nm = m ? m->name : "item";
                 if (nm.size() > 10) nm = nm.substr(0, 10);
@@ -2081,7 +2158,8 @@ static void draw_hud()
             }
         }
 
-        panel_text("1-0 use/equip   R unequip weapon   F unequip armor", panel_x + 14, panel_y + PH - 24, 12, sf::Color(200, 200, 200));
+        panel_text("Arrows: move cursor   F/Enter: use/equip   D: drop", panel_x + 14, panel_y + PH - 42, 12, sf::Color(255, 220, 130));
+        panel_text("1-0: quick slot   R/A: unequip wpn/arm   G: pick up", panel_x + 14, panel_y + PH - 24, 12, sf::Color(200, 200, 200));
     }
 
     // 공용 텍스트 헬퍼 (퀘스트 UI)
@@ -2320,22 +2398,20 @@ void client_main()
     for (const auto& d : g_decorations) draw_landmark_sprite(d);
     for (const auto& d : g_landmarks)   draw_landmark_sprite(d);
 
-    // === Stage 8: 바닥 아이템 (캐릭터 아래) — 회전 사각형 보석 + 외곽선 ===
+    // === Stage 8: 바닥 아이템 (캐릭터 아래) — DCSS 아이템 스프라이트 ===
     for (const auto& kv : g_ground_items) {
         const GroundItemView& gi = kv.second;
         if (!in_view_tile(gi.x, gi.y)) continue;
-        const ClientItemMeta* meta = item_meta(gi.item_id);
-        sf::Color col = meta ? meta->color : sf::Color(220, 220, 220);
-        float px = (gi.x - g_left_x) * (float)TILE_WIDTH;
-        float py = (gi.y - g_top_y)  * (float)TILE_WIDTH;
-        sf::RectangleShape gem(sf::Vector2f(TILE_WIDTH * 0.42f, TILE_WIDTH * 0.42f));
-        gem.setOrigin(gem.getSize().x * 0.5f, gem.getSize().y * 0.5f);
-        gem.setPosition(px + TILE_WIDTH * 0.5f, py + TILE_WIDTH * 0.5f);
-        gem.setRotation(45.0f);
-        gem.setFillColor(col);
-        gem.setOutlineColor(sf::Color(20, 20, 20));
-        gem.setOutlineThickness(2.0f);
-        g_window->draw(gem);
+        float cx = (gi.x - g_left_x + 0.5f) * (float)TILE_WIDTH;
+        float cy = (gi.y - g_top_y  + 0.5f) * (float)TILE_WIDTH;
+        // 바닥 그림자(타원)로 드롭이 떠 있는 느낌 강조
+        sf::CircleShape shadow(TILE_WIDTH * 0.26f);
+        shadow.setScale(1.0f, 0.45f);
+        shadow.setOrigin(shadow.getRadius(), shadow.getRadius());
+        shadow.setPosition(cx, cy + TILE_WIDTH * 0.28f);
+        shadow.setFillColor(sf::Color(0, 0, 0, 90));
+        g_window->draw(shadow);
+        draw_item_sprite(gi.item_id, cx, cy, (float)TILE_WIDTH * 0.9f);
     }
 
     avatar.draw();
@@ -2473,10 +2549,32 @@ int main()
                     continue;  // 대화창 동안 다른 입력 차단
                 }
 
-                // Stage 8: 인벤토리 패널이 열린 동안엔 숫자/장착 키를 인벤 조작으로 가로챔 (모달)
+                // Stage 8: 인벤토리 패널이 열린 동안엔 방향키/장착 키를 인벤 조작으로 가로챔 (모달)
                 if (g_inv_open) {
+                    constexpr int INV_COLS = 5;  // 인벤 그리드 열 수 (draw의 COLS와 동일)
+                    // 슬롯 사용(소모품)/장착(무기·방어구) 공통 처리
+                    auto use_or_equip = [&](int slot) {
+                        if (slot < 0 || slot >= (int)g_inventory.size()) return;
+                        int item_id = g_inventory[slot].first;
+                        const ClientItemMeta* m = item_meta(item_id);
+                        if (m && m->cat == CIC_CONSUMABLE) {
+                            C2S_UseItem u; u.size = sizeof(u); u.type = C2S_USE_ITEM; u.slot = (unsigned char)slot; send_packet(&u);
+                        } else if (m) {
+                            C2S_EquipItem e; e.size = sizeof(e); e.type = C2S_EQUIP_ITEM; e.slot = (unsigned char)slot; send_packet(&e);
+                        }
+                    };
                     int slot = -1;
                     switch (event.key.code) {
+                    // 방향키 = 커서 이동 (20칸 5열 그리드)
+                    case sf::Keyboard::Left:  if (g_inv_cursor % INV_COLS > 0) g_inv_cursor -= 1; break;
+                    case sf::Keyboard::Right: if (g_inv_cursor % INV_COLS < INV_COLS - 1 &&
+                                                  g_inv_cursor + 1 < MAX_INVENTORY_SLOTS) g_inv_cursor += 1; break;
+                    case sf::Keyboard::Up:     if (g_inv_cursor - INV_COLS >= 0) g_inv_cursor -= INV_COLS; break;
+                    case sf::Keyboard::Down:   if (g_inv_cursor + INV_COLS < MAX_INVENTORY_SLOTS) g_inv_cursor += INV_COLS; break;
+                    // F / Enter = 커서가 가리키는 슬롯 사용·장착
+                    case sf::Keyboard::F:
+                    case sf::Keyboard::Enter:  use_or_equip(g_inv_cursor); break;
+                    // 1~0 = 앞 10칸 빠른 사용·장착 (기존 단축키 유지)
                     case sf::Keyboard::Num1: slot = 0; break;
                     case sf::Keyboard::Num2: slot = 1; break;
                     case sf::Keyboard::Num3: slot = 2; break;
@@ -2498,21 +2596,21 @@ int main()
                         C2S_UnequipItem u; u.size = sizeof(u); u.type = C2S_UNEQUIP_ITEM; u.which = 0; send_packet(&u);
                         break;
                     }
-                    case sf::Keyboard::F: {  // 방어구 해제
+                    case sf::Keyboard::A: {  // 방어구 해제 (F가 사용·장착으로 바뀌어 A로 이동)
                         C2S_UnequipItem u; u.size = sizeof(u); u.type = C2S_UNEQUIP_ITEM; u.which = 1; send_packet(&u);
+                        break;
+                    }
+                    case sf::Keyboard::D: {  // 커서 슬롯 아이템 버리기 (발밑 바닥에 떨어뜨림)
+                        if (g_inv_cursor >= 0 && g_inv_cursor < (int)g_inventory.size()) {
+                            C2S_DropItem d; d.size = sizeof(d); d.type = C2S_DROP_ITEM; d.slot = (unsigned char)g_inv_cursor; send_packet(&d);
+                        }
                         break;
                     }
                     default: break;
                     }
-                    if (slot >= 0 && slot < (int)g_inventory.size()) {
-                        int item_id = g_inventory[slot].first;
-                        const ClientItemMeta* m = item_meta(item_id);
-                        if (m && m->cat == CIC_CONSUMABLE) {
-                            C2S_UseItem u; u.size = sizeof(u); u.type = C2S_USE_ITEM; u.slot = (unsigned char)slot; send_packet(&u);
-                        } else if (m) {
-                            C2S_EquipItem e; e.size = sizeof(e); e.type = C2S_EQUIP_ITEM; e.slot = (unsigned char)slot; send_packet(&e);
-                        }
-                    }
+                    if (g_inv_cursor < 0) g_inv_cursor = 0;
+                    if (g_inv_cursor >= MAX_INVENTORY_SLOTS) g_inv_cursor = MAX_INVENTORY_SLOTS - 1;
+                    if (slot >= 0) use_or_equip(slot);
                     continue;  // 인벤 모드에선 이동/공격/스킬 입력 무시
                 }
 
