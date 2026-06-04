@@ -2241,6 +2241,14 @@ void worker_thread() {
             }
             else {
                 SOCKET c_socket = ov_ex->client_socket;
+                // Nagle 비활성화: 작은 move/이벤트 패킷이 ACK를 기다리며 묶이는 것을 막는다.
+                // localhost(RTT~0)에선 무영향이지만 실제/원거리 RTT(VPN 등) 링크에선
+                // Nagle+delayed-ACK가 패킷당 수십~수백 ms 지연을 유발한다.
+                {
+                    BOOL nodelay = TRUE;
+                    setsockopt(c_socket, IPPROTO_TCP, TCP_NODELAY,
+                        reinterpret_cast<const char*>(&nodelay), sizeof(nodelay));
+                }
                 int new_id = g_next_id++;
                 auto session = make_shared<Player>();
                 session->id = new_id;

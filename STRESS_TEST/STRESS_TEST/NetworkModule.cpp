@@ -81,6 +81,18 @@ struct ALIEN {
 
 void error_display(const char* msg, int err_no)
 {
+	// 진단 출력은 측정 스레드를 막지 않도록 모든 스레드 합산 초당 1회로 제한.
+	// (5000 CCU 부근에서 WSAConnect 실패가 폭주하면 매 실패마다 동기 콘솔 flush가
+	//  Test_Thread를 멈춰 측정 지연(global_delay)이 부풀려지던 문제 수정.
+	//  FormatMessage 시스템콜 자체도 비싸므로 throttle 통과 시에만 호출한다.)
+	static std::atomic<long long> last_err_ms{ 0 };
+	long long now_ms = duration_cast<milliseconds>(
+		high_resolution_clock::now().time_since_epoch()).count();
+	long long prev = last_err_ms.load(std::memory_order_relaxed);
+	if (now_ms - prev < 1000) return;                                   // 1초 내 중복 진단은 버림
+	if (!last_err_ms.compare_exchange_strong(prev, now_ms,
+		std::memory_order_relaxed)) return;                             // 다른 스레드가 먼저 출력
+
 	WCHAR* lpMsgBuf;
 	FormatMessage(
 		FORMAT_MESSAGE_ALLOCATE_BUFFER |
@@ -89,7 +101,7 @@ void error_display(const char* msg, int err_no)
 		MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT),
 		(LPTSTR)&lpMsgBuf, 0, NULL);
 	std::cout << msg;
-	std::wcout << L"����" << lpMsgBuf << std::endl;
+	std::wcout << L"Error: " << lpMsgBuf << L'\n';
 
 	// MessageBox 팝업은 스트레스 테스트를 블로킹하므로 제거 — 콘솔 출력만 유지
 	LocalFree(lpMsgBuf);
@@ -332,6 +344,15 @@ void Adjust_Number_Of_Client()
 	last_connect_time = high_resolution_clock::now();
 	g_clients[num_connections].client_socket = WSASocketW(AF_INET, SOCK_STREAM, IPPROTO_TCP, NULL, 0, WSA_FLAG_OVERLAPPED);
 
+	// Nagle 비활성화: 서버와 동일하게 작은 move 패킷이 묶이지 않도록.
+	// VPN/원거리 RTT 링크에서 측정 지연(global_delay)이 실제 서버 처리시간이 아니라
+	// Nagle 지연으로 부풀려지는 것을 방지한다.
+	{
+		BOOL nodelay = TRUE;
+		setsockopt(g_clients[num_connections].client_socket, IPPROTO_TCP, TCP_NODELAY,
+			reinterpret_cast<const char*>(&nodelay), sizeof(nodelay));
+	}
+
 	SOCKADDR_IN ServerAddr;
 	ZeroMemory(&ServerAddr, sizeof(SOCKADDR_IN));
 	ServerAddr.sin_family = AF_INET;
@@ -413,14 +434,14 @@ void Test_Thread()
 
 void InitializeNetwork()
 {
-	std::cout << "���� IP �ּҸ� �Է��ϼ��� (�⺻��: 127.0.0.1): ";
+	std::cout << "Server IP (default 127.0.0.1): ";
 	std::string input_ip;
 	std::getline(std::cin, input_ip);
 	if (input_ip.empty())
 		strncpy_s(g_server_ip, "127.0.0.1", sizeof(g_server_ip) - 1);
 	else
 		strncpy_s(g_server_ip, input_ip.c_str(), sizeof(g_server_ip) - 1);
-	std::cout << "���� IP: " << g_server_ip << std::endl;
+	std::cout << "Server IP: " << g_server_ip << std::endl;
 
 	for (auto& cl : g_clients) {
 		cl.connected = false;
