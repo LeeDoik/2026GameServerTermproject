@@ -7,7 +7,6 @@
 | 폴더 | 용도 |
 |---|---|
 | `tiles/` | 지면/배경 타일맵. 던전 바닥, 장애물 등 |
-| `tiles/archive/` | 안 쓰는 타일 변형(보관용) |
 | `hero/` | 플레이어 워리어 스프라이트 (walk/attack/death 등) |
 | `monsters/` | NPC 스프라이트 (goblin, orc, skeleton, boss 등) |
 | `ui/` | HUD/UI 요소 (HP/MP 구슬, EXP 바, 채팅창, 인벤토리 슬롯) |
@@ -37,7 +36,6 @@
 | 파일 | 크기 | 레이아웃 | 비고 |
 |---|---|---|---|
 | `tiles/dungeon-tiles-256x256.png` | 256x256 | 4행x4열 (각 64x64) | 행=지역(0:NW 균열석 / 1:SW 혈흔 / 2:NE 벽돌 / 3:SE 룬), 열=variant |
-| `tiles/archive/dungeon-tiles-256x256-runeglow.png` | 256x256 | 동일 | 룬 발광 버전 (현재 미사용) |
 | `hero/hero-walk-256x256-4dir.png` | 256x256 | 4행x4열 (각 64x64) | 행=방향(Down/Left/Right/Up), 열=walk 프레임 0~3 |
 | `hero/hero-attack-192x256-4dir.png` | 192x256 | 4행x3열 (각 64x64) | 행=방향, 열=공격 프레임(windup/slash/recovery). Stage 5에서 연결 예정 |
 
