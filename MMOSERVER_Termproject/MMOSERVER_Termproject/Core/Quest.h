@@ -6,6 +6,7 @@
 // 플레이어별 진행 상태(QuestProgress)는 Player가 보유.
 
 #include <vector>
+#include <unordered_map>
 #include "../protocol_2026.h"  // MAX_NAME_LEN
 
 struct QuestDef {
@@ -19,8 +20,8 @@ struct QuestDef {
     int reward_item_qty = 0;
 };
 
-// 카탈로그 (부팅 시 1회 로드 후 read-only) — 동시 읽기 안전. id 오름차순 유지.
-extern std::vector<QuestDef> g_quest_defs;
+// 카탈로그 (부팅 시 1회 로드 후 read-only) — 동시 읽기 안전.
+extern std::unordered_map<int, QuestDef> g_quest_defs;
 
 // 정의 조회. 없으면 nullptr.
 const QuestDef* GetQuestDef(int quest_id);

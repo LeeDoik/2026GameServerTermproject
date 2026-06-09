@@ -22,8 +22,8 @@ constexpr int HP_REGEN_PERCENT = 10;
 
 // MP 시스템 — 저소모·고속재생 (스킬은 쿨타임이 주 제약, MP는 보조)
 constexpr int MP_MAX               = 100;   // 최대 MP (전 플레이어 고정)
-constexpr int MP_REGEN_INTERVAL_MS = 1000;  // 1초마다 재생 (빠름)
-constexpr int MP_REGEN_AMOUNT      = 30;    // 틱당 +30 → 0→100 약 3.3초, 스킬 1회분은 한 틱 내 회복
+constexpr int MP_REGEN_INTERVAL_MS = 3000;  // 3초마다 재생
+constexpr int MP_REGEN_AMOUNT      = 10;    // 틱당 +10 → 0→100 약 30초
 constexpr int SKILL_AOE_MP_COST    = 5;     // Q
 constexpr int SKILL_LINE_MP_COST   = 5;     // W
 constexpr int SKILL_HEAL_MP_COST   = 10;    // E
@@ -78,9 +78,13 @@ constexpr int SKILL_LINE_DAMAGE_PER_LEVEL = 20;
 constexpr int SKILL_HEAL_PERCENT          = 30; // max_hp의 30%
 
 // Stage 8: 아이템 시스템
-constexpr int GROUND_ITEM_EXPIRE_MS = 60000;   // 바닥 아이템 60초 후 자동 소멸
-constexpr int ITEM_PICKUP_RANGE     = 1;       // 줍기 가능 거리 (manhattan)
-constexpr int DROP_ID_START         = 2000000; // 바닥 아이템 ID 시작 (player<1e6, npc<1.2e6과 분리)
+constexpr int GROUND_ITEM_EXPIRE_MS      = 60000;   // 바닥 아이템 60초 후 자동 소멸
+constexpr int ITEM_PICKUP_RANGE          = 1;       // 수동 줍기 가능 거리 (chebyshev)
+constexpr int AUTO_HEAL_PICKUP_RANGE     = 1;       // 자동 힐 픽업 범위 (Chebyshev) — 3×3 영역
+constexpr int DROP_ID_START              = 2000000; // 바닥 아이템 ID 시작 (player<1e6, npc<1.2e6과 분리)
+
+// 파티 초대 타임아웃: 30초 내 응답 없으면 자동 취소
+constexpr int PARTY_INVITE_TIMEOUT_MS = 30000;
 
 // Stage 9: 퀘스트 시스템
 // 장로(퀘스트 giver, 마을 NPC index 0) 좌표 — client.cpp g_village_npcs[0]와 일치해야 함.

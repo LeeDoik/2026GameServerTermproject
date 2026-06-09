@@ -1,5 +1,5 @@
 #define _CRT_SECURE_NO_WARNINGS
-#include "MySqlOdbcBackend.h"
+#include "SqlServerOdbcBackend.h"
 
 #include <windows.h>
 #include <sql.h>
@@ -45,7 +45,7 @@ SQLRETURN BindInt(SQLHSTMT st, SQLUSMALLINT pnum, SQLSMALLINT sql_type, int* val
 
 } // namespace
 
-MySqlOdbcBackend::MySqlOdbcBackend(const std::string& conn_str) {
+SqlServerOdbcBackend::SqlServerOdbcBackend(const std::string& conn_str) {
     SQLHENV env = SQL_NULL_HENV;
     SQLHDBC dbc = SQL_NULL_HDBC;
 
@@ -81,7 +81,7 @@ MySqlOdbcBackend::MySqlOdbcBackend(const std::string& conn_str) {
     connected_ = true;
 }
 
-MySqlOdbcBackend::~MySqlOdbcBackend() {
+SqlServerOdbcBackend::~SqlServerOdbcBackend() {
     if (dbc_) {
         SQLDisconnect(static_cast<SQLHDBC>(dbc_));
         SQLFreeHandle(SQL_HANDLE_DBC, static_cast<SQLHDBC>(dbc_));
@@ -91,7 +91,7 @@ MySqlOdbcBackend::~MySqlOdbcBackend() {
     }
 }
 
-IDbBackend::LoadResult MySqlOdbcBackend::Load(const std::string& username, PlayerSnapshot& out) {
+IDbBackend::LoadResult SqlServerOdbcBackend::Load(const std::string& username, PlayerSnapshot& out) {
     LoadResult res;
     out.username = username;
     if (!connected_) return res;  // ok=false
@@ -111,7 +111,7 @@ IDbBackend::LoadResult MySqlOdbcBackend::Load(const std::string& username, Playe
             return res;
         }
         const char* sql =
-            "SELECT hp,max_hp,exp,level,x,y,equipped_weapon_id,equipped_armor_id "
+            "SELECT hp,max_hp,exp,level,x,y,direction,equipped_weapon_id,equipped_armor_id "
             "FROM players WHERE username=?";
         BindUser(st, 1, user, &user_ind);
         if (!Ok(SQLExecDirectA(st, reinterpret_cast<SQLCHAR*>(const_cast<char*>(sql)), SQL_NTS))) {
@@ -134,7 +134,7 @@ IDbBackend::LoadResult MySqlOdbcBackend::Load(const std::string& username, Playe
             return res;
         }
 
-        long hp = 100, max_hp = 100, level = 1, x = 0, y = 0, wpn = -1, arm = -1;
+        long hp = 100, max_hp = 100, level = 1, x = 0, y = 0, dir = 0, wpn = -1, arm = -1;
         unsigned long long exp = 0;
         SQLLEN ind = 0;
         SQLGetData(st, 1, SQL_C_SLONG, &hp, 0, &ind);
@@ -143,8 +143,9 @@ IDbBackend::LoadResult MySqlOdbcBackend::Load(const std::string& username, Playe
         SQLGetData(st, 4, SQL_C_SLONG, &level, 0, &ind);
         SQLGetData(st, 5, SQL_C_SLONG, &x, 0, &ind);
         SQLGetData(st, 6, SQL_C_SLONG, &y, 0, &ind);
-        SQLGetData(st, 7, SQL_C_SLONG, &wpn, 0, &ind);
-        SQLGetData(st, 8, SQL_C_SLONG, &arm, 0, &ind);
+        SQLGetData(st, 7, SQL_C_SLONG, &dir, 0, &ind);
+        SQLGetData(st, 8, SQL_C_SLONG, &wpn, 0, &ind);
+        SQLGetData(st, 9, SQL_C_SLONG, &arm, 0, &ind);
 
         out.hp = static_cast<int>(hp);
         out.max_hp = static_cast<int>(max_hp);
@@ -152,6 +153,7 @@ IDbBackend::LoadResult MySqlOdbcBackend::Load(const std::string& username, Playe
         out.level = static_cast<unsigned char>(level);
         out.x = static_cast<short>(x);
         out.y = static_cast<short>(y);
+        out.direction = static_cast<unsigned char>(dir & 3);
         out.equipped_weapon_id = static_cast<int>(wpn);
         out.equipped_armor_id = static_cast<int>(arm);
 
@@ -212,7 +214,7 @@ IDbBackend::LoadResult MySqlOdbcBackend::Load(const std::string& username, Playe
     return res;
 }
 
-bool MySqlOdbcBackend::Save(const PlayerSnapshot& snap) {
+bool SqlServerOdbcBackend::Save(const PlayerSnapshot& snap) {
     if (!connected_) return false;
     SQLHDBC dbc = static_cast<SQLHDBC>(dbc_);
 
@@ -228,23 +230,30 @@ bool MySqlOdbcBackend::Save(const PlayerSnapshot& snap) {
     SQLLEN user_ind = SQL_NTS;
 
     int hp = snap.hp, max_hp = snap.max_hp, level = snap.level;
-    int x = snap.x, y = snap.y;
+    int x = snap.x, y = snap.y, dir = snap.direction;
     int wpn = snap.equipped_weapon_id, arm = snap.equipped_armor_id;
     unsigned long long exp = snap.exp;
 
-    // --- 1) players upsert ---
+    // --- 1) players upsert (T-SQL MERGE) ---
+    // VALUES(?,...) 테이블 생성자의 ? 10개가 아래 BindUser/BindInt 순서(username,hp,max_hp,exp,
+    // level,x,y,direction,wpn,arm)와 1:1 위치 매칭. MERGE는 문장 끝 세미콜론 필수.
+    // WITH (HOLDLOCK): upsert 경합 시 PK 충돌 방지(단일 워커라 필수는 아니나 안전상 유지).
     if (ok) {
         SQLHSTMT st = SQL_NULL_HSTMT;
         if (Ok(SQLAllocHandle(SQL_HANDLE_STMT, dbc, &st))) {
             const char* sql =
-                "INSERT INTO players "
-                "(username,hp,max_hp,exp,level,x,y,equipped_weapon_id,equipped_armor_id) "
-                "VALUES (?,?,?,?,?,?,?,?,?) "
-                "ON DUPLICATE KEY UPDATE "
-                "hp=VALUES(hp),max_hp=VALUES(max_hp),exp=VALUES(exp),level=VALUES(level),"
-                "x=VALUES(x),y=VALUES(y),"
-                "equipped_weapon_id=VALUES(equipped_weapon_id),"
-                "equipped_armor_id=VALUES(equipped_armor_id)";
+                "MERGE players WITH (HOLDLOCK) AS t "
+                "USING (VALUES(?,?,?,?,?,?,?,?,?,?)) AS s "
+                "(username,hp,max_hp,exp,level,x,y,direction,equipped_weapon_id,equipped_armor_id) "
+                "ON (t.username = s.username) "
+                "WHEN MATCHED THEN UPDATE SET "
+                "hp=s.hp,max_hp=s.max_hp,exp=s.exp,level=s.level,x=s.x,y=s.y,"
+                "direction=s.direction,equipped_weapon_id=s.equipped_weapon_id,"
+                "equipped_armor_id=s.equipped_armor_id "
+                "WHEN NOT MATCHED THEN INSERT "
+                "(username,hp,max_hp,exp,level,x,y,direction,equipped_weapon_id,equipped_armor_id) "
+                "VALUES (s.username,s.hp,s.max_hp,s.exp,s.level,s.x,s.y,s.direction,"
+                "s.equipped_weapon_id,s.equipped_armor_id);";
             BindUser(st, 1, user, &user_ind);
             BindInt(st, 2, SQL_INTEGER, &hp);
             BindInt(st, 3, SQL_INTEGER, &max_hp);
@@ -252,8 +261,9 @@ bool MySqlOdbcBackend::Save(const PlayerSnapshot& snap) {
             BindInt(st, 5, SQL_TINYINT, &level);
             BindInt(st, 6, SQL_SMALLINT, &x);
             BindInt(st, 7, SQL_SMALLINT, &y);
-            BindInt(st, 8, SQL_INTEGER, &wpn);
-            BindInt(st, 9, SQL_INTEGER, &arm);
+            BindInt(st, 8, SQL_TINYINT, &dir);
+            BindInt(st, 9, SQL_INTEGER, &wpn);
+            BindInt(st, 10, SQL_INTEGER, &arm);
             if (!Ok(SQLExecDirectA(st, reinterpret_cast<SQLCHAR*>(const_cast<char*>(sql)), SQL_NTS))) {
                 ReportError("Save/players", SQL_HANDLE_STMT, st);
                 ok = false;

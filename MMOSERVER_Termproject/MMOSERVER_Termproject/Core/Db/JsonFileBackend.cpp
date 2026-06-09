@@ -175,8 +175,9 @@ IDbBackend::LoadResult JsonFileBackend::Load(const std::string& username, Player
     if (const char* p = FindKey(json, "max_hp"))  { if (ReadInt(p, v)) out.max_hp = static_cast<int>(v); }
     if (const char* p = FindKey(json, "exp"))     { if (ReadInt(p, v)) out.exp = static_cast<unsigned long long>(v); }
     if (const char* p = FindKey(json, "level"))   { if (ReadInt(p, v)) out.level = static_cast<unsigned char>(v); }
-    if (const char* p = FindKey(json, "x"))       { if (ReadInt(p, v)) out.x = static_cast<short>(v); }
-    if (const char* p = FindKey(json, "y"))       { if (ReadInt(p, v)) out.y = static_cast<short>(v); }
+    if (const char* p = FindKey(json, "x"))         { if (ReadInt(p, v)) out.x = static_cast<short>(v); }
+    if (const char* p = FindKey(json, "y"))         { if (ReadInt(p, v)) out.y = static_cast<short>(v); }
+    if (const char* p = FindKey(json, "direction")) { if (ReadInt(p, v)) out.direction = static_cast<unsigned char>(v & 3); }
 
     // Stage 8: 아이템 (키 없으면 기본값 — 구버전 JSON 호환)
     if (const char* p = FindKey(json, "weapon"))    { if (ReadInt(p, v)) out.equipped_weapon_id = static_cast<int>(v); }
@@ -222,7 +223,8 @@ bool JsonFileBackend::Save(const PlayerSnapshot& snap) {
     // 외부 라이브러리 없이 one-liner JSON. username은 안전화된 키 그대로 사용.
     int n = std::fprintf(
         fp,
-        "{\"username\":\"%s\",\"hp\":%d,\"max_hp\":%d,\"exp\":%llu,\"level\":%u,\"x\":%d,\"y\":%d,"
+        "{\"username\":\"%s\",\"hp\":%d,\"max_hp\":%d,\"exp\":%llu,\"level\":%u,"
+        "\"x\":%d,\"y\":%d,\"direction\":%u,"
         "\"inventory\":%s,\"weapon\":%d,\"armor\":%d,\"quests\":%s}\n",
         SafeUsername(snap.username).c_str(),
         snap.hp,
@@ -231,6 +233,7 @@ bool JsonFileBackend::Save(const PlayerSnapshot& snap) {
         static_cast<unsigned int>(snap.level),
         static_cast<int>(snap.x),
         static_cast<int>(snap.y),
+        static_cast<unsigned int>(snap.direction),
         inv.c_str(),
         snap.equipped_weapon_id,
         snap.equipped_armor_id,

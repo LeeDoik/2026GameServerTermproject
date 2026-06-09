@@ -1,0 +1,599 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Aetheria Online — 텀프로젝트 발표</title>
+<style>
+  :root{
+    --ink:#16223d;        /* 본문 글자 (짙은 네이비) */
+    --muted:#5d6b82;      /* 보조 글자 */
+    --bg:#ffffff;
+    --panel:#f3f6fc;      /* 카드 배경 */
+    --line:#dde4f0;
+    --blue:#2563eb;       /* 기본 구현 강조색 */
+    --blue-dark:#1d4ed8;
+    --blue-soft:#eaf1ff;
+    --orange:#ea580c;     /* 추가 구현 강조색 */
+    --orange-dark:#c2410c;
+    --orange-soft:#fff1e8;
+    --good:#0f9d58;
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  html,body{height:100%}
+  body{
+    background:#0d1526;
+    font-family:'Segoe UI','Malgun Gothic','Apple SD Gothic Neo',sans-serif;
+    color:var(--ink);
+    overflow:hidden;
+  }
+
+  /* 16:9 고정 캔버스 — 프로젝터 해상도와 무관하게 화면에 꽉 맞춤 */
+  #deck{
+    position:absolute; top:50%; left:50%;
+    width:1280px; height:720px;
+    transform-origin:center center;
+    background:var(--bg);
+  }
+
+  .slide{
+    position:absolute; inset:0;
+    display:none;
+    padding:54px 64px 60px;
+    flex-direction:column;
+  }
+  .slide.active{display:flex}
+
+  /* 공통 헤더 */
+  .stag{
+    display:inline-flex; align-items:center; gap:8px;
+    font-size:15px; font-weight:700; letter-spacing:.04em;
+    padding:5px 13px; border-radius:999px;
+    color:#fff; background:var(--blue);
+    margin-bottom:14px; width:fit-content;
+  }
+  .slide[data-sec="add"] .stag{background:var(--orange)}
+  .stag .dot{width:8px;height:8px;border-radius:50%;background:#fff;opacity:.85}
+
+  h1.title{font-size:40px;font-weight:800;line-height:1.15;color:var(--ink)}
+  h1.title .ac{color:var(--blue)}
+  .slide[data-sec="add"] h1.title .ac{color:var(--orange)}
+  .rule{height:5px;width:74px;background:var(--blue);border-radius:3px;margin:14px 0 26px}
+  .slide[data-sec="add"] .rule{background:var(--orange)}
+
+  /* 본문 카드 */
+  .grid{display:grid;gap:18px;flex:1;min-height:0}
+  .g2{grid-template-columns:1fr 1fr}
+  .g3{grid-template-columns:1fr 1fr 1fr}
+  .card{
+    background:var(--panel); border:1px solid var(--line);
+    border-left:6px solid var(--blue);
+    border-radius:12px; padding:20px 22px;
+  }
+  .slide[data-sec="add"] .card{border-left-color:var(--orange)}
+  .card h3{font-size:21px;font-weight:800;margin-bottom:12px;color:var(--ink);display:flex;align-items:center;gap:9px}
+  .card h3 .k{font-size:13px;font-weight:700;color:#fff;background:var(--blue);padding:3px 9px;border-radius:6px}
+  .slide[data-sec="add"] .card h3 .k{background:var(--orange)}
+  ul{list-style:none}
+  li{
+    position:relative; padding-left:20px; margin:9px 0;
+    font-size:18.5px; line-height:1.4; color:#28344c;
+  }
+  li::before{
+    content:""; position:absolute; left:2px; top:10px;
+    width:8px;height:8px;border-radius:2px;background:var(--blue);
+  }
+  .slide[data-sec="add"] li::before{background:var(--orange)}
+  li b{color:var(--ink);font-weight:800}
+  li .num{color:var(--blue);font-weight:800}
+  .slide[data-sec="add"] li .num{color:var(--orange-dark)}
+  .sub{font-size:15.5px;color:var(--muted);line-height:1.4}
+  code{font-family:'Consolas','D2Coding',monospace;background:#e7edf8;color:#1c3a73;padding:1px 6px;border-radius:5px;font-size:.92em}
+
+  /* 푸터 */
+  .foot{
+    position:absolute; left:64px; right:64px; bottom:20px;
+    display:flex; justify-content:space-between; align-items:center;
+    font-size:13px; color:#93a0b5; border-top:1px solid var(--line); padding-top:9px;
+  }
+  .progress{position:absolute;left:0;bottom:0;height:5px;background:var(--blue);transition:width .25s ease}
+  .slide[data-sec="add"] ~ .progress{}
+
+  /* ===== 타이틀 슬라이드 ===== */
+  #s-title{justify-content:center;background:
+     radial-gradient(900px 520px at 78% 14%, #eef3ff 0%, #ffffff 60%);}
+  #s-title .eyebrow{font-size:18px;font-weight:700;color:var(--blue);letter-spacing:.12em;margin-bottom:18px}
+  #s-title h1{font-size:78px;font-weight:900;line-height:1.02;color:var(--ink)}
+  #s-title .ko{font-size:27px;font-weight:700;color:#33425f;margin-top:14px}
+  #s-title .specs{display:flex;gap:10px;flex-wrap:wrap;margin-top:30px}
+  #s-title .chip{font-size:16px;font-weight:700;color:var(--blue-dark);background:var(--blue-soft);
+     border:1px solid #cfe0ff;padding:8px 15px;border-radius:9px}
+  #s-title .meta{margin-top:40px;font-size:18px;color:var(--muted);line-height:1.7}
+  #s-title .meta b{color:var(--ink)}
+  #s-title .hint{position:absolute;right:64px;bottom:54px;font-size:14px;color:#aab4c6}
+
+  /* ===== 구분(섹션) 슬라이드 ===== */
+  .divider{justify-content:center;align-items:flex-start}
+  .divider .big{font-size:90px;font-weight:900;line-height:1;color:var(--ink)}
+  .divider .lead{font-size:24px;font-weight:700;color:#fff;background:var(--blue);
+     padding:8px 18px;border-radius:10px;margin-bottom:26px;width:fit-content}
+  .slide[data-sec="add"].divider .lead{background:var(--orange)}
+  .divider .desc{font-size:23px;color:#3a475f;margin-top:24px;line-height:1.5}
+  .divider .desc b{color:var(--blue-dark)}
+  .slide[data-sec="add"].divider .desc b{color:var(--orange-dark)}
+  .divider .score{display:inline-block;margin-top:22px;font-size:17px;font-weight:700;color:var(--muted);
+     border:1px dashed #c3cee0;padding:7px 14px;border-radius:8px}
+
+  /* 개요 헤드라인 숫자 */
+  .headline{background:linear-gradient(135deg,#1d4ed8,#2563eb);color:#fff;border:none;
+     border-radius:14px;padding:24px 26px;display:flex;flex-direction:column;justify-content:center}
+  .headline .lab{font-size:16px;opacity:.85;font-weight:700;letter-spacing:.03em}
+  .headline .val{font-size:46px;font-weight:900;line-height:1.05;margin-top:6px}
+  .headline .val small{font-size:22px;font-weight:800;opacity:.92}
+  .headline .note{font-size:15px;opacity:.85;margin-top:10px}
+
+  /* 스택 칩 묶음 */
+  .stackwrap{display:flex;flex-wrap:wrap;gap:9px;margin-top:4px}
+  .stackwrap span{font-size:16px;font-weight:700;color:#1c3a73;background:#e7edf8;
+     border:1px solid #d3e0f4;padding:7px 13px;border-radius:8px}
+
+  /* 아키텍처 다이어그램 */
+  .arch{display:flex;flex-direction:column;gap:12px;align-items:center;justify-content:center;flex:1}
+  .arch .row{display:flex;gap:12px;align-items:stretch;justify-content:center;flex-wrap:wrap}
+  .box{background:#fff;border:2px solid var(--blue);border-radius:10px;padding:11px 16px;
+     font-size:16.5px;font-weight:700;color:var(--ink);text-align:center;min-width:150px}
+  .box.fill{background:var(--blue);color:#fff;border-color:var(--blue)}
+  .box small{display:block;font-size:13px;font-weight:600;color:var(--muted);margin-top:3px}
+  .box.fill small{color:#dbe6ff}
+  .arrow{font-size:22px;color:#9fb0cc;align-self:center;font-weight:900}
+  .archnote{font-size:15.5px;color:var(--muted);text-align:center;margin-top:4px}
+
+  /* 성능 칩 그리드 */
+  .opt{display:grid;grid-template-columns:repeat(3,1fr);gap:11px}
+  .opt span{font-size:16px;font-weight:700;color:#1c3a73;background:var(--panel);
+     border:1px solid var(--line);border-left:5px solid var(--blue);
+     padding:11px 14px;border-radius:9px}
+
+  /* 시연 체크리스트 */
+  .demo{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+  .demo div{font-size:20px;font-weight:700;color:var(--ink);background:var(--orange-soft);
+     border:1px solid #ffd9c2;border-radius:10px;padding:15px 18px;display:flex;align-items:center;gap:12px}
+  .demo div .n{font-size:15px;color:#fff;background:var(--orange);width:28px;height:28px;border-radius:50%;
+     display:flex;align-items:center;justify-content:center;flex-shrink:0;font-weight:800}
+
+  /* 화면 우하단 네비 */
+  #nav{position:fixed;right:18px;bottom:16px;display:flex;gap:8px;z-index:20}
+  #nav button{background:rgba(255,255,255,.14);color:#fff;border:1px solid rgba(255,255,255,.3);
+     width:38px;height:38px;border-radius:9px;font-size:18px;cursor:pointer}
+  #nav button:hover{background:rgba(255,255,255,.28)}
+  #pageno{position:fixed;left:20px;bottom:20px;color:rgba(255,255,255,.5);font-size:13px;z-index:20}
+</style>
+</head>
+<body>
+<div id="deck">
+
+  <!-- 1. 타이틀 -->
+  <section class="slide active" id="s-title" data-sec="base">
+    <div class="eyebrow">MM4220 게임서버 프로그래밍 · 텀프로젝트</div>
+    <h1>Aetheria <span style="color:var(--blue)">Online</span></h1>
+    <div class="ko">2,000 × 2,000 격자 기반 고성능 MMORPG 서버</div>
+    <div class="specs">
+      <span class="chip">Win32 IOCP</span>
+      <span class="chip">C++20 · x64 Release</span>
+      <span class="chip">NPC 200,000</span>
+      <span class="chip">목표 5,000 CCU</span>
+    </div>
+    <div class="meta">발표자 <b>이도익</b><br>2026. 06. 18</div>
+    <div class="hint">← → 방향키로 슬라이드 이동</div>
+  </section>
+
+  <!-- 2. 개요 -->
+  <section class="slide" data-sec="base">
+    <span class="stag"><span class="dot"></span>OVERVIEW</span>
+    <h1 class="title">프로젝트 <span class="ac">개요</span></h1>
+    <div class="rule"></div>
+    <div class="grid g2">
+      <div style="display:flex;flex-direction:column;gap:18px">
+        <div class="card">
+          <h3>무엇을 만들었나</h3>
+          <ul>
+            <li>2000×2000 격자 위 다중 접속 · 전투 · NPC AI를 처리하는 <b>MMORPG 서버</b></li>
+            <li>Win32 <b>IOCP</b> 기반 비동기 I/O로 동시 접속 처리</li>
+            <li>NPC <b>200,000</b> 마리 — 4개 지역 + 보스 4</li>
+          </ul>
+        </div>
+        <div class="card">
+          <h3>기술 스택</h3>
+          <div class="stackwrap">
+            <span>C++20 / Release /O2</span><span>Win32 IOCP</span>
+            <span>Intel TBB</span><span>Lua 5.5</span>
+            <span>MySQL + ODBC</span><span>SFML 2.5.1 (클라)</span>
+          </div>
+        </div>
+      </div>
+      <div style="display:flex;flex-direction:column;gap:18px">
+        <div class="headline">
+          <div class="lab">목표 동시 접속</div>
+          <div class="val">5,000 <small>CCU · 랙 없음</small></div>
+        </div>
+        <div class="headline" style="background:linear-gradient(135deg,#0f766e,#0f9d58)">
+          <div class="lab">측정 결과 (localhost)</div>
+          <div class="val">3,462 <small>CCU @ 0~1ms</small></div>
+          <div class="note">200K NPC 동작 중 · 단일 PC 기준</div>
+        </div>
+      </div>
+    </div>
+    <div class="foot"><span>Aetheria Online — 텀프로젝트</span><span>02</span></div>
+    <div class="progress" style="width:14%"></div>
+  </section>
+
+  <!-- 3. 아키텍처 -->
+  <section class="slide" data-sec="base">
+    <span class="stag"><span class="dot"></span>ARCHITECTURE</span>
+    <h1 class="title">시스템 <span class="ac">구조</span></h1>
+    <div class="rule"></div>
+    <div class="arch">
+      <div class="row">
+        <div class="box fill">단일 IOCP 완료 포트<small>worker = CPU 코어 수</small></div>
+      </div>
+      <div class="arrow">▲ ▼</div>
+      <div class="row">
+        <div class="box">IO_ACCEPT<small>접속 수락</small></div>
+        <div class="box">IO_RECV / IO_SEND<small>패킷 수신 · 송신</small></div>
+        <div class="box">IO_TIMER<small>주기 이벤트</small></div>
+        <div class="box">IO_DB_DONE<small>DB 응답</small></div>
+      </div>
+      <div class="row" style="margin-top:6px">
+        <div class="box" style="border-color:#9fb0cc">TimerManager<small>8-shard Min-Heap → IO_TIMER post</small></div>
+        <div class="box" style="border-color:#9fb0cc">DbWorker<small>비동기 Job Queue → IO_DB_DONE post</small></div>
+      </div>
+      <div class="archnote">타이머·DB까지 모두 IOCP 이벤트로 일원화 → 로직 스레드는 블로킹 없이 한 흐름으로 처리</div>
+      <div class="archnote" style="color:#28344c;font-weight:700">패킷: Length-Prefix(1바이트 size + type) · RingBuffer Peek 재조립 → TCP 경계 문제 해소</div>
+    </div>
+    <div class="foot"><span>Aetheria Online — 텀프로젝트</span><span>03</span></div>
+    <div class="progress" style="width:21%"></div>
+  </section>
+
+  <!-- 4. 구분: 기본 구현 -->
+  <section class="slide divider" data-sec="base">
+    <div class="lead">PART 1</div>
+    <div class="big">기본 구현</div>
+    <div class="desc">필수 요구사항 — <b>이동 · 장애물 · NPC AI · 전투 · DB · 스크립트 · 채팅</b></div>
+    <div class="score">평가 항목 : 구현 50% + 성능 20%</div>
+    <div class="foot"><span>Aetheria Online — 텀프로젝트</span><span>04</span></div>
+    <div class="progress" style="width:28%"></div>
+  </section>
+
+  <!-- 5. 맵·이동·시야 -->
+  <section class="slide" data-sec="base">
+    <span class="stag"><span class="dot"></span>기본 구현</span>
+    <h1 class="title">맵 · 이동 · <span class="ac">시야(AOI)</span></h1>
+    <div class="rule"></div>
+    <div class="grid g2">
+      <div class="card">
+        <h3><span class="k">MAP</span>맵 · 장애물</h3>
+        <ul>
+          <li>2000×2000 격자, 섹터 <b>100×100</b> (각 20×20)</li>
+          <li>장애물 <code>obstacles.txt</code> 로드 + 절차적 배치</li>
+          <li>충돌 검사 <code>IsBlocked(x,y)</code> — 비트맵 <span class="num">O(1)</span></li>
+          <li>지역 구분: 중앙 시작 마을 + 4방향 사냥터</li>
+        </ul>
+      </div>
+      <div class="card">
+        <h3><span class="k">MOVE</span>이동 · 시야</h3>
+        <ul>
+          <li>이동 속도 <b>0.5초 / 칸</b> (플레이어·NPC 공통), 서버에서 검증</li>
+          <li>시야 <b>15×15</b> — 주변 <b>9섹터</b>만 검사</li>
+          <li>view_list <b>diff</b>: entered / left / stayed 분리</li>
+          <li>변화분만 전송: <code>ADD / REMOVE / MOVE_OBJECT</code></li>
+        </ul>
+      </div>
+    </div>
+    <div class="foot"><span>Aetheria Online — 텀프로젝트</span><span>05</span></div>
+    <div class="progress" style="width:35%"></div>
+  </section>
+
+  <!-- 6. NPC·AI·길찾기 -->
+  <section class="slide" data-sec="base">
+    <span class="stag"><span class="dot"></span>기본 구현</span>
+    <h1 class="title">NPC · AI · <span class="ac">길찾기(A*)</span></h1>
+    <div class="rule"></div>
+    <div class="grid g2">
+      <div class="card">
+        <h3><span class="k">NPC</span>몬스터 · 타입</h3>
+        <ul>
+          <li>NPC <b>200,000</b> 마리 — raw 배열 <code>unique_ptr&lt;NPC[]&gt;</code></li>
+          <li><b>Peace</b>: 피격 전 정지 / <b>Agro</b>: 11×11 감지 시 추적</li>
+          <li>이동: 고정 / 로밍(원위치 20×20 내)</li>
+          <li>사망 후 <b>30초</b> 뒤 부활</li>
+        </ul>
+      </div>
+      <div class="card">
+        <h3><span class="k">AI</span>길찾기 · Lazy AI</h3>
+        <ul>
+          <li><b>A*</b> 길찾기로 장애물 회피 — 틱당 1스텝, 확장 <b>256</b> 제한</li>
+          <li><b>Lazy AI</b>: 플레이어 시야 안 NPC만 활성화(CAS)</li>
+          <li>200K 전체가 아닌 실제 보이는 NPC만 연산</li>
+          <li>NPC 틱 주기 500ms</li>
+        </ul>
+      </div>
+    </div>
+    <div class="foot"><span>Aetheria Online — 텀프로젝트</span><span>06</span></div>
+    <div class="progress" style="width:42%"></div>
+  </section>
+
+  <!-- 7. 전투·캐릭터·채팅 -->
+  <section class="slide" data-sec="base">
+    <span class="stag"><span class="dot"></span>기본 구현</span>
+    <h1 class="title">전투 · 캐릭터 · <span class="ac">채팅</span></h1>
+    <div class="rule"></div>
+    <div class="grid g2">
+      <div class="card">
+        <h3><span class="k">BATTLE</span>전투</h3>
+        <ul>
+          <li><code>A</code>키 → 주위 <b>4방향 동시 공격</b>, 1초 1회</li>
+          <li>데미지: 플레이어 = <span class="num">레벨×10 + 무기</span>, NPC = 레벨×2</li>
+          <li>경험치 = <span class="num">레벨²×2</span> (Agro·로밍 ×2, 보스 ×20)</li>
+          <li>전투 메시지 · 채팅: <code>S2C_DAMAGE</code> / <code>S2C_CHAT</code></li>
+        </ul>
+      </div>
+      <div class="card">
+        <h3><span class="k">CHAR</span>캐릭터 · 사망</h3>
+        <ul>
+          <li>요구 EXP = <b>100 × 레벨²</b>, 레벨업 시 maxHP +20</li>
+          <li>HP 5초마다 maxHP의 <b>10% 회복</b></li>
+          <li>사망: EXP <b>50% 감소</b> + HP 회복 후 시작 마을 부활</li>
+          <li>로그인 시 ID로 선택, 미존재 ID는 신규 생성</li>
+        </ul>
+      </div>
+    </div>
+    <div class="foot"><span>Aetheria Online — 텀프로젝트</span><span>07</span></div>
+    <div class="progress" style="width:49%"></div>
+  </section>
+
+  <!-- 8. DB·스크립트 -->
+  <section class="slide" data-sec="base">
+    <span class="stag"><span class="dot"></span>기본 구현</span>
+    <h1 class="title">DB 연동 · <span class="ac">Lua 스크립트</span></h1>
+    <div class="rule"></div>
+    <div class="grid g2">
+      <div class="card">
+        <h3><span class="k">DB</span>데이터베이스</h3>
+        <ul>
+          <li><code>IDbBackend</code> 추상화 → MySQL(ODBC) / JSON 폴백</li>
+          <li>정규화 <b>3테이블</b>: players · player_inventory · player_quests (FK CASCADE)</li>
+          <li>비동기: DbWorker Job Queue → <code>IO_DB_DONE</code></li>
+          <li>로그인 시 Load · 30초 자동 저장 + 로그아웃 저장</li>
+        </ul>
+      </div>
+      <div class="card">
+        <h3><span class="k">SCRIPT</span>스크립트</h3>
+        <ul>
+          <li>Lua 5.5 <b>C API 직접 바인딩</b></li>
+          <li><code>npc_spawn.txt</code> — NPC 200K 배치 정보</li>
+          <li><code>npc_ai.lua</code> — NPC/보스 AI 로직</li>
+          <li><code>obstacles.txt</code> · <code>items.txt</code> · <code>quests.txt</code> 데이터 분리</li>
+        </ul>
+      </div>
+    </div>
+    <div class="foot"><span>Aetheria Online — 텀프로젝트</span><span>08</span></div>
+    <div class="progress" style="width:56%"></div>
+  </section>
+
+  <!-- 9. 구분: 추가 구현 -->
+  <section class="slide divider" data-sec="add">
+    <div class="lead">PART 2</div>
+    <div class="big">추가 구현</div>
+    <div class="desc">게임성 요소 — <b>스킬 · 파티 · 아이템 · 퀘스트 · 보스 AI</b></div>
+    <div class="score">평가 항목 : 게임성 / 추가 요소 40%</div>
+    <div class="foot"><span>Aetheria Online — 텀프로젝트</span><span>09</span></div>
+    <div class="progress" style="width:63%"></div>
+  </section>
+
+  <!-- 10. 스킬·파티 -->
+  <section class="slide" data-sec="add">
+    <span class="stag"><span class="dot"></span>추가 구현</span>
+    <h1 class="title">스킬 · <span class="ac">파티</span></h1>
+    <div class="rule"></div>
+    <div class="grid g2">
+      <div class="card">
+        <h3><span class="k">SKILL</span>스킬 (MP + 쿨다운)</h3>
+        <ul>
+          <li><b>AoE</b> 5×5 광역, 데미지 레벨×15 · MP 5 · CD 3초</li>
+          <li><b>Line</b> 방향성 공격</li>
+          <li><b>Heal</b> maxHP 30% 회복 · MP 10 · CD 10초</li>
+          <li>MP 100, 1초마다 +30 회복 · <code>S2C_SKILL_EFFECT</code> 연출</li>
+        </ul>
+      </div>
+      <div class="card">
+        <h3><span class="k">PARTY</span>파티</h3>
+        <ul>
+          <li>초대 / 수락 / 거절 / 탈퇴 — 최대 <b>4인</b></li>
+          <li>경험치 <b>공유</b> (GiveExpToKillerAndParty)</li>
+          <li>파티원 HP 상태 표시 (<code>S2C_STATUS_CHANGE</code>)</li>
+          <li>접속 종료 시 파티 정리</li>
+        </ul>
+      </div>
+    </div>
+    <div class="foot"><span>Aetheria Online — 텀프로젝트</span><span>10</span></div>
+    <div class="progress" style="width:70%"></div>
+  </section>
+
+  <!-- 11. 아이템·퀘스트 -->
+  <section class="slide" data-sec="add">
+    <span class="stag"><span class="dot"></span>추가 구현</span>
+    <h1 class="title">아이템 · <span class="ac">퀘스트</span></h1>
+    <div class="rule"></div>
+    <div class="grid g2">
+      <div class="card">
+        <h3><span class="k">ITEM</span>아이템 (3종)</h3>
+        <ul>
+          <li>소모: HealthPotion +50 / Great +150</li>
+          <li>무기: Rusty · Iron · Mythril — ATK <b>+5 / +15 / +30</b></li>
+          <li>방어구: Leather · Chain · Plate — MaxHP <b>+30 / +80 / +150</b></li>
+          <li>인벤토리 20칸, 드롭/획득(<code>G</code>), 부위별 장착·교환</li>
+        </ul>
+      </div>
+      <div class="card">
+        <h3><span class="k">QUEST</span>퀘스트 (3단계 연속)</h3>
+        <ul>
+          <li>Slime ×3 → Rat ×5 → Goblin ×5</li>
+          <li>보상: EXP + 아이템 (포션 · RustySword)</li>
+          <li>NPC 대화: Offer / InProgress / ReadyTurnIn</li>
+          <li>처치 시 진행도 갱신 <code>S2C_QUEST_UPDATE</code></li>
+        </ul>
+      </div>
+    </div>
+    <div class="foot"><span>Aetheria Online — 텀프로젝트</span><span>11</span></div>
+    <div class="progress" style="width:77%"></div>
+  </section>
+
+  <!-- 12. 보스 AI -->
+  <section class="slide" data-sec="add">
+    <span class="stag"><span class="dot"></span>추가 구현</span>
+    <h1 class="title">보스 AI <span class="ac">(Lua 스크립트)</span></h1>
+    <div class="rule"></div>
+    <div class="grid g2">
+      <div class="card">
+        <h3><span class="k">BOSS</span>구성</h3>
+        <ul>
+          <li>4개 지역 × 보스 <b>1체</b> (총 4)</li>
+          <li>Lv 50 · HP <b>3,000</b> · 졸개 5체 소환(부활)</li>
+          <li>부활 5분 (300초)</li>
+          <li>전투 중 도발 채팅 <code>S2C_CHAT_MESSAGE</code></li>
+        </ul>
+      </div>
+      <div class="card">
+        <h3><span class="k">PATTERN</span>2페이즈 패턴</h3>
+        <ul>
+          <li>HP <b>50%</b> 도달 시 → 이동 가속 + 공격 버프</li>
+          <li>광역 공격(AoE) 5×5, <b>3초 예고</b> 후 발동</li>
+          <li>패턴 전부 <code>npc_ai.lua</code> <b>OnBossTick</b>에 정의</li>
+          <li>C++는 판정·전송, 행동 결정은 스크립트가 담당</li>
+        </ul>
+      </div>
+    </div>
+    <div class="foot"><span>Aetheria Online — 텀프로젝트</span><span>12</span></div>
+    <div class="progress" style="width:84%"></div>
+  </section>
+
+  <!-- 13. 성능 최적화 -->
+  <section class="slide" data-sec="base">
+    <span class="stag"><span class="dot"></span>PERFORMANCE</span>
+    <h1 class="title">성능 최적화 · <span class="ac">측정</span></h1>
+    <div class="rule"></div>
+    <div class="grid g2" style="grid-template-columns:1.25fr 1fr">
+      <div class="card">
+        <h3>적용 기법</h3>
+        <div class="opt">
+          <span>섹터 AOI (9섹터)</span>
+          <span>Lazy AI (활성만)</span>
+          <span>워커별 Lua VM</span>
+          <span>8-shard Min-Heap 타이머</span>
+          <span>Object Pool (free-list)</span>
+          <span>NPC raw 배열</span>
+          <span>TBB concurrent_hash_map</span>
+          <span>TCP_NODELAY</span>
+          <span>Send 코얼레싱 8KB→1회</span>
+        </div>
+      </div>
+      <div style="display:flex;flex-direction:column;gap:16px">
+        <div class="headline" style="background:linear-gradient(135deg,#0f766e,#0f9d58)">
+          <div class="lab">측정 (localhost)</div>
+          <div class="val">3,462 <small>CCU @ 0~1ms</small></div>
+          <div class="note">랙 없음 · NPC 200K 동작 중</div>
+        </div>
+        <div class="card" style="border-left-color:#9aa6bb">
+          <ul>
+            <li><b>남은 과제</b>: 분리 머신 5,000 CCU 측정</li>
+            <li>방향: NPC 샤딩 · Read-Write Lock (Phase 2B/2C)</li>
+          </ul>
+        </div>
+      </div>
+    </div>
+    <div class="foot"><span>Aetheria Online — 텀프로젝트</span><span>13</span></div>
+    <div class="progress" style="width:92%"></div>
+  </section>
+
+  <!-- 14. 정리 & 시연 -->
+  <section class="slide" data-sec="add">
+    <span class="stag"><span class="dot"></span>정리 &amp; 시연</span>
+    <h1 class="title">정리 · <span class="ac">시연 안내</span></h1>
+    <div class="rule"></div>
+    <div class="grid g2">
+      <div class="card" style="border-left-color:var(--blue)">
+        <h3 style="color:var(--ink)">한눈에</h3>
+        <ul>
+          <li style="--c:var(--blue)">필수: 이동·장애물·NPC AI·전투·DB·스크립트·채팅 <b>구현 완료</b></li>
+          <li>추가: 스킬·파티·아이템·퀘스트·2페이즈 보스 AI</li>
+          <li>성능: IOCP + AOI + Lazy AI + Send 코얼레싱 → <b>3,462 CCU @ 0~1ms</b></li>
+        </ul>
+      </div>
+      <div class="card">
+        <h3>시연 항목</h3>
+        <div class="demo">
+          <div><span class="n">1</span>다중 접속 · 이동 · 시야</div>
+          <div><span class="n">2</span>NPC 전투 · 메시지</div>
+          <div><span class="n">3</span>스킬 · 파티</div>
+          <div><span class="n">4</span>퀘스트 진행</div>
+          <div><span class="n">5</span>보스 전투</div>
+          <div style="background:#eef3ff;border-color:#cfe0ff;color:var(--blue-dark)">
+            <span class="n" style="background:var(--blue)">▶</span>시연으로 이어집니다</div>
+        </div>
+      </div>
+    </div>
+    <div class="foot"><span>Aetheria Online — 텀프로젝트</span><span>14</span></div>
+    <div class="progress" style="width:100%"></div>
+  </section>
+
+</div>
+
+<div id="nav">
+  <button id="prev" title="이전 (←)">‹</button>
+  <button id="next" title="다음 (→)">›</button>
+  <button id="fs" title="전체화면 (F)">⤢</button>
+</div>
+<div id="pageno"></div>
+
+<script>
+  const deck = document.getElementById('deck');
+  const slides = Array.from(document.querySelectorAll('.slide'));
+  let i = 0;
+
+  function show(n){
+    i = Math.max(0, Math.min(slides.length-1, n));
+    slides.forEach((s,k)=>s.classList.toggle('active', k===i));
+    document.getElementById('pageno').textContent = (i+1)+' / '+slides.length;
+  }
+  function next(){ show(i+1); }
+  function prev(){ show(i-1); }
+
+  function fit(){
+    const scale = Math.min(window.innerWidth/1280, window.innerHeight/720);
+    deck.style.transform = `translate(-50%,-50%) scale(${scale})`;
+  }
+  window.addEventListener('resize', fit);
+
+  document.addEventListener('keydown', e=>{
+    if(['ArrowRight','ArrowDown',' ','PageDown'].includes(e.key)){ e.preventDefault(); next(); }
+    else if(['ArrowLeft','ArrowUp','PageUp','Backspace'].includes(e.key)){ e.preventDefault(); prev(); }
+    else if(e.key==='Home'){ show(0); }
+    else if(e.key==='End'){ show(slides.length-1); }
+    else if(e.key==='f'||e.key==='F'){ toggleFs(); }
+  });
+
+  document.getElementById('next').onclick = next;
+  document.getElementById('prev').onclick = prev;
+  document.getElementById('fs').onclick = toggleFs;
+  // 슬라이드 영역 클릭으로 다음장 (네비 버튼 제외)
+  deck.addEventListener('click', e=>{ if(!e.target.closest('button')) next(); });
+
+  function toggleFs(){
+    if(!document.fullscreenElement) document.documentElement.requestFullscreen();
+    else document.exitFullscreen();
+  }
+
+  fit(); show(0);
+</script>
+</body>
+</html>

@@ -31,7 +31,7 @@
 #include "Core/Quest.h"
 #include "Core/Db/DbTypes.h"
 #include "Core/Db/JsonFileBackend.h"
-#include "Core/Db/MySqlOdbcBackend.h"
+#include "Core/Db/SqlServerOdbcBackend.h"
 #include "Core/Db/DbWorker.h"
 
 #pragma comment(lib, "ws2_32.lib")
@@ -226,6 +226,19 @@ struct Player : public Entity {
     shared_ptr<string> name;
     bool is_active;
 
+    // 위치(x/y) + 섹터 갱신의 임계영역 보호. 플레이어 좌표는 본인 패킷 스레드(HandleMove)와
+    // NPC 틱 스레드(PlayerOnDeath의 리스폰 텔레포트)가 동시에 바꿀 수 있다. 두 경로가 각각
+    // "현재 좌표 읽기 → 섹터 이동 → 좌표 쓰기"를 하는데, 이 락 없이는 서로 끼어들어
+    // 섹터 소속이 깨지거나(유령/미표시), 사망 직후 stale 이동이 좌표를 덮어써 클라(스폰)와
+    // 서버(이전 칸)가 어긋나 이후 모든 이동이 >1칸으로 거부되는 '리스폰 후 멈춤'이 발생한다.
+    // move_lock은 항상 sector/view 락보다 먼저(최외곽) 잡아 데드락을 피한다.
+    std::mutex move_lock;
+
+    // 완전 입장(OnPlayerSpawn 종료) 여부. name은 HandleLogin에서 DB Load 큐잉 '전'에 세팅되므로
+    // name만으로 게이팅하면 (로그인~스폰) 사이 윈도우에 들어온 이동/공격이 좌표 미설정(-1,-1)
+    // 세션을 건드려 섹터가 깨질 수 있다. 스폰 완료 후에만 게임플레이 패킷을 처리한다.
+    std::atomic<bool> spawned{ false };
+
     // 전투/스탯 — Stage 5
     atomic<int> hp;
     atomic<int> max_hp;
@@ -258,7 +271,7 @@ struct Player : public Entity {
     Player() : Entity(), socket(INVALID_SOCKET), recv_overlapped(IO_RECV), is_active(false),
                hp(100), max_hp(100), mp(MP_MAX), max_mp(MP_MAX), exp(0), level(1), last_attack_ms(0),
                last_skill1_ms(0), last_skill2_ms(0), last_skill3_ms(0) {
-        name = make_shared<string>("Guest");
+        name = make_shared<string>("");
     }
 
     ~Player() override {
@@ -325,7 +338,15 @@ struct Party {
 };
 
 unordered_map<int, shared_ptr<Party>> g_parties;
-unordered_map<int, int> g_pending_invites;  // invitee_id → inviter_id
+// 펜딩 초대. PartyInviteExpire 타이머는 invitee_id만 키로 전달하므로, 같은 invitee가
+// 이전 초대 해소(거절/수락/탈퇴) 후 30초 내 재초대되면 묵은 타이머가 새 초대를 잘못
+// 취소할 수 있다. expire_at_ms를 들고, 만료 핸들러가 "지금이 만료시각 이전이면 더 새
+// 초대가 덮어쓴 것"으로 보고 무시해 묵은 타이머로부터 새 초대를 보호한다.
+struct PendingInvite {
+    int inviter_id;
+    long long expire_at_ms;  // steady_clock 기준 만료 시각
+};
+unordered_map<int, PendingInvite> g_pending_invites;  // invitee_id → PendingInvite
 mutex g_party_mutex;
 atomic<int> g_next_party_id{ 1 };
 
@@ -453,8 +474,10 @@ void SendAddObject(shared_ptr<Player> to_session, shared_ptr<Player> obj_session
     pkt.y = obj_session->y;
     pkt.visual_id = 0;
     strcpy_s(pkt.obj_name, (*atomic_load(&obj_session->name)).c_str());
-    // 나머지 상태값 초기화
-    pkt.hp = 100; pkt.max_hp = 100; pkt.level = 1; pkt.exp = 0;
+    pkt.hp     = obj_session->hp.load();
+    pkt.max_hp = obj_session->max_hp.load();
+    pkt.level  = obj_session->level.load();
+    pkt.exp    = obj_session->exp.load();
     
     to_session->do_send(pkt.size, &pkt);
 }
@@ -498,6 +521,7 @@ void NpcOnMove(int npc_id);
 void NpcOnRespawn(int npc_id);
 void PlayerOnDeath(std::shared_ptr<Player> session);
 void PlayerOnHpRegen(int client_id);
+void BroadcastHpToParty(const std::shared_ptr<Player>& session);
 void PlayerOnMpRegen(int client_id);
 void OnPlayerSpawn(int client_id, const PlayerSnapshot& snap, bool exists);
 void OnDbResponse(DbResponse& resp);
@@ -509,6 +533,7 @@ void PlayerLeaveParty(std::shared_ptr<Player> session);
 void SendSystemMessage(std::shared_ptr<Player> session, const std::string& msg);
 void SpawnNpcLoot(NpcType type, NpcMoveMode mode, int level, short x, short y);
 void OnGroundItemExpire(int drop_id);
+void OnPartyInviteExpire(int invitee_id);
 void SendInventory(const std::shared_ptr<Player>& session);
 void SendQuestUpdate(const std::shared_ptr<Player>& session, int quest_id, int kill_count, int target_count, unsigned char state);
 void SendAllQuestUpdates(const std::shared_ptr<Player>& session);
@@ -753,7 +778,10 @@ void NpcOnMove(int npc_id) {
 
                             // 사망 체크 — Lazy AI 안 비활성화 사이클을 깨지 않도록 타이머 재스케줄 후 호출
                             if (new_hp_val == 0) {
-                                PlayerOnDeath(target_player);
+                                PlayerOnDeath(target_player);  // 부활 후 풀HP를 파티원에 브로드캐스트
+                            } else {
+                                // S2C_DAMAGE는 시야 기반이라 시야 밖 파티원 HP바가 안 줄어든다 → 직접 동기화
+                                BroadcastHpToParty(target_player);
                             }
                         }
                     }
@@ -863,7 +891,9 @@ void NpcOnMove(int npc_id) {
         for (int pid : npc.view_list) {
             if (new_view.count(pid) == 0) left.push_back(pid);
         }
-        npc.view_list = new_view;
+        // 덮어쓰기 대신 증분 적용: SyncPlayerNpcView가 락 밖에서 삽입한 항목을 보존
+        for (int pid : left)    npc.view_list.erase(pid);
+        for (int pid : entered) npc.view_list.insert(pid);
     }
 
     // entered: player view에 NPC 추가 + Add 전송
@@ -906,25 +936,38 @@ void NpcOnMove(int npc_id) {
 
     // ==== 보스 전용 처리: 채팅 + AoE ====
     if (npc.type == NpcType::Boss) {
-        // 보스 채팅 (chat_id > 0이면 시야 내 모든 플레이어에게 S2C_CHAT_MESSAGE)
+        // 보스 채팅: 시야 내 플레이어뿐 아니라 주변 3섹터 범위(약 60타일)까지 브로드캐스트
         if (result.chat_id > 0) {
             const char* boss_msgs[] = {
-                "",
                 "You dare enter my domain?!",
                 "I will crush you!",
                 "None shall pass!",
                 "ROARRR!!"
             };
-            int mid = result.chat_id;
-            if (mid >= 1 && mid <= 4) {
-                const char* msg = boss_msgs[mid];
+            int mid = result.chat_id - 1;  // Lua는 1~4 반환, 배열은 0~3
+            if (mid >= 0 && mid <= 3) {
                 S2C_ChatMessage cpkt;
                 cpkt.size = static_cast<unsigned char>(sizeof(cpkt));
                 cpkt.type = S2C_CHAT_MESSAGE;
                 cpkt.object_id = npc_id;
-                strncpy_s(cpkt.message, msg, _TRUNCATE);
-                for (auto& [pid, psess] : id_to_session) {
-                    psess->do_send(cpkt.size, &cpkt);
+                strncpy_s(cpkt.message, boss_msgs[mid], _TRUNCATE);
+                // 3섹터 반경(60타일) 내 플레이어에게 전송 — 보스 위협 연출
+                int bsx = new_x / SECTOR_SIZE, bsy = new_y / SECTOR_SIZE;
+                for (int ddy = -3; ddy <= 3; ++ddy) {
+                    for (int ddx = -3; ddx <= 3; ++ddx) {
+                        int nx = bsx + ddx, ny = bsy + ddy;
+                        if (nx < 0 || nx >= NUM_SECTORS_X || ny < 0 || ny >= NUM_SECTORS_Y) continue;
+                        vector<int> pids_in_sector;
+                        {
+                            lock_guard<mutex> lk(g_sectors[ny][nx].m_lock);
+                            pids_in_sector.assign(g_sectors[ny][nx].players.begin(),
+                                                  g_sectors[ny][nx].players.end());
+                        }
+                        for (int pid : pids_in_sector) {
+                            ClientMap::const_accessor a;
+                            if (g_clients.find(a, pid)) a->second->do_send(cpkt.size, &cpkt);
+                        }
+                    }
                 }
             }
         }
@@ -966,7 +1009,10 @@ void NpcOnMove(int npc_id) {
 
                     // 플레이어 사망 처리
                     if (new_hp_v == 0) {
-                        PlayerOnDeath(psess);
+                        PlayerOnDeath(psess);  // 부활 후 풀HP를 파티원에 브로드캐스트
+                    } else {
+                        // S2C_DAMAGE는 시야 기반이라 시야 밖 파티원 HP바가 안 줄어든다 → 직접 동기화
+                        BroadcastHpToParty(psess);
                     }
                 }
             }
@@ -1101,10 +1147,23 @@ void PlayerOnDeath(std::shared_ptr<Player> session) {
         }
         SendRemoveObject(a->second, client_id);
     }
-    // 자기 view_list: 다른 플레이어 + NPC 모두 비움. 새 위치에서 다시 구축됨.
+    // 자기 view_list: NPC들의 view_list에서 먼저 제거한 뒤 전체 비움.
+    // 제거하지 않으면 NPC가 리스폰 위치의 플레이어에게 계속 Move/Attack을 전송해
+    // 클라이언트 화면에 보이지 않는 NPC의 패킷이 수신된다(유령 NPC).
     {
-        lock_guard<mutex> lk(session->view_lock);
-        session->view_list.clear();
+        vector<int> npc_ids;
+        {
+            lock_guard<mutex> lk(session->view_lock);
+            for (int id : session->view_list)
+                if (IsNpcId(id)) npc_ids.push_back(id);
+            session->view_list.clear();
+        }
+        for (int nid : npc_ids) {
+            int idx = nid - NPC_ID_START;
+            if (idx < 0 || idx >= g_npc_count) continue;
+            lock_guard<mutex> lk(g_npcs[idx].view_lock);
+            g_npcs[idx].view_list.erase(client_id);
+        }
     }
 
     // 4) 사망 페널티: EXP 50% 손실, HP 풀회복
@@ -1113,11 +1172,17 @@ void PlayerOnDeath(std::shared_ptr<Player> session) {
     session->hp.store(session->max_hp.load());
 
     // 5) 시작 위치로 텔레포트 + 섹터 갱신
+    // move_lock으로 HandleMove와 경쟁 차단: 현재 좌표를 락 안에서 재독해 섹터 이동의 출발점으로
+    // 삼아야, 사망 직전 이동으로 death_x/y가 stale해도 올바른 섹터에서 빠져나간다.
     short respawn_x = PLAYER_SPAWN_X;
     short respawn_y = PLAYER_SPAWN_Y;
-    UpdateObjectSector(client_id, death_x, death_y, respawn_x, respawn_y, true);
-    session->x = respawn_x;
-    session->y = respawn_y;
+    {
+        lock_guard<mutex> mlk(session->move_lock);
+        short cur_x = session->x, cur_y = session->y;
+        UpdateObjectSector(client_id, cur_x, cur_y, respawn_x, respawn_y, true);
+        session->x = respawn_x;
+        session->y = respawn_y;
+    }
 
     // 6) 새 위치 9섹터에서 신규 viewer 후보 수집 → IsInView 필터 → 양방향 등록 + Add 패킷
     int sx = respawn_x / SECTOR_SIZE;
@@ -1167,7 +1232,10 @@ void PlayerOnDeath(std::shared_ptr<Player> session) {
         other->do_send(rpkt.size, &rpkt);
     }
 
-    // 8) 자기 자신에게 스탯 변경 통보 (HUD 갱신)
+    // 8) 자기 자신 + 파티원에게 스탯 변경 통보 (본인 HUD / 파티원 HP바 갱신)
+    //    S2C_DEATH/RESPAWN은 둘 다 시야 기반이라 시야 밖 파티원은 사망·부활을 못 받는다.
+    //    부활로 풀회복된 HP를 시야 밖 파티원 HP바에도 반영하려면 S2C_StatusChange를
+    //    파티 전체에 보내야 한다(SendStatusChange와 동일 패턴). 누락 시 HP바가 사망 직전 값에 멈춤.
     S2C_StatusChange sc;
     sc.size = sizeof(sc);
     sc.type = S2C_STATUS_CHANGE;
@@ -1177,6 +1245,7 @@ void PlayerOnDeath(std::shared_ptr<Player> session) {
     sc.exp = session->exp.load();
     sc.level = session->level.load();
     session->do_send(sc.size, &sc);
+    BroadcastHpToParty(session);  // 시야 밖 파티원 HP바를 부활 후 풀HP로 갱신
 
     // 9) NPC 시야 동기화 (새 위치 주변)
     SyncPlayerNpcView(session);
@@ -1221,6 +1290,9 @@ void PlayerOnHpRegen(int client_id) {
         sc.exp = session->exp.load();
         sc.level = session->level.load();
         session->do_send(sc.size, &sc);
+
+        // 시야 밖 파티원의 HP바도 회복분만큼 따라오도록 동기화
+        BroadcastHpToParty(session);
     }
 
     // 다음 회복 tick 재스케줄
@@ -1260,20 +1332,32 @@ PlayerSnapshot SnapshotPlayer(const std::shared_ptr<Player>& session) {
     PlayerSnapshot snap;
     auto name_ptr = atomic_load(&session->name);
     snap.username = name_ptr ? *name_ptr : std::string{};
-    snap.hp      = session->hp.load();
-    // Stage 8: 방어구 보너스를 제외한 base max_hp 저장 (재장착 시 중복 합산 방지)
-    int armor_id = session->equipped_armor_id.load();
-    const ItemDef* adef = (armor_id >= 0) ? GetItemDef(armor_id) : nullptr;
-    int armor_bonus = adef ? adef->value : 0;
-    snap.max_hp  = session->max_hp.load() - armor_bonus;
-    if (snap.max_hp < 1) snap.max_hp = 1;
-    snap.exp     = session->exp.load();
-    snap.level   = session->level.load();
-    snap.x       = session->x;
-    snap.y       = session->y;
-    snap.equipped_weapon_id = session->equipped_weapon_id.load();
-    snap.equipped_armor_id  = armor_id;
-    { lock_guard<mutex> lk(session->inv_lock); snap.inventory = session->inventory; }
+    snap.hp        = session->hp.load();
+    snap.exp       = session->exp.load();
+    snap.level     = session->level.load();
+    // 좌표는 move_lock 하에서 읽어 HandleMove/PlayerOnDeath의 락 구간 좌표 쓰기와의
+    // 데이터 레이스(new-x + old-y로 찢어진 좌표 저장)를 막는다. move_lock은 최외곽 락이므로
+    // inv_lock/quest_lock보다 먼저, 좁은 스코프에서 잡았다 푼다(락 순서 보존).
+    {
+        lock_guard<mutex> mlk(session->move_lock);
+        snap.x = session->x;
+        snap.y = session->y;
+    }
+    snap.direction = session->direction.load();
+    // Stage 8: inv_lock 보유 중에 장비+max_hp 일괄 읽기 — 착탈 race 방지
+    // EquipItem/UnequipItem 모두 inv_lock 하에서 equipped_*와 max_hp를 갱신하므로
+    // 동일 락으로 읽으면 armor_bonus와 max_hp가 항상 일관된 상태를 반영한다.
+    {
+        lock_guard<mutex> lk(session->inv_lock);
+        int armor_id = session->equipped_armor_id.load();
+        const ItemDef* adef = (armor_id >= 0) ? GetItemDef(armor_id) : nullptr;
+        int armor_bonus = adef ? adef->value : 0;
+        snap.max_hp = session->max_hp.load() - armor_bonus;
+        if (snap.max_hp < 1) snap.max_hp = 1;
+        snap.equipped_weapon_id = session->equipped_weapon_id.load();
+        snap.equipped_armor_id  = armor_id;
+        snap.inventory = session->inventory;
+    }
     // Stage 9: 퀘스트 진행/완료 상태 저장
     {
         lock_guard<mutex> lk(session->quest_lock);
@@ -1313,8 +1397,8 @@ void OnPlayerSpawn(int client_id, const PlayerSnapshot& snap, bool exists) {
         int range_x = VILLAGE_X2 - VILLAGE_X1;
         int range_y = VILLAGE_Y2 - VILLAGE_Y1;
         for (int attempt = 0; attempt < 32; ++attempt) {
-            short tx = static_cast<short>(VILLAGE_X1 + rand() % range_x);
-            short ty = static_cast<short>(VILLAGE_Y1 + rand() % range_y);
+            short tx = static_cast<short>(VILLAGE_X1 + t_npc_rng() % range_x);
+            short ty = static_cast<short>(VILLAGE_Y1 + t_npc_rng() % range_y);
             if (!Map::IsBlocked(tx, ty)) { sx_pos = tx; sy_pos = ty; break; }
         }
     }
@@ -1326,8 +1410,16 @@ void OnPlayerSpawn(int client_id, const PlayerSnapshot& snap, bool exists) {
         int armor  = snap.equipped_armor_id;
         const ItemDef* wdef = (weapon >= 0) ? GetItemDef(weapon) : nullptr;
         const ItemDef* adef = (armor  >= 0) ? GetItemDef(armor)  : nullptr;
-        if (!wdef) weapon = -1;
-        if (!adef) armor  = -1;
+        if (!wdef && weapon >= 0) {
+            cout << "[Warn] " << snap.username << " had weapon id=" << weapon
+                 << " which is no longer in catalog — unequipped." << endl;
+            weapon = -1;
+        }
+        if (!adef && armor >= 0) {
+            cout << "[Warn] " << snap.username << " had armor id=" << armor
+                 << " which is no longer in catalog — unequipped." << endl;
+            armor = -1;
+        }
         int armor_bonus = adef ? adef->value : 0;
         int eff_max = base_max + armor_bonus;
 
@@ -1340,6 +1432,7 @@ void OnPlayerSpawn(int client_id, const PlayerSnapshot& snap, bool exists) {
         session->equipped_weapon_id.store(weapon);
         session->equipped_armor_id.store(armor);
         session->atk_bonus.store(wdef ? wdef->value : 0);
+        session->direction.store(snap.direction);
         { lock_guard<mutex> lk(session->inv_lock); session->inventory = snap.inventory; }
         // Stage 9: 퀘스트 진행/완료 상태 복원 (def가 없는 퀘스트는 스킵)
         {
@@ -1425,6 +1518,11 @@ void OnPlayerSpawn(int client_id, const PlayerSnapshot& snap, bool exists) {
     }
 
     SyncPlayerNpcView(session);
+
+    // 위치/섹터/시야가 모두 확립된 뒤에만 게임플레이 패킷을 허용한다.
+    // atomic store(release) → 이후 spawned=true를 본 스레드는 위의 모든 초기화도 관측한다.
+    session->spawned.store(true);
+
     g_timer_manager.Schedule(client_id, TimerEventKind::HpRegen, HP_REGEN_INTERVAL_MS);
     g_timer_manager.Schedule(client_id, TimerEventKind::MpRegen, MP_REGEN_INTERVAL_MS);
 
@@ -1443,8 +1541,19 @@ void OnDbResponse(DbResponse& resp) {
     case DbReqKind::Load:
         if (!resp.ok) {
             cerr << "[Db] Load failed for client " << resp.client_id << endl;
-            // 실패해도 신규 캐릭으로 spawn 처리 — 게임은 계속
-            OnPlayerSpawn(resp.client_id, resp.data, false);
+            // DB 오류 시 클라이언트에 실패 응답 전송 후 연결 종료 (데이터 없이 입장 방지)
+            {
+                ClientMap::const_accessor a;
+                if (g_clients.find(a, resp.client_id)) {
+                    S2C_LoginResult fail;
+                    fail.size = sizeof(fail);
+                    fail.type = S2C_LOGIN_RESULT;
+                    fail.success = false;
+                    strcpy_s(fail.message, "Server error. Please reconnect.");
+                    a->second->do_send(fail.size, &fail);
+                    closesocket(a->second->socket);
+                }
+            }
             break;
         }
         OnPlayerSpawn(resp.client_id, resp.data, resp.exists);
@@ -1474,6 +1583,9 @@ void PlayerOnAutoSave() {
         if (!p) continue;  // 스냅샷 직후 접속종료된 경우
         auto name_ptr = atomic_load(&p->name);
         if (!name_ptr || name_ptr->empty()) continue;
+        // 스폰 완료 전(로그인~OnPlayerSpawn 사이)에는 세션이 기본 스탯이므로 저장하면
+        // 실제 DB 데이터를 덮어쓴다 — disconnect 저장과 동일하게 spawned로 게이팅.
+        if (!p->spawned.load()) continue;
         g_db_worker.EnqueueSave(p->id, SnapshotPlayer(p));
     }
     // 다음 자동 저장 tick 재스케줄 (entity_id=0은 dummy)
@@ -1702,6 +1814,36 @@ void SendInventory(const std::shared_ptr<Player>& session) {
     session->do_send(pkt.size, &pkt);
 }
 
+// 현재 HP/스탯을 "시야와 무관하게" 온라인 파티원에게만 S2C_StatusChange로 전송 (본인 제외).
+// S2C_DAMAGE/DEATH/RESPAWN은 모두 시야 기반이라 시야 밖 파티원의 HP바가 갱신되지 않는다.
+// 따라서 플레이어 HP가 변하는 모든 지점(피격/회복/부활)에서 호출해 파티 HP바를 동기화한다.
+// 본인은 이미 S2C_DAMAGE 등으로 자기 HP를 받으므로 여기서 self 전송은 생략한다.
+void BroadcastHpToParty(const std::shared_ptr<Player>& session) {
+    int party_id_val = session->party_id.load();
+    if (party_id_val < 0) return;
+    vector<int> members;
+    {
+        lock_guard<mutex> lk(g_party_mutex);
+        auto it = g_parties.find(party_id_val);
+        if (it != g_parties.end()) members = it->second->members;
+    }
+    if (members.empty()) return;
+
+    S2C_StatusChange sc;
+    sc.size = sizeof(sc);
+    sc.type = S2C_STATUS_CHANGE;
+    sc.object_id = session->id;
+    sc.hp = session->hp.load();
+    sc.max_hp = session->max_hp.load();
+    sc.exp = session->exp.load();
+    sc.level = session->level.load();
+    for (int mid : members) {
+        if (mid == session->id) continue;
+        ClientMap::const_accessor a;
+        if (g_clients.find(a, mid)) a->second->do_send(sc.size, &sc);
+    }
+}
+
 // 현재 스탯(hp/max_hp/exp/level)을 본인 + 파티원에게 S2C_StatusChange로 전송 (장착/회복 시 HUD 갱신).
 void SendStatusChange(const std::shared_ptr<Player>& session) {
     S2C_StatusChange sc;
@@ -1740,10 +1882,17 @@ void LevelUpPlayer(shared_ptr<Player> session, unsigned long long exp_gain) {
         unsigned long long cur_exp = session->exp.load();
         if (cur_exp < need) break;
         if (session->exp.compare_exchange_weak(cur_exp, cur_exp - need)) {
-            session->level.fetch_add(1);
-            int new_max = session->max_hp.fetch_add(20) + 20;
-            session->hp.store(new_max);
-            leveled_up = true;
+            // level도 CAS로 증가 — 파티 EXP 동시 처리 시 두 워커가 같은 cur_lv를 읽고
+            // 각자 EXP를 소비한 뒤 level.fetch_add를 두 번 호출하는 race 방지.
+            // CAS 실패 = 다른 스레드가 이미 이 레벨에서 레벨업 완료 → EXP 복원 후 재계산.
+            unsigned char expected_lv = cur_lv;
+            if (session->level.compare_exchange_strong(expected_lv, static_cast<unsigned char>(cur_lv + 1))) {
+                int new_max = session->max_hp.fetch_add(20) + 20;
+                session->hp.store(new_max);
+                leveled_up = true;
+            } else {
+                session->exp.fetch_add(need);  // 소비 취소 후 다음 루프에서 새 레벨 기준으로 재계산
+            }
         }
     }
 
@@ -1767,9 +1916,16 @@ void LevelUpPlayer(shared_ptr<Player> session, unsigned long long exp_gain) {
     sc.max_hp = session->max_hp.load();
     sc.exp = session->exp.load();
     sc.level = session->level.load();
-    session->do_send(sc.size, &sc);
 
-    // 파티원에게도 StatusChange 전송 (파티 HP 바 갱신)
+    // 레벨업이면 시야 내 모든 플레이어에게 브로드캐스트 (레벨·HP 표시 갱신 필요)
+    // 그 외 EXP 획득·HP 변동은 자기 자신에게만 전송
+    if (leveled_up) {
+        BroadcastToViewerPlayers(session, sc, true);
+    } else {
+        session->do_send(sc.size, &sc);
+    }
+
+    // 파티원이 시야 밖에 있을 수 있으므로 파티 HP 바 갱신은 별도 전송
     int party_id_val = session->party_id.load();
     if (party_id_val >= 0) {
         vector<int> members;
@@ -1932,7 +2088,7 @@ void PlayerLeaveParty(shared_ptr<Player> session) {
         lock_guard<mutex> lk(g_party_mutex);
         g_pending_invites.erase(session->id);
         for (auto it = g_pending_invites.begin(); it != g_pending_invites.end(); ) {
-            if (it->second == session->id) it = g_pending_invites.erase(it);
+            if (it->second.inviter_id == session->id) it = g_pending_invites.erase(it);
             else ++it;
         }
     }
@@ -2070,6 +2226,15 @@ int main(int argc, char* argv[]) {
     }
     if (quest_count >= 0) {
         cout << "[Quest] Loaded " << quest_count << " quest defs." << endl;
+        // 퀘스트 보상 아이템이 카탈로그에 존재하는지 부팅 시 검증
+        for (const auto& kv : g_quest_defs) {
+            const QuestDef& qd = kv.second;
+            if (qd.reward_item_id >= 0 && !GetItemDef(qd.reward_item_id)) {
+                cout << "[Warn] Quest id=" << qd.id
+                     << " reward_item_id=" << qd.reward_item_id
+                     << " is not in items catalog — reward will be skipped." << endl;
+            }
+        }
     } else {
         cout << "[Quest] quests.txt not found — quests disabled." << endl;
     }
@@ -2088,10 +2253,14 @@ int main(int argc, char* argv[]) {
         if (spawned >= 0) break;
     }
     if (spawned > 0) {
+        int fixed_hp = 0;
         for (int i = 0; i < spawned; ++i) {
             NPC& n = g_npcs[i];
+            if (n.hp <= 0) { n.hp = 10; n.max_hp = 10; ++fixed_hp; }  // hp=0 NPC 보정
             UpdateObjectSector(n.id, -1, -1, n.x, n.y, false);
         }
+        if (fixed_hp > 0)
+            cout << "[Warn] " << fixed_hp << " NPC(s) had hp<=0 in spawn data — corrected to 10." << endl;
         cout << "[World] " << spawned << " NPCs placed into sectors." << endl;
     }
     else {
@@ -2137,7 +2306,7 @@ int main(int argc, char* argv[]) {
     });
 
     // --- Stage 6.3 + DB연동: DB 워커 시작 ---
-    // 우선순위: data/db.ini의 enabled=1 + MySQL(ODBC) 연결 성공 시 MySQL 백엔드 사용.
+    // 우선순위: data/db.ini의 enabled=1 + SQL Server(ODBC) 연결 성공 시 SQL Server 백엔드 사용.
     // 미설정/연결 실패 시 JSON 파일 백엔드로 자동 폴백 → 무DB 환경에서도 서버 항상 동작.
     // 응답 콜백: PostQueuedCompletionStatus로 IOCP에 IO_DB_DONE 이벤트 post.
     const char* parent_candidates[] = { "data", "../../data", "../../../data" };
@@ -2178,17 +2347,17 @@ int main(int argc, char* argv[]) {
 
     std::unique_ptr<IDbBackend> db_backend;
     if (db_enabled && !db_conn.empty()) {
-        auto mysql = std::make_unique<MySqlOdbcBackend>(db_conn);
-        if (mysql->Connected()) {
-            db_backend = std::move(mysql);
-            cout << "[Db] MySQL(ODBC) connected." << endl;
+        auto mssql = std::make_unique<SqlServerOdbcBackend>(db_conn);
+        if (mssql->Connected()) {
+            db_backend = std::move(mssql);
+            cout << "[Db] SQL Server(ODBC) connected." << endl;
         }
         else {
-            cout << "[Db] MySQL connect failed -> JSON fallback (root: " << db_root << ")" << endl;
+            cout << "[Db] SQL Server connect failed -> JSON fallback (root: " << db_root << ")" << endl;
         }
     }
     else {
-        cout << "[Db] MySQL disabled in db.ini -> JSON backend (root: " << db_root << ")" << endl;
+        cout << "[Db] SQL Server disabled in db.ini -> JSON backend (root: " << db_root << ")" << endl;
     }
     if (!db_backend) {
         db_backend = std::make_unique<JsonFileBackend>(db_root);
@@ -2209,7 +2378,10 @@ int main(int argc, char* argv[]) {
     g_timer_manager.Schedule(0, TimerEventKind::PlayerAutoSave, PLAYER_AUTO_SAVE_INTERVAL_MS);
 
     vector<thread> worker_threads;
+    // hardware_concurrency()는 코어 수를 못 구하면 0을 반환 → 그대로 쓰면 워커 0개로
+    // 서버가 아무 IO도 처리 못 하고 멈춘다. 최소 2개 보장.
     int num_threads = thread::hardware_concurrency();
+    if (num_threads < 2) num_threads = 2;
     for (int i = 0; i < num_threads; ++i) {
         worker_threads.emplace_back(worker_thread);
     }
@@ -2250,6 +2422,13 @@ void worker_thread() {
                         reinterpret_cast<const char*>(&nodelay), sizeof(nodelay));
                 }
                 int new_id = g_next_id++;
+                // 플레이어 ID는 재사용 없이 단조 증가(IOCP 인플라이트 완료의 오라우팅 방지).
+                // 누적 100만 접속 시 NPC_ID_START에 도달하면 IsNpcId()가 플레이어를 NPC로 오인 →
+                // 조용한 상태 오염. 현실적으로 도달 불가하지만, 도달 시 안전하게 거절(방어).
+                if (new_id >= NPC_ID_START) {
+                    cout << "[Fatal] Player ID space exhausted (reached NPC ID range). Rejecting connection." << endl;
+                    closesocket(c_socket);
+                } else {
                 auto session = make_shared<Player>();
                 session->id = new_id;
                 session->socket = c_socket;
@@ -2274,8 +2453,9 @@ void worker_thread() {
                 session->do_send(res.size, &res);
 
                 session->do_recv();
+                }  // new_id < NPC_ID_START
             }
-            
+
             ov_ex->client_socket = WSASocket(AF_INET, SOCK_STREAM, 0, NULL, 0, WSA_FLAG_OVERLAPPED);
             memset(&ov_ex->overlapped, 0, sizeof(ov_ex->overlapped));
             g_fp_accept_ex(g_listen_socket, ov_ex->client_socket, ov_ex->buffer, 0,
@@ -2308,6 +2488,9 @@ void worker_thread() {
                 break;
             case TimerEventKind::GroundItemExpire:
                 OnGroundItemExpire(entity_id);  // entity_id 자리에 drop_id 전달됨
+                break;
+            case TimerEventKind::PartyInviteExpire:
+                OnPartyInviteExpire(entity_id); // entity_id = invitee client_id
                 break;
             default:
                 break;
@@ -2346,8 +2529,14 @@ void worker_thread() {
                 {
                     auto name_ptr = atomic_load(&disconnected->name);
                     if (name_ptr && !name_ptr->empty()) {
-                        g_db_worker.EnqueueSave(client_id, SnapshotPlayer(disconnected));
-                        // 이름 인덱스에서 이 client_id 항목 제거 (동명이인의 다른 항목은 보존)
+                        // 저장은 스폰 완료(OnPlayerSpawn에서 DB Load 데이터 적재) 이후에만.
+                        // 로그인~스폰 사이(또는 Load 실패로 강제 종료)에는 세션이 기본 스탯
+                        // (hp=100/level=1/exp=0/빈 인벤)이라, 저장하면 실제 저장 데이터를
+                        // 기본값으로 덮어써 진행 상황이 유실된다. spawned로 게이팅.
+                        if (disconnected->spawned.load())
+                            g_db_worker.EnqueueSave(client_id, SnapshotPlayer(disconnected));
+                        // 이름 인덱스 제거는 스폰 여부와 무관 — HandleLogin에서 등록되므로
+                        // 항상 제거해야 누수/재로그인 차단을 막는다 (동명이인의 다른 항목은 보존).
                         lock_guard<mutex> lk(g_name_index_mutex);
                         auto range = g_name_index.equal_range(*name_ptr);
                         for (auto it = range.first; it != range.second; ) {
@@ -2376,6 +2565,8 @@ void worker_thread() {
                         NPC& n = GetNpc(id);
                         lock_guard<mutex> lk(n.view_lock);
                         n.view_list.erase(client_id);
+                        // target_id도 즉시 해제 — 다음 tick까지 유령 타겟 방지
+                        if (n.target_id == client_id) n.target_id = -1;
                         // NPC 비활성화는 다음 tick에서 view_list 비었음을 확인하고 스스로 수행
                     }
                     else {
@@ -2418,15 +2609,23 @@ void worker_thread() {
                         break; // 처리할 데이터가 없음
                     }
 
+                    // 최소 2바이트(size + type) 미만은 비정상 패킷 — 연결 강제 종료
+                    if (packet_size < 2) {
+                        closesocket(session->socket);
+                        break;
+                    }
+
                     // 버퍼에 저장된 데이터가 패킷의 크기 이상이면 온전한 패킷 완성
                     if (session->packet_buffer.GetStoredSize() >= packet_size) {
-                        unsigned char packet_data[256]; // 임시 조립 버퍼 (프로토콜상 최대 255바이트)
+                        // 0으로 초기화: size 필드를 줄여 보낸 조작 패킷이 구조체 뒤쪽(미수신 영역)에서
+                        // 직전 패킷의 잔존 스택 데이터를 읽는 것을 방지(미초기화 읽기 UB 차단).
+                        unsigned char packet_data[256] = { 0 }; // 임시 조립 버퍼 (프로토콜상 최대 255바이트)
                         session->packet_buffer.Read(packet_data, packet_size);
-                        
+
                         process_packet(client_id, packet_data);
                     } else {
                         // 아직 패킷이 덜 옴. 다음 Recv를 기다림
-                        break; 
+                        break;
                     }
                 }
 
@@ -2465,16 +2664,104 @@ void worker_thread() {
 // 각 핸들러는 session/client_id/ptr을 받아 해당 패킷 1종을 처리. 케이스 종료(break)는 return.
 
 static void HandleLogin(const shared_ptr<Player>& session, int client_id, unsigned char* ptr) {
-    // Stage 6.3: LOGIN 비동기화 — DB Load 큐잉. 응답 도착 시 OnPlayerSpawn에서 spawn/view 처리.
+    // 이미 로그인된 세션에서 재처리 방지 (중복 C2S_LOGIN 패킷 또는 DB 요청 중복 방지)
+    {
+        auto existing = atomic_load(&session->name);
+        if (existing && !existing->empty()) return;
+    }
+
     C2S_Login* pkt = reinterpret_cast<C2S_Login*>(ptr);
-    std::string username = pkt->username;
-    atomic_store(&session->name, make_shared<string>(username));
-    // 이름 인덱스 등록 (파티 초대 이름 탐색용). disconnect 시 같은 client_id 항목만 제거.
+    // null 종결 보장: username 배열이 null 없이 꽉 찼을 경우 OOB 방지
+    std::string username(pkt->username, strnlen(pkt->username, MAX_NAME_LEN));
+    if (username.empty()) return;
+
+    // 동명 유저 중복 접속 거부 — JSON 백엔드 파일 충돌 및 파티 인덱스 오염 방지
     {
         lock_guard<mutex> lk(g_name_index_mutex);
+        if (g_name_index.count(username) > 0) {
+            S2C_LoginResult fail;
+            fail.size = sizeof(fail);
+            fail.type = S2C_LOGIN_RESULT;
+            fail.success = false;
+            strcpy_s(fail.message, "Username already in use.");
+            session->do_send(fail.size, &fail);
+            closesocket(session->socket);
+            return;
+        }
+        // Stage 6.3: LOGIN 비동기화 — DB Load 큐잉. 응답 도착 시 OnPlayerSpawn에서 spawn/view 처리.
         g_name_index.emplace(username, client_id);
     }
+
+    atomic_store(&session->name, make_shared<string>(username));
     g_db_worker.EnqueueLoad(client_id, std::move(username));
+}
+
+// 동시 피격(CAS 감소)과 경쟁해도 데미지를 삼키지 않는 HP 회복.
+// 피격/리스폰/재생 경로가 모두 hp를 CAS로 다루므로(line 716/963/1238), 회복도 CAS 루프로
+// 맞춰 lost-update를 막는다. 평범한 load-store 회복은 동시에 들어온 데미지를 덮어써
+// '피격 무효화' 익스플로잇이 된다.
+// 반환: 회복 후 HP(이미 풀피/사망이면 그 시점 값). 실제 회복이 일어났으면 healed=true.
+static int HealPlayerHpAtomic(const std::shared_ptr<Player>& session, int amount, bool& healed) {
+    healed = false;
+    int max_hp = session->max_hp.load();
+    if (amount <= 0) return session->hp.load();
+    int observed = session->hp.load();
+    while (true) {
+        if (observed <= 0 || observed >= max_hp) return observed;  // 사망/풀피 → 회복 없음
+        int next = std::min(max_hp, observed + amount);
+        if (session->hp.compare_exchange_weak(observed, next)) { healed = true; return next; }
+        // CAS 실패: observed가 최신값으로 갱신됨 → 루프 재평가
+    }
+}
+
+// 이동 후 플레이어 주변 3×3(Chebyshev 1) 범위 내 힐링 아이템을 자동 픽업·즉시 사용.
+// 인벤토리를 거치지 않고 HP를 직접 회복한다. HP가 이미 최대면 스킵.
+static void TryAutoPickupHealItem(const shared_ptr<Player>& session, int client_id) {
+    if (session->hp.load() >= session->max_hp.load()) return;
+
+    short px = session->x, py = session->y;
+    int best_drop_id = -1;
+    GroundItem claimed{};
+
+    {
+        lock_guard<mutex> lk(g_ground_mutex);
+        int best_dist = AUTO_HEAL_PICKUP_RANGE + 1;
+        for (auto& kv : g_ground_items) {
+            const ItemDef* def = GetItemDef(kv.second.item_id);
+            if (!def || def->type != ItemType::Consumable) continue;
+            int adx = abs(static_cast<int>(kv.second.x) - static_cast<int>(px));
+            int ady = abs(static_cast<int>(kv.second.y) - static_cast<int>(py));
+            int dist = max(adx, ady);  // Chebyshev distance → 3×3 영역
+            if (dist <= AUTO_HEAL_PICKUP_RANGE && dist < best_dist) {
+                best_dist = dist;
+                best_drop_id = kv.first;
+            }
+        }
+        if (best_drop_id >= 0) {
+            claimed = g_ground_items[best_drop_id];
+            g_ground_items.erase(best_drop_id);
+        }
+    }
+
+    if (best_drop_id < 0) return;
+
+    // 즉시 사용: 인벤토리 경유 없이 HP 직접 회복 (동시 피격과 경쟁해도 데미지 보존 — CAS)
+    const ItemDef* def = GetItemDef(claimed.item_id);
+    if (def) {
+        bool healed;
+        HealPlayerHpAtomic(session, def->value, healed);
+    }
+
+    // 주변 플레이어에게 아이템 제거 통지
+    S2C_ItemRemove rm;
+    rm.size = sizeof(rm);
+    rm.type = S2C_ITEM_REMOVE;
+    rm.drop_id = best_drop_id;
+    BroadcastToSectorPlayers(claimed.x, claimed.y, rm);
+
+    // 본인 HP 갱신 브로드캐스트
+    SendStatusChange(session);
+    SendSystemMessage(session, string("Auto-used ") + (def ? def->name : "potion") + "! HP restored.");
 }
 
 // C2S_MOVE / C2S_TELEPORT 공용. is_teleport면 쿨타임/거리 검증 생략(테스트용).
@@ -2499,10 +2786,7 @@ static void HandleMove(const shared_ptr<Player>& session, int client_id, unsigne
         std::chrono::steady_clock::now().time_since_epoch()).count();
     long long last = session->last_move_ms.load();
 
-    short old_x = session->x;
-    short old_y = session->y;
-
-    // 월드 경계 클램프 (클라가 보낸 좌표 신뢰 X)
+    // 월드 경계 클램프 (클라가 보낸 좌표 신뢰 X) — req만 의존하므로 락 밖에서 선처리
     short new_x = req_x;
     short new_y = req_y;
     if (new_x < 0) new_x = 0;
@@ -2515,44 +2799,46 @@ static void HandleMove(const shared_ptr<Player>& session, int client_id, unsigne
         return;
     }
 
-    // 이동량 검증: Chebyshev distance 기준
-    int dx = std::abs(static_cast<int>(new_x) - static_cast<int>(old_x));
-    int dy = std::abs(static_cast<int>(new_y) - static_cast<int>(old_y));
-    int dist = std::max(dx, dy);
-    if (dist == 0) {
-        // 제자리 이동 패킷은 무시
-        return;
-    }
-    if (!is_teleport) {
-        if (last != 0 && now_ms - last < PLAYER_MOVE_INTERVAL_MS) {
-            // 쿨타임 미충족 — 치트/연사 방지
-            return;
-        }
-        if (dist > 1) {
-            // 한 칸 초과 이동은 치트로 간주
-            return;
-        }
-    }
-    // 텔레포트 직후에도 last_move_ms를 갱신해 곧바로 한 칸 더 이동하는 것을 막음
-    session->last_move_ms.store(now_ms);
+    // === 위치 임계영역: move_lock으로 "현재 좌표 읽기 → 검증 → 섹터 이동 → 좌표 쓰기"를 원자화 ===
+    // PlayerOnDeath(리스폰 텔레포트)가 다른 스레드에서 좌표를 바꾸는 것과 경쟁하지 않도록,
+    // 현재 좌표를 반드시 락 안에서 읽어 그 좌표 기준으로 거리 검증한다. 그러면 사망 직후
+    // stale 이동(사망 전 위치 기준 1칸)이 스폰 좌표를 덮어써 클라/서버가 어긋나는 문제를 막는다.
+    short old_x, old_y;
+    {
+        lock_guard<mutex> mlk(session->move_lock);
+        old_x = session->x;
+        old_y = session->y;
 
-    // 방향 갱신 — 공격 모션의 direction 결정용
-    // dx/dy 중 더 큰 축 우선. 동률이면 dx 우선. 0=Down, 1=Left, 2=Right, 3=Up.
-    int sdx = static_cast<int>(new_x) - static_cast<int>(old_x);
-    int sdy = static_cast<int>(new_y) - static_cast<int>(old_y);
-    if (std::abs(sdx) >= std::abs(sdy)) {
-        if (sdx > 0)      session->direction.store(2); // Right
-        else if (sdx < 0) session->direction.store(1); // Left
-    }
-    else {
-        if (sdy > 0)      session->direction.store(0); // Down
-        else if (sdy < 0) session->direction.store(3); // Up
-    }
+        // 이동량 검증: Chebyshev distance (락 안의 최신 좌표 기준)
+        int dx = std::abs(static_cast<int>(new_x) - static_cast<int>(old_x));
+        int dy = std::abs(static_cast<int>(new_y) - static_cast<int>(old_y));
+        int dist = std::max(dx, dy);
+        if (dist == 0) return;  // 제자리 이동 패킷 무시 (RAII로 move_lock 해제)
+        if (!is_teleport) {
+            if (last != 0 && now_ms - last < PLAYER_MOVE_INTERVAL_MS) return;  // 쿨타임 미충족(치트/연사)
+            if (dist > 1) return;  // 한 칸 초과 이동은 치트 — 사망 후 stale 이동도 여기서 거부됨
+        }
+        // 텔레포트 직후에도 last_move_ms를 갱신해 곧바로 한 칸 더 이동하는 것을 막음
+        session->last_move_ms.store(now_ms);
 
-    // Sector 업데이트
-    UpdateObjectSector(client_id, old_x, old_y, new_x, new_y, true);
-    session->x = new_x;
-    session->y = new_y;
+        // 방향 갱신 — 공격 모션의 direction 결정용
+        // dx/dy 중 더 큰 축 우선. 동률이면 dx 우선. 0=Down, 1=Left, 2=Right, 3=Up.
+        int sdx = static_cast<int>(new_x) - static_cast<int>(old_x);
+        int sdy = static_cast<int>(new_y) - static_cast<int>(old_y);
+        if (std::abs(sdx) >= std::abs(sdy)) {
+            if (sdx > 0)      session->direction.store(2); // Right
+            else if (sdx < 0) session->direction.store(1); // Left
+        }
+        else {
+            if (sdy > 0)      session->direction.store(0); // Down
+            else if (sdy < 0) session->direction.store(3); // Up
+        }
+
+        // Sector 업데이트 + 좌표 확정 (move_lock이 sector 락보다 외곽 — 데드락 없음)
+        UpdateObjectSector(client_id, old_x, old_y, new_x, new_y, true);
+        session->x = new_x;
+        session->y = new_y;
+    }
 
     // 이동 패킷 브로드캐스팅
     S2C_MoveObject move_pkt;
@@ -2657,6 +2943,9 @@ static void HandleMove(const shared_ptr<Player>& session, int client_id, unsigne
 
     // NPC 시야 동기화 (별도 경로 — player diff와 view_list 영역이 분리됨)
     SyncPlayerNpcView(session);
+
+    // 이동 완료 후 주변 3×3 범위 힐링 아이템 자동 픽업·즉시 사용
+    TryAutoPickupHealItem(session, client_id);
 }
 
 static void HandleAttack(const shared_ptr<Player>& session, int client_id, unsigned char* ptr) {
@@ -2734,15 +3023,25 @@ static void HandleUseSkill(const shared_ptr<Player>& session, int client_id, uns
         return; // 알 수 없는 스킬 ID
     }
 
-    // 쿨타임 통과 → MP 차감 후 본인에게 MP 갱신 통지
+    // 쿨타임 통과 → MP CAS 차감 (음수 방지 + 재확인)
+    int new_mp = 0;
     {
-        int observed = session->mp.fetch_sub(mp_cost) - mp_cost;
-        if (observed < 0) { session->mp.store(0); observed = 0; }
+        int cur = session->mp.load();
+        while (true) {
+            if (cur < mp_cost) {
+                SendSystemMessage(session, "Not enough MP.");
+                return;
+            }
+            if (session->mp.compare_exchange_weak(cur, cur - mp_cost)) {
+                new_mp = cur - mp_cost;
+                break;
+            }
+        }
         S2C_MpChange mc;
         mc.size = sizeof(mc);
         mc.type = S2C_MP_CHANGE;
         mc.object_id = client_id;
-        mc.mp = observed;
+        mc.mp = new_mp;
         mc.max_mp = session->max_mp.load();
         session->do_send(mc.size, &mc);
     }
@@ -2813,10 +3112,8 @@ static void HandleUseSkill(const shared_ptr<Player>& session, int client_id, uns
     // --- 스킬 3: Heal — 자신 HP를 max_hp의 30% 회복 ---
     else if (skill_id == 3) {
         int max_hp = session->max_hp.load();
-        int heal = max_hp * SKILL_HEAL_PERCENT / 100;
-        int cur_hp = session->hp.load();
-        int new_hp = min(max_hp, cur_hp + heal);
-        session->hp.store(new_hp);
+        bool healed;
+        int new_hp = HealPlayerHpAtomic(session, max_hp * SKILL_HEAL_PERCENT / 100, healed);
 
         S2C_StatusChange sc; sc.size = sizeof(sc); sc.type = S2C_STATUS_CHANGE;
         sc.object_id = client_id; sc.hp = new_hp; sc.max_hp = max_hp;
@@ -2840,9 +3137,40 @@ static void HandleChat(const shared_ptr<Player>& session, int client_id, unsigne
     BroadcastToViewerPlayers(session, msg, true);
 }
 
+// 파티 초대 30초 타임아웃. 아직 pending이면 취소하고 양쪽에 알림.
+void OnPartyInviteExpire(int invitee_id) {
+    int inviter_id = -1;
+    {
+        lock_guard<mutex> lk(g_party_mutex);
+        auto it = g_pending_invites.find(invitee_id);
+        if (it == g_pending_invites.end()) return;  // 이미 수락/거절됨
+        // 묵은 타이머 보호: 현재 시각이 이 초대의 만료시각 이전이면, 이 자리는 이전 초대가
+        // 해소된 뒤 들어온 더 새 초대다. 이 타이머는 그 이전(이미 해소된) 초대의 것이므로
+        // 무시한다 — 새 초대는 자신의 타이머가 정시에 만료시킨다.
+        auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+        if (now_ms < it->second.expire_at_ms) return;
+        inviter_id = it->second.inviter_id;
+        g_pending_invites.erase(it);
+    }
+    // 초대한 쪽에게 타임아웃 알림
+    if (inviter_id >= 0) {
+        ClientMap::const_accessor a;
+        if (g_clients.find(a, inviter_id))
+            SendSystemMessage(a->second, "Party invite expired (no response).");
+    }
+    // 초대 받은 쪽에게도 알림 (아직 접속 중이면)
+    {
+        ClientMap::const_accessor a;
+        if (g_clients.find(a, invitee_id))
+            SendSystemMessage(a->second, "Party invite has expired.");
+    }
+}
+
 static void HandlePartyInvite(const shared_ptr<Player>& session, int client_id, unsigned char* ptr) {
     C2S_PartyInvite* p = reinterpret_cast<C2S_PartyInvite*>(ptr);
-    string target_name(p->target_name);
+    // null 종결 보장: target_name 배열이 null 없이 꽉 찼을 경우 OOB 읽기 방지 (HandleLogin과 동일 패턴)
+    string target_name(p->target_name, strnlen(p->target_name, MAX_NAME_LEN));
 
     // 내 파티가 꽉 찼으면 거부
     int my_party = session->party_id.load();
@@ -2874,14 +3202,21 @@ static void HandlePartyInvite(const shared_ptr<Player>& session, int client_id, 
         SendSystemMessage(session, target_name + " is already in a party.");
         return;
     }
+    // 예약 타이머의 만료 시각과 동일 기준(steady_clock)으로 expire_at_ms 기록 —
+    // OnPartyInviteExpire가 묵은 타이머를 구분하는 데 사용.
+    auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
     {
         lock_guard<mutex> lk(g_party_mutex);
         if (g_pending_invites.count(target->id)) {
             SendSystemMessage(session, target_name + " already has a pending invite.");
             return;
         }
-        g_pending_invites[target->id] = client_id;
+        g_pending_invites[target->id] = PendingInvite{ client_id, now_ms + PARTY_INVITE_TIMEOUT_MS };
     }
+    // 30초 내 응답 없으면 자동 취소 (entity_id 자리에 invitee client_id 사용)
+    g_timer_manager.Schedule(target->id, TimerEventKind::PartyInviteExpire, PARTY_INVITE_TIMEOUT_MS);
+
     auto my_name = atomic_load(&session->name);
     S2C_PartyInvited inv;
     inv.size = sizeof(inv);
@@ -2894,6 +3229,11 @@ static void HandlePartyInvite(const shared_ptr<Player>& session, int client_id, 
 }
 
 static void HandlePartyAccept(const shared_ptr<Player>& session, int client_id, unsigned char* ptr) {
+    // 이미 파티에 속해 있으면 수락 불가 — 그 사이 다른 초대를 먼저 수락한 경우
+    if (session->party_id.load() >= 0) {
+        SendSystemMessage(session, "You are already in a party.");
+        return;
+    }
     int inviter_id;
     {
         lock_guard<mutex> lk(g_party_mutex);
@@ -2902,7 +3242,7 @@ static void HandlePartyAccept(const shared_ptr<Player>& session, int client_id, 
             SendSystemMessage(session, "No pending party invite.");
             return;
         }
-        inviter_id = it->second;
+        inviter_id = it->second.inviter_id;
         g_pending_invites.erase(it);
     }
     shared_ptr<Player> inviter;
@@ -2968,6 +3308,27 @@ static void HandlePartyAccept(const shared_ptr<Player>& session, int client_id, 
                   mname ? mname->c_str() : "", _TRUNCATE);
         session->do_send(info.size, &info);
     }
+    // 파티 HP 상태 동기화: 신입 → 기존 멤버, 기존 멤버 → 신입
+    {
+        S2C_StatusChange my_sc;
+        my_sc.size = sizeof(my_sc); my_sc.type = S2C_STATUS_CHANGE;
+        my_sc.object_id = client_id;
+        my_sc.hp = session->hp.load(); my_sc.max_hp = session->max_hp.load();
+        my_sc.exp = session->exp.load(); my_sc.level = session->level.load();
+        for (int mid : existing_members) {
+            ClientMap::const_accessor a;
+            if (g_clients.find(a, mid)) {
+                a->second->do_send(my_sc.size, &my_sc);
+                // 기존 멤버의 HP도 신입에게 전송
+                S2C_StatusChange mem_sc;
+                mem_sc.size = sizeof(mem_sc); mem_sc.type = S2C_STATUS_CHANGE;
+                mem_sc.object_id = mid;
+                mem_sc.hp = a->second->hp.load(); mem_sc.max_hp = a->second->max_hp.load();
+                mem_sc.exp = a->second->exp.load(); mem_sc.level = a->second->level.load();
+                session->do_send(mem_sc.size, &mem_sc);
+            }
+        }
+    }
     SendSystemMessage(session, "Joined party!");
 }
 
@@ -2977,7 +3338,7 @@ static void HandlePartyReject(const shared_ptr<Player>& session, int client_id, 
         lock_guard<mutex> lk(g_party_mutex);
         auto it = g_pending_invites.find(client_id);
         if (it == g_pending_invites.end()) return;
-        inviter_id = it->second;
+        inviter_id = it->second.inviter_id;
         g_pending_invites.erase(it);
     }
     auto my_name = atomic_load(&session->name);
@@ -3005,7 +3366,7 @@ static void HandlePickup(const shared_ptr<Player>& session, int client_id, unsig
         for (auto& kv : g_ground_items) {
             int adx = (kv.second.x > px) ? kv.second.x - px : px - kv.second.x;
             int ady = (kv.second.y > py) ? kv.second.y - py : py - kv.second.y;
-            int dist = adx + ady;
+            int dist = (adx > ady) ? adx : ady;  // Chebyshev — TryAutoPickupHealItem과 일치
             if (dist <= ITEM_PICKUP_RANGE && dist < best_dist) { best_dist = dist; drop_id = kv.first; }
         }
         if (drop_id >= 0) { claimed = g_ground_items[drop_id]; g_ground_items.erase(drop_id); }
@@ -3016,9 +3377,26 @@ static void HandlePickup(const shared_ptr<Player>& session, int client_id, unsig
     bool added;
     { lock_guard<mutex> lk(session->inv_lock); added = AddToInventoryLocked(*session, claimed.item_id, claimed.count); }
     if (!added) {
-        // 인벤 가득 → 바닥에 되돌림 (만료 타이머는 그대로 진행)
-        lock_guard<mutex> lk(g_ground_mutex);
-        g_ground_items[drop_id] = claimed;
+        // 인벤 가득 → 새 drop_id로 바닥에 되돌림 + 새 만료 타이머 등록
+        // (원래 drop_id의 타이머는 이미 진행 중이므로 새 ID를 발급해 중복 만료 방지)
+        // 먼저 원래 drop_id의 제거를 브로드캐스트해야 한다 — 안 그러면 클라가 원래
+        // 스프라이트를 계속 그려 새 스프라이트와 한 칸에 겹친 유령 아이템이 남는다
+        // (원래 id는 맵에서 이미 지워져 OnGroundItemExpire가 제거 패킷을 보내지 않음).
+        S2C_ItemRemove oldrm;
+        oldrm.size = sizeof(oldrm); oldrm.type = S2C_ITEM_REMOVE; oldrm.drop_id = drop_id;
+        BroadcastToSectorPlayers(claimed.x, claimed.y, oldrm);
+
+        int new_drop_id = g_next_drop_id.fetch_add(1);
+        {
+            lock_guard<mutex> lk(g_ground_mutex);
+            g_ground_items[new_drop_id] = claimed;
+        }
+        S2C_ItemDrop redrop;
+        redrop.size = sizeof(redrop); redrop.type = S2C_ITEM_DROP;
+        redrop.drop_id = new_drop_id; redrop.item_id = claimed.item_id;
+        redrop.x = claimed.x; redrop.y = claimed.y;
+        BroadcastToSectorPlayers(claimed.x, claimed.y, redrop);
+        g_timer_manager.Schedule(new_drop_id, TimerEventKind::GroundItemExpire, GROUND_ITEM_EXPIRE_MS);
         SendSystemMessage(session, "Inventory full.");
         return;
     }
@@ -3043,13 +3421,17 @@ static void HandleUseItem(const shared_ptr<Player>& session, int client_id, unsi
         if (!def || def->type != ItemType::Consumable) return;
 
         int max_hp = session->max_hp.load();
-        int cur = session->hp.load();
-        if (cur >= max_hp) { full_hp = true; }
+        if (session->hp.load() >= max_hp) { full_hp = true; }
         else {
-            session->hp.store(std::min(max_hp, cur + def->value));
-            if (--session->inventory[slot].second <= 0)
-                session->inventory.erase(session->inventory.begin() + slot);
-            consumed = true;
+            bool healed;
+            HealPlayerHpAtomic(session, def->value, healed);
+            if (healed) {
+                if (--session->inventory[slot].second <= 0)
+                    session->inventory.erase(session->inventory.begin() + slot);
+                consumed = true;
+            } else {
+                full_hp = true;  // 경쟁 중 풀피/사망 → 포션 소비 안 함
+            }
         }
     }
     if (full_hp) { SendSystemMessage(session, "HP already full."); return; }
@@ -3091,6 +3473,7 @@ static void HandleEquipItem(const shared_ptr<Player>& session, int client_id, un
 static void HandleUnequipItem(const shared_ptr<Player>& session, int client_id, unsigned char* ptr) {
     C2S_UnequipItem* p = reinterpret_cast<C2S_UnequipItem*>(ptr);
     int which = p->which;  // 0=weapon, 1=armor
+    if (which > 1) return;  // 유효하지 않은 슬롯 타입 — 조작된 패킷 방어
     bool changed = false;
     {
         lock_guard<mutex> lk(session->inv_lock);
@@ -3197,7 +3580,8 @@ static void HandleQuestInteract(const shared_ptr<Player>& session, int client_id
         if (dlg_quest != -1) { kind = 1; }  // InProgress
         else {
             // 3) offer 가능 (giver=0, 미보유, 선행 완료) — 가장 낮은 id
-            for (const QuestDef& def : g_quest_defs) {
+            for (const auto& kv : g_quest_defs) {
+                const QuestDef& def = kv.second;
                 if (def.giver_npc != 0) continue;
                 if (find_q(def.id)) continue;  // 이미 보유(진행 또는 완료)
                 if (def.prereq_id >= 0) {
@@ -3273,11 +3657,47 @@ static void HandleQuestAction(const shared_ptr<Player>& session, int client_id, 
             if (def->reward_item_id >= 0 && def->reward_item_qty > 0) {
                 bool added;
                 { lock_guard<mutex> lk(session->inv_lock); added = AddToInventoryLocked(*session, def->reward_item_id, def->reward_item_qty); }
-                if (added) SendInventory(session);
-                else SendSystemMessage(session, "Inventory full — reward item not granted.");
+                if (added) {
+                    SendInventory(session);
+                } else {
+                    // 인벤 가득 → 발밑에 드롭 (아이템이 사라지지 않도록)
+                    int rdrop_id = g_next_drop_id.fetch_add(1);
+                    short rx = session->x, ry = session->y;
+                    {
+                        lock_guard<mutex> lk(g_ground_mutex);
+                        g_ground_items[rdrop_id] = GroundItem{ def->reward_item_id, def->reward_item_qty, rx, ry };
+                    }
+                    S2C_ItemDrop dpkt;
+                    dpkt.size = sizeof(dpkt); dpkt.type = S2C_ITEM_DROP;
+                    dpkt.drop_id = rdrop_id; dpkt.item_id = def->reward_item_id;
+                    dpkt.x = rx; dpkt.y = ry;
+                    BroadcastToSectorPlayers(rx, ry, dpkt);
+                    g_timer_manager.Schedule(rdrop_id, TimerEventKind::GroundItemExpire, GROUND_ITEM_EXPIRE_MS);
+                    SendSystemMessage(session, "Inventory full — reward dropped at your feet.");
+                }
             }
             SendQuestUpdate(session, def->id, def->target_count, def->target_count, 1);
             SendSystemMessage(session, "Quest complete! Rewards granted.");
+        }
+    }
+    else if (p->action == 2) {
+        // 퀘스트 포기: 진행 중(state==0)인 퀘스트만 취소 가능
+        bool abandoned = false;
+        {
+            lock_guard<mutex> lk(session->quest_lock);
+            auto& qlist = session->quests;
+            for (auto it = qlist.begin(); it != qlist.end(); ++it) {
+                if (it->quest_id == def->id && it->state == 0) {
+                    qlist.erase(it);
+                    abandoned = true;
+                    break;
+                }
+            }
+        }
+        if (abandoned) {
+            // 클라이언트에 퀘스트 제거 알림 — kill_count=-1로 "removed" 시그널 사용
+            SendQuestUpdate(session, def->id, -1, def->target_count, 0);
+            SendSystemMessage(session, "Quest abandoned.");
         }
     }
 }
@@ -3298,6 +3718,13 @@ void process_packet(int client_id, unsigned char* ptr) {
         ClientMap::const_accessor a;
         if (!g_clients.find(a, client_id)) return;
         session = a->second;
+    }
+
+    // 완전 입장(스폰 완료) 전에는 C2S_LOGIN 외 모든 패킷 무시.
+    // name이 아니라 spawned로 게이팅 — (로그인~OnPlayerSpawn) 사이 좌표 미설정 윈도우에서
+    // 이동/공격이 처리돼 섹터/시야가 깨지는 것을 막는다.
+    if (type != C2S_LOGIN) {
+        if (!session->spawned.load()) return;
     }
 
     switch (type) {

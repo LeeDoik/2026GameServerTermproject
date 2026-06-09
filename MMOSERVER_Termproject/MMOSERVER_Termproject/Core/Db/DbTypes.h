@@ -17,6 +17,7 @@ struct PlayerSnapshot {
     unsigned char level = 1;
     short x = 0;
     short y = 0;
+    unsigned char direction = 0;  // 0=Down 1=Left 2=Right 3=Up
     // Stage 8: 아이템
     std::vector<std::pair<int, int>> inventory;  // (item_id, qty)
     int equipped_weapon_id = -1;

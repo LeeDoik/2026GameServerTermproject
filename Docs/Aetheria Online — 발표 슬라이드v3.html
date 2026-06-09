@@ -1,0 +1,254 @@
+<!DOCTYPE html>
+<!-- saved from url=(0338)file:///C:/%ED%95%9C%EA%B5%AD%EA%B3%B5%ED%95%99%EB%8C%80%ED%95%99%EA%B5%90/4%ED%95%99%EB%85%84%201%ED%95%99%EA%B8%B0/%EA%B2%8C%EC%9E%84%EC%84%9C%EB%B2%84%20%ED%94%84%EB%A1%9C%EA%B7%B8%EB%9E%98%EB%B0%8D/%ED%85%80%ED%94%84%EB%A1%9C%EC%A0%9D%ED%8A%B8/2026GameServerTermproject/Docs/%EB%B0%9C%ED%91%9C%EC%8A%AC%EB%9D%BC%EC%9D%B4%EB%93%9C.html -->
+<html lang="ko"><head><meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Aetheria Online — 발표 슬라이드</title>
+<style>
+  :root{
+    --bg:#0a0e1a; --bg2:#0f1626; --ink:#e8edf7; --muted:#8a97b1;
+    --accent:#22d3ee; --accent2:#a78bfa; --gold:#fbbf24; --green:#34d399;
+    --line:#1e2a44; --card:#121b30;
+  }
+  *{box-sizing:border-box; margin:0; padding:0;}
+  html,body{height:100%; background:#05070d; overflow:hidden;
+    font-family:'Malgun Gothic','맑은 고딕',-apple-system,'Segoe UI',system-ui,sans-serif;
+    color:var(--ink); -webkit-font-smoothing:antialiased;}
+
+  /* 1280x720 고정 무대 → 화면에 맞춰 스케일 */
+  #stageWrap{position:fixed; inset:0; display:flex; align-items:center; justify-content:center;}
+  #stage{width:1280px; height:720px; position:relative; transform-origin:center center;
+    background:radial-gradient(1200px 700px at 70% -10%, #15213c 0%, var(--bg) 55%);
+    overflow:hidden; box-shadow:0 30px 120px rgba(0,0,0,.6);}
+
+  .slide{position:absolute; inset:0; padding:64px 72px; display:none; flex-direction:column;}
+  .slide.active{display:flex; animation:fade .35s ease;}
+  @keyframes fade{from{opacity:0; transform:translateY(8px);} to{opacity:1; transform:none;}}
+
+  .kicker{color:var(--accent); font-weight:700; letter-spacing:.18em; font-size:15px; text-transform:uppercase;}
+  h1{font-size:62px; line-height:1.08; font-weight:800; letter-spacing:-.5px;}
+  h2{font-size:40px; font-weight:800; letter-spacing:-.5px; margin-bottom:8px;}
+  h2 .num{color:var(--gold);}
+  .sub{color:var(--muted); font-size:20px; margin-top:14px;}
+  .accentbar{width:64px; height:6px; border-radius:6px; background:linear-gradient(90deg,var(--accent),var(--accent2)); margin:18px 0 26px;}
+
+  /* 슬라이드1 타이틀 */
+  .hero{justify-content:center;}
+  .badges{display:flex; gap:18px; margin-top:40px;}
+  .badge{flex:1; background:var(--card); border:1px solid var(--line); border-radius:18px; padding:26px 24px;}
+  .badge .big{font-size:46px; font-weight:800; line-height:1;}
+  .badge .big.gold{color:var(--gold);} .badge .big.cyan{color:var(--accent);} .badge .big.violet{color:var(--accent2);}
+  .badge .cap{color:var(--muted); margin-top:12px; font-size:16px; font-weight:600;}
+  .foot{position:absolute; left:72px; bottom:40px; color:var(--muted); font-size:16px;}
+
+  /* 공통 카드 그리드 */
+  .grid3{display:grid; grid-template-columns:repeat(3,1fr); gap:20px; margin-top:8px; flex:1;}
+  .card{background:var(--card); border:1px solid var(--line); border-radius:16px; padding:26px 24px; display:flex; flex-direction:column;}
+  .card .n{font-size:14px; font-weight:800; color:var(--accent); letter-spacing:.1em;}
+  .card h3{font-size:24px; font-weight:800; margin:8px 0 10px;}
+  .card p{color:var(--muted); font-size:17px; line-height:1.5;}
+  .card .tag{margin-top:auto; color:var(--green); font-size:15px; font-weight:700; padding-top:14px;}
+
+  /* IOCP 다이어그램 */
+  .diagram{display:flex; align-items:center; gap:26px; flex:1; margin-top:6px;}
+  .col{display:flex; flex-direction:column; gap:14px;}
+  .pill{background:var(--card); border:1px solid var(--line); border-radius:12px; padding:16px 20px; font-size:18px; font-weight:700; min-width:230px;}
+  .pill small{display:block; color:var(--muted); font-weight:500; font-size:14px; margin-top:3px;}
+  .arrow{color:var(--accent); font-size:38px; font-weight:800;}
+  .iocp{background:linear-gradient(160deg,#16263f,#0e1830); border:1.5px solid var(--accent);
+    border-radius:18px; padding:30px 28px; text-align:center; min-width:230px; box-shadow:0 0 40px rgba(34,211,238,.18);}
+  .iocp .t{font-size:26px; font-weight:800; color:var(--accent);}
+  .iocp small{color:var(--muted); font-size:14px;}
+  .worker{background:var(--card); border:1px solid var(--line); border-radius:14px; padding:18px 22px; font-size:18px; font-weight:700; text-align:center;}
+  .note{margin-top:22px; color:var(--muted); font-size:18px;}
+  .note b{color:var(--ink);}
+
+  /* 최적화 여정 */
+  .journey{display:flex; align-items:stretch; gap:18px; flex:1; margin-top:10px;}
+  .step{flex:1; background:var(--card); border:1px solid var(--line); border-radius:16px; padding:22px 20px; display:flex; flex-direction:column;}
+  .step.wall{border-color:#dc2626;}
+  .step.win{border-color:var(--green); background:linear-gradient(160deg,#10241c,#0e1830);}
+  .step .lab{font-size:13px; font-weight:800; letter-spacing:.08em; color:var(--accent);}
+  .step.wall .lab{color:#f87171;} .step.win .lab{color:var(--green);}
+  .step .v{font-size:30px; font-weight:800; margin:8px 0 6px;}
+  .step ul{list-style:none; color:var(--muted); font-size:15px; line-height:1.7;}
+  .step ul li::before{content:"·"; color:var(--accent); font-weight:800; margin-right:8px;}
+  .bigarrow{display:flex; align-items:center; color:var(--accent); font-size:30px; font-weight:800;}
+
+  /* 자체구현 리스트 */
+  .impl{display:grid; grid-template-columns:1fr 1fr; gap:14px 30px; flex:1; margin-top:10px; align-content:start;}
+  .impl .row{display:flex; gap:14px; align-items:flex-start; background:var(--card); border:1px solid var(--line); border-radius:12px; padding:16px 18px;}
+  .check{color:var(--green); font-size:22px; font-weight:800; line-height:1.2;}
+  .impl .row b{font-size:19px;} .impl .row span{display:block; color:var(--muted); font-size:15px; margin-top:3px;}
+  .banner{margin-top:18px; background:linear-gradient(90deg,rgba(167,139,250,.14),rgba(34,211,238,.10));
+    border:1px solid var(--line); border-radius:12px; padding:16px 20px; font-size:18px;}
+  .banner b{color:var(--gold);}
+
+  /* 콘텐츠 매핑 */
+  .content{display:grid; grid-template-columns:repeat(3,1fr); gap:16px; flex:1; margin-top:6px; align-content:start;}
+  .cbox{background:var(--card); border:1px solid var(--line); border-radius:14px; padding:18px 18px;}
+  .cbox .ico{font-size:26px;} .cbox h4{font-size:19px; font-weight:800; margin:8px 0 4px;}
+  .cbox p{color:var(--muted); font-size:14px; line-height:1.45;}
+  .closing{position:absolute; left:72px; right:72px; bottom:36px; text-align:center;
+    font-size:22px; font-weight:700; color:var(--accent);}
+
+  /* UI 크롬 */
+  #progress{position:fixed; top:0; left:0; height:4px; background:linear-gradient(90deg,var(--accent),var(--accent2)); z-index:50; transition:width .3s;}
+  #counter{position:fixed; right:18px; bottom:14px; color:#5b6783; font-size:14px; z-index:50; font-variant-numeric:tabular-nums;}
+  #notes{position:fixed; left:0; right:0; bottom:0; background:rgba(5,7,13,.96); border-top:1px solid var(--line);
+    color:var(--ink); padding:16px 24px; font-size:16px; line-height:1.55; display:none; z-index:60;}
+  #notes.show{display:block;} #notes b{color:var(--gold);}
+  #hint{position:fixed; left:18px; bottom:14px; color:#3c4660; font-size:13px; z-index:50;}
+
+  @media print{
+    html,body{overflow:visible; background:#fff;}
+    #stageWrap{position:static;}
+    #stage{transform:none !important; width:100%; height:auto; box-shadow:none;}
+    .slide{position:relative; display:flex !important; width:1280px; height:720px; page-break-after:always; animation:none;}
+    #progress,#counter,#notes,#hint{display:none !important;}
+    @page{size:1280px 720px; margin:0;}
+  }
+</style>
+</head>
+<body>
+<div id="progress" style="width: 50%;"></div>
+<div id="stageWrap"><div id="stage" style="transform: scale(1.17656);">
+
+  <!-- 1 -->
+  <section class="slide hero" data-note="&lt;b&gt;오프닝 30초.&lt;/b&gt; 안녕하세요, Aetheria Online입니다. 세 가지 숫자만 기억해 주세요 — 20만 NPC, 단일 머신에서 3,462 동접을 0~1ms 지연으로, 그리고 핵심 서버 모듈을 전부 직접 구현했습니다. 이 발표는 게임 기능 나열이 아니라 &#39;서버 엔지니어링&#39;으로 채우겠습니다.">
+    <div class="kicker">Game Server Termproject</div>
+    <h1>Aetheria&nbsp;Online<br><span style="font-size:40px; color:var(--accent);">Win32 IOCP 기반 MMORPG 서버</span></h1>
+    <div class="badges">
+      
+      
+      
+    </div>
+    <div class="foot">한국공학대학교 · 게임서버 프로그래밍 · 2026</div>
+  </section>
+
+  <!-- 2 -->
+  <section class="slide" data-note="&lt;b&gt;아키텍처 45초.&lt;/b&gt; 핵심은 &#39;하나의 IOCP&#39;입니다. 네트워크 I/O, 타이머 만기, DB 완료를 전부 같은 완료 포트로 통합했습니다. 그래서 모든 게임 상태 변경이 오직 워커 스레드 컨텍스트에서만 일어나고, 동기화 규약이 하나로 단일화됩니다.">
+    <div class="kicker">Architecture</div>
+    <h2>통합 IOCP 아키텍처</h2>
+    <div class="accentbar"></div>
+    <div class="diagram">
+      <div class="col">
+        <div class="pill">네트워크 I/O<small>WSARecv / WSASend</small></div>
+        <div class="pill">타이머 만기<small>TimerOverlapped</small></div>
+        <div class="pill">DB 완료<small>DbOverlapped</small></div>
+      </div>
+      <div class="arrow">→</div>
+      <div class="iocp"><div class="t">단일 IOCP</div><small>Completion Port</small><div style="margin-top:14px; font-size:15px; color:var(--ink)">IO_TYPE 으로<br>분기</div></div>
+      <div class="arrow">→</div>
+      <div class="col">
+        <div class="worker">Worker #1</div>
+        <div class="worker">Worker #2</div>
+        <div class="worker">… Worker #N</div>
+      </div>
+    </div>
+    <div class="note">모든 게임 상태 변경 = <b>워커 컨텍스트에서만 발생</b> → 동기화 규약 단일화</div>
+  </section>
+
+  <!-- 3 -->
+  <section class="slide active" data-note="&lt;b&gt;20만 NPC 60초.&lt;/b&gt; 20만을 버틴 비결은 셋입니다. 첫째 섹터 기반 AOI — 내 주변 9섹터만 검사합니다. 둘째 Lazy AI — 플레이어 근처 NPC만 깨어 있어서, 실제 활성 AI 수는 전체 20만이 아니라 동접에 비례합니다. 셋째 워커마다 thread_local Lua VM — AI 핫패스에 락이 0입니다.">
+    <div class="kicker">Scalability</div>
+    <h2><span class="num">20만</span> NPC를 버티는 3대 비결</h2>
+    <div class="accentbar"></div>
+    <div class="grid3">
+      <div class="card"><div class="n">① AOI</div><h3>섹터 기반 시야</h3><p>맵을 섹터로 분할, 내 주변 <b style="color:var(--ink)">9섹터만</b> 검사. 전체 순회 제거.</p><div class="tag">O(전체) → O(주변)</div></div>
+      <div class="card"><div class="n">② Lazy AI</div><h3>필요할 때만 활성</h3><p>플레이어 시야 진입 시 CAS로 활성, 시야 비면 자가 비활성.</p><div class="tag">활성 AI = 동접 비례</div></div>
+      <div class="card"><div class="n">③ Lua VM</div><h3>워커 로컬 스크립트</h3><p><b style="color:var(--ink)">thread_local</b> VM. OnTick(ctx) stateless.</p><div class="tag">AI 핫패스 락 0</div></div>
+    </div>
+  </section>
+
+  <!-- 4 -->
+  <section class="slide" data-note="&lt;b&gt;최적화 여정 60초.&lt;/b&gt; 처음엔 3,000 동접에서 벽에 부딪혔습니다. 원인은 단일 Lua 락, 단일 타이머, 전역 송신풀 — 전부 직렬화 지점이었죠. Phase1에서 이걸 병렬화하고, Phase2A에서 송신을 코얼레싱하니, 3,462 동접을 0~1ms 지연으로 처리하며 벽을 넘었습니다.">
+    <div class="kicker">Optimization Story</div>
+    <h2>최적화 여정 — <span class="num">3,000 벽</span>을 넘다</h2>
+    <div class="accentbar"></div>
+    <div class="journey">
+      <div class="step wall"><div class="lab">BEFORE</div><div class="v">3,000 벽</div><ul><li>단일 Lua 락</li><li>단일 타이머</li><li>전역 송신풀</li></ul></div>
+      <div class="bigarrow">→</div>
+      <div class="step"><div class="lab">PHASE 1</div><div class="v">병렬화</div><ul><li>워커 로컬 VM</li><li>8샤드 타이머</li><li>8샤드 송신풀</li></ul></div>
+      <div class="bigarrow">+</div>
+      <div class="step"><div class="lab">PHASE 2A</div><div class="v">코얼레싱</div><ul><li>송신 묶음 처리</li><li>syscall 감소</li></ul></div>
+      <div class="bigarrow">→</div>
+      <div class="step win"><div class="lab">AFTER</div><div class="v" style="color:var(--green)">3,462</div><ul><li style="color:var(--green)">@ 0~1ms 지연</li><li>벽 해소</li></ul></div>
+    </div>
+  </section>
+
+  <!-- 5 -->
+  <section class="slide" data-note="&lt;b&gt;자체 구현 45초.&lt;/b&gt; 표절 항목을 정면돌파하겠습니다. 제공된 건 protocol_2026.h 헤더 하나뿐이고, 나머지는 전부 scratch부터 짰습니다 — IOCP 래퍼, RingBuffer 패킷 조립, Min-Heap 타이머, DB 비동기 Job Queue, Lua 바인딩까지. 코드는 질의응답 때 바로 보여드릴 준비가 돼 있습니다.">
+    <div class="kicker">Built From Scratch</div>
+    <h2>자체 구현 — 표절 방지 정면돌파</h2>
+    <div class="accentbar"></div>
+    <div class="impl">
+      <div class="row"><span class="check">✓</span><div><b>IOCP 래퍼</b><span>OVERLAPPED_EX 통합 설계</span></div></div>
+      <div class="row"><span class="check">✓</span><div><b>패킷 조립</b><span>Length-Prefix + 자체 RingBuffer</span></div></div>
+      <div class="row"><span class="check">✓</span><div><b>타이머</b><span>Min-Heap 기반 만기 처리</span></div></div>
+      <div class="row"><span class="check">✓</span><div><b>DB 계층</b><span>비동기 Job Queue + 완료 통지</span></div></div>
+      <div class="row"><span class="check">✓</span><div><b>Lua 바인딩</b><span>워커 로컬 VM 연동</span></div></div>
+      <div class="row"><span class="check">✓</span><div><b>AOI / 섹터</b><span>시야 관리 자체 구현</span></div></div>
+    </div>
+    <div class="banner">제공받은 것은 <b>protocol_2026.h</b> 헤더 하나뿐 — 나머지는 전부 scratch부터.</div>
+  </section>
+
+  <!-- 6 -->
+  <section class="slide" data-note="&lt;b&gt;콘텐츠 + 전환 60초.&lt;/b&gt; 게임 콘텐츠는 4바이옴, 스킬 3종, 파티, 아이템·장비, 연쇄 퀘스트, 2페이즈 보스까지 갖췄습니다. 각 동작은 말보다 영상이 빠르니 — 지금부터 시연 영상으로 보여드리겠습니다.">
+    <div class="kicker">Game Content × 채점 매핑</div>
+    <h2>게임 콘텐츠 한눈에</h2>
+    <div class="accentbar"></div>
+    <div class="content">
+      <div class="cbox"><div class="ico">🗺️</div><h4>4 바이옴</h4><p>지역별 맵 · 장애물 · 시야</p></div>
+      <div class="cbox"><div class="ico">✨</div><h4>스킬 3종</h4><p>AoE · Line · Heal</p></div>
+      <div class="cbox"><div class="ico">🤝</div><h4>파티</h4><p>초대/수락 · 경험치 공유</p></div>
+      <div class="cbox"><div class="ico">🎒</div><h4>아이템 · 장비</h4><p>드롭 · 줍기 · 장착 스탯</p></div>
+      <div class="cbox"><div class="ico">📜</div><h4>연쇄 퀘스트</h4><p>대화 · 처치 카운트 · 보상</p></div>
+      <div class="cbox"><div class="ico">🐉</div><h4>2페이즈 보스</h4><p>HP 50% 분노 · 광역기</p></div>
+    </div>
+    <div class="closing">▶ 동작은 곧 시연 영상으로 보여드리겠습니다.</div>
+  </section>
+
+</div></div>
+
+<div id="counter">3 / 6</div>
+<div id="hint">← → 이동 · F11 풀스크린 · N 발표노트 · Ctrl+P PDF저장</div>
+<div id="notes" class=""><b>아키텍처 45초.</b> 핵심은 '하나의 IOCP'입니다. 네트워크 I/O, 타이머 만기, DB 완료를 전부 같은 완료 포트로 통합했습니다. 그래서 모든 게임 상태 변경이 오직 워커 스레드 컨텍스트에서만 일어나고, 동기화 규약이 하나로 단일화됩니다.</div>
+
+<script>
+  const slides=[...document.querySelectorAll('.slide')];
+  const stage=document.getElementById('stage');
+  const counter=document.getElementById('counter');
+  const progress=document.getElementById('progress');
+  const notes=document.getElementById('notes');
+  let i=0, notesOn=false;
+
+  function fit(){
+    const s=Math.min(innerWidth/1280, innerHeight/720);
+    stage.style.transform='scale('+s+')';
+  }
+  function show(n){
+    i=Math.max(0,Math.min(slides.length-1,n));
+    slides.forEach((s,k)=>s.classList.toggle('active',k===i));
+    counter.textContent=(i+1)+' / '+slides.length;
+    progress.style.width=((i+1)/slides.length*100)+'%';
+    if(notesOn) notes.innerHTML=slides[i].dataset.note||'';
+  }
+  function toggleNotes(){
+    notesOn=!notesOn; notes.classList.toggle('show',notesOn);
+    if(notesOn) notes.innerHTML=slides[i].dataset.note||'';
+  }
+  addEventListener('keydown',e=>{
+    if(['ArrowRight','PageDown',' '].includes(e.key)){e.preventDefault();show(i+1);}
+    else if(['ArrowLeft','PageUp'].includes(e.key)){e.preventDefault();show(i-1);}
+    else if(e.key==='Home')show(0);
+    else if(e.key==='End')show(slides.length-1);
+    else if(e.key.toLowerCase()==='n')toggleNotes();
+  });
+  addEventListener('resize',fit);
+  stage.addEventListener('click',()=>show(i+1));
+  fit(); show(0);
+</script>
+
+
+</body></html>

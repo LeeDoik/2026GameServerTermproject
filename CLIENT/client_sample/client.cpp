@@ -94,9 +94,10 @@ int  g_inv_cursor = 0;   // 인벤토리 커서 슬롯 (0 .. MAX_INVENTORY_SLOTS
 // 제목/설명은 서버 data/quests.txt와 동일 ID로 매핑 (서버는 로직, 클라는 표시 텍스트).
 struct ClientQuestMeta { const char* title; const char* desc; const char* target_disp; int target_count; };
 static const std::unordered_map<int, ClientQuestMeta> g_quest_meta = {
-    { 1, { "슬라임 퇴치",   "초원의 슬라임이 마을을 위협합니다. 슬라임을 처치하세요.", "Slime",  3 } },
-    { 2, { "쥐 사냥",      "창고의 쥐가 식량을 갉아먹습니다. 쥐를 사냥하세요.",       "Rat",    5 } },
-    { 3, { "고블린 토벌",   "고블린 무리가 길을 막고 있습니다. 고블린을 토벌하세요.",   "Goblin", 5 } },
+    { 1, { "초원의 군주", "SW 초원의 보스 슬라임 킹을 처치하고 장로에게 보고하세요.",   "GrassBoss",  1 } },
+    { 2, { "숲의 수호자", "SE 숲의 보스 히드라를 처치하고 장로에게 보고하세요.",        "ForestBoss", 1 } },
+    { 3, { "사막의 폭군", "NE 사막의 보스 황금 드래곤을 처치하고 장로에게 보고하세요.", "DesertBoss", 1 } },
+    { 4, { "설원의 마왕", "NW 설원의 보스 케레보브를 처치하고 장로에게 보고하세요.",     "IceBoss",    1 } },
 };
 static const ClientQuestMeta* quest_meta(int id) {
     auto it = g_quest_meta.find(id);
@@ -2624,18 +2625,20 @@ int main()
                 case sf::Keyboard::Right: target_x += 1; moved = true; break;
                 case sf::Keyboard::Up:    target_y -= 1; moved = true; break;
                 case sf::Keyboard::Down:  target_y += 1; moved = true; break;
-                // 테스트용 텔레포트: 1=상 / 2=하 / 3=좌 / 4=우, 100칸씩 이동
+                // 테스트용 텔레포트: 1=상 / 2=하 / 3=좌 / 4=우, 10칸씩 이동
                 case sf::Keyboard::Num1:  target_y -= 10; teleported = true; break;
                 case sf::Keyboard::Num2:  target_y += 10; teleported = true; break;
                 case sf::Keyboard::Num3:  target_x -= 10; teleported = true; break;
                 case sf::Keyboard::Num4:  target_x += 10; teleported = true; break;
-                // 디버그용 이펙트 트리거: 5=혈흔
-                case sf::Keyboard::Num5:  spawn_effect_blood(avatar.m_x, avatar.m_y);   break;
-                // 보스 텔레포트: 6=SW초원 GrassBoss / 7=SE숲 ForestBoss / 8=NE사막 DesertBoss / 9=NW설원 IceBoss
-                case sf::Keyboard::Num6:  target_x = 500;  target_y = 1402; teleported = true; break;
-                case sf::Keyboard::Num7:  target_x = 1500; target_y = 1402; teleported = true; break;
-                case sf::Keyboard::Num8:  target_x = 1500; target_y = 402;  teleported = true; break;
-                case sf::Keyboard::Num9:  target_x = 500;  target_y = 402;  teleported = true; break;
+                // 보스 앞으로 텔레포트: 5=SW초원 GrassBoss / 6=SE숲 ForestBoss / 7=NE사막 DesertBoss / 8=NW설원 IceBoss
+                // (500,1402)는 절차적 장식(Map::IsProceduralDeco)으로 막혀 서버가 텔레포트를 거부하므로
+                // 보스(500,1400) 바로 앞 walkable 타일 (500,1401)로 지정.
+                case sf::Keyboard::Num5:  target_x = 500;  target_y = 1401; teleported = true; break;
+                case sf::Keyboard::Num6:  target_x = 1500; target_y = 1402; teleported = true; break;
+                case sf::Keyboard::Num7:  target_x = 1500; target_y = 402;  teleported = true; break;
+                case sf::Keyboard::Num8:  target_x = 500;  target_y = 402;  teleported = true; break;
+                // 9=마을(스폰지점)으로 복귀
+                case sf::Keyboard::Num9:  target_x = 1000; target_y = 1002; teleported = true; break;
                 // A키 = 공격 (인접 4타일 NPC 동시 데미지). 서버가 쿨타임 검증.
                 case sf::Keyboard::A: {
                     C2S_Attack ap;

@@ -14,12 +14,13 @@ enum class TimerEventKind : unsigned char {
     NpcMove,
     NpcRespawn,
     HpRegen,
-    MpRegen,         // MP 고속 재생 틱
+    MpRegen,           // MP 고속 재생 틱
     AttackCooldown,
     SkillCooldown,
-    PlayerAutoSave,  // Stage 6.3 — 주기적 DB 자동 저장
-    GroundItemExpire, // Stage 8 — 바닥 아이템 만료 (entity_id 자리에 drop_id)
-    TestPing,    // 검증 테스트용
+    PlayerAutoSave,    // Stage 6.3 — 주기적 DB 자동 저장
+    GroundItemExpire,  // Stage 8 — 바닥 아이템 만료 (entity_id 자리에 drop_id)
+    PartyInviteExpire, // 파티 초대 30초 타임아웃 (entity_id = invitee client_id)
+    TestPing,          // 검증 테스트용
 };
 
 struct TimerEvent {

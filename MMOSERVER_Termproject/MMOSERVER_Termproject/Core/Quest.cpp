@@ -5,13 +5,11 @@
 #include <cstring>
 #include <iostream>
 
-std::vector<QuestDef> g_quest_defs;
+std::unordered_map<int, QuestDef> g_quest_defs;
 
 const QuestDef* GetQuestDef(int quest_id) {
-    for (const QuestDef& d : g_quest_defs) {
-        if (d.id == quest_id) return &d;
-    }
-    return nullptr;
+    auto it = g_quest_defs.find(quest_id);
+    return (it != g_quest_defs.end()) ? &it->second : nullptr;
 }
 
 int LoadQuestDefs(const char* path) {
@@ -47,7 +45,7 @@ int LoadQuestDefs(const char* path) {
         def.reward_exp = reward_exp;
         def.reward_item_id = reward_item;
         def.reward_item_qty = (reward_qty < 0) ? 0 : reward_qty;
-        g_quest_defs.push_back(def);
+        g_quest_defs[def.id] = def;
         ++loaded;
     }
     std::fclose(fp);
