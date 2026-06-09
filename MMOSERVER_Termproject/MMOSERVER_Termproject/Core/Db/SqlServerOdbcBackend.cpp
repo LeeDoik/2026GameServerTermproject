@@ -16,6 +16,12 @@ namespace {
 
 inline bool Ok(SQLRETURN r) { return r == SQL_SUCCESS || r == SQL_SUCCESS_WITH_INFO; }
 
+// 매칭 행이 0개인 searched DELETE/UPDATE에 대해 SQL Server ODBC는 ODBC 표준대로 SQL_NO_DATA를
+// 반환한다(진단 레코드 없음). MySQL ODBC는 같은 경우 SQL_SUCCESS를 주던 자리 — 신규 플레이어의
+// 첫 저장은 인벤/퀘스트 행이 없어 항상 0행 DELETE가 되므로, NO_DATA를 실패로 보면 트랜잭션이
+// 통째로 롤백되어 어떤 플레이어도 영속되지 않는다. 0행 삭제는 정상이므로 NO_DATA도 성공 취급.
+inline bool OkDelete(SQLRETURN r) { return Ok(r) || r == SQL_NO_DATA; }
+
 // 진단 레코드를 stderr로 출력 (크래시 없이 로깅만).
 void ReportError(const char* ctx, SQLSMALLINT handle_type, SQLHANDLE handle) {
     SQLCHAR state[6] = { 0 };
@@ -29,6 +35,10 @@ void ReportError(const char* ctx, SQLSMALLINT handle_type, SQLHANDLE handle) {
                      reinterpret_cast<char*>(state), reinterpret_cast<char*>(msg));
         ++rec;
     }
+    // main()이 ios_base::sync_with_stdio(false)를 호출하므로 fprintf(stderr)는 std::cerr와
+    // 버퍼가 분리된다. stderr가 파일/파이프로 리다이렉트되면 풀버퍼링이라 진단이 묻혀
+    // 보이지 않는다 → 즉시 flush해 콘솔/캡처 양쪽에서 항상 보이게 한다.
+    std::fflush(stderr);
 }
 
 // username을 input VARCHAR 파라미터로 바인딩 (버퍼는 호출자가 stable하게 보유).
@@ -281,7 +291,7 @@ bool SqlServerOdbcBackend::Save(const PlayerSnapshot& snap) {
         if (Ok(SQLAllocHandle(SQL_HANDLE_STMT, dbc, &st))) {
             const char* del = "DELETE FROM player_inventory WHERE username=?";
             BindUser(st, 1, user, &user_ind);
-            if (!Ok(SQLExecDirectA(st, reinterpret_cast<SQLCHAR*>(const_cast<char*>(del)), SQL_NTS))) {
+            if (!OkDelete(SQLExecDirectA(st, reinterpret_cast<SQLCHAR*>(const_cast<char*>(del)), SQL_NTS))) {
                 ReportError("Save/inv-del", SQL_HANDLE_STMT, st);
                 ok = false;
             }
@@ -322,7 +332,7 @@ bool SqlServerOdbcBackend::Save(const PlayerSnapshot& snap) {
         if (Ok(SQLAllocHandle(SQL_HANDLE_STMT, dbc, &st))) {
             const char* del = "DELETE FROM player_quests WHERE username=?";
             BindUser(st, 1, user, &user_ind);
-            if (!Ok(SQLExecDirectA(st, reinterpret_cast<SQLCHAR*>(const_cast<char*>(del)), SQL_NTS))) {
+            if (!OkDelete(SQLExecDirectA(st, reinterpret_cast<SQLCHAR*>(const_cast<char*>(del)), SQL_NTS))) {
                 ReportError("Save/quest-del", SQL_HANDLE_STMT, st);
                 ok = false;
             }
