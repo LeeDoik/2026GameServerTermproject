@@ -20,7 +20,7 @@ using namespace chrono;
 
 extern HWND		hWnd;
 
-const static int MAX_TEST = 5000;   // 목표 동접 (채점 기준 5000 CCU. 도달 시 추가 접속 중단, 측정 지연이 높으면 자동 백오프)
+const static int MAX_TEST = 10000;  // 목표 동접 (서버 MAX_PLAYERS=10000 상한과 일치. 채점 기준은 5000 CCU. 도달 시 추가 접속 중단, 측정 지연이 높으면 자동 백오프)
 const static int MAX_CLIENTS = MAX_TEST * 2;
 const static int INVALID_ID = -1;
 const static int MAX_PACKET_SIZE = 255;

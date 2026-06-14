@@ -158,10 +158,13 @@ int LoadNpcSpawnScript(const char* path) {
             n.active.store(false);
             n.boss_tick_count.store(0);
 
-            // 보스는 GameConfig 전용 스탯, 일반 NPC는 스크립트 값 사용
+            // 보스는 level만 BOSS_LEVEL(50)로 통일하고, HP는 npc_spawn.txt에서 보스별로 지정
+            // (구역 난이도순 800/1700/3000/4000). 스크립트 값이 없으면 BOSS_MAX_HP로 폴백.
+            // 2페이즈 분노는 n.max_hp의 50% 기준이라 보스별 HP에 자동으로 맞춰진다.
             if (type == NpcType::Boss) {
-                n.hp = BOSS_MAX_HP;
-                n.max_hp = BOSS_MAX_HP;
+                int boss_hp = (script_hp > 0) ? script_hp : BOSS_MAX_HP;
+                n.hp = boss_hp;
+                n.max_hp = boss_hp;
                 n.level = static_cast<unsigned char>(BOSS_LEVEL);
             } else {
                 n.hp = script_hp;
