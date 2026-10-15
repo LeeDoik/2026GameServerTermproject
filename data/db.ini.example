@@ -12,11 +12,11 @@
 #  - ODBC Driver 18 은 기본값이 Encrypt=yes 라서 localhost에 신뢰된 인증서가 없으면 연결 실패한다.
 #    이때는 Encrypt=no 또는 TrustServerCertificate=yes 를 추가한다.
 #  - SQL 로그인(UID/PWD)을 쓰려면 서버가 "SQL Server 및 Windows 인증 모드"(혼합)여야 한다.
-#    스키마: data\schema_mssql.sql 가 로그인 aetheria/aetheria123 을 생성한다.
+#    스키마: data\schema_mssql.sql 가 로그인 <user>/<password> (schema_mssql.sql 참고) 을 생성한다.
 #  - 원격 서버/명명 인스턴스 예) SERVER=192.168.0.10,1433  또는  SERVER=HOST\SQLEXPRESS
 #    원격이면 TCP/IP 활성화 + 방화벽 1433 개방 필요.
 #
 # 줄 시작이 # 이면 주석. key=value 형식. 값 안의 공백/중괄호 그대로 허용.
 
-enabled=1
-conn=DRIVER={ODBC Driver 17 for SQL Server};SERVER=localhost\SQLEXPRESS;DATABASE=aetheria;UID=aetheria;PWD=aetheria123;Encrypt=no;
+enabled=0
+conn=DRIVER={ODBC Driver 17 for SQL Server};SERVER=localhost\SQLEXPRESS;DATABASE=aetheria;UID=<user>;PWD=<password>;

@@ -47,3 +47,6 @@ data/players/
 # *.pdf
 client_sample.exe - 바로 가기.lnk
 MMOSERVER_Termproject.exe - 바로 가기.lnk
+
+# DB 접속 설정은 로컬 전용 (data/db.ini.example 을 복사해서 사용)
+data/db.ini
